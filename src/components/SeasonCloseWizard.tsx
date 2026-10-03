@@ -1,0 +1,638 @@
+// ============================================================
+// معالج إقفال الموسم
+// ============================================================
+// خمس خطوات، ولا كتابة واحدة قبل الخطوة الخامسة.
+//
+// التحقق من الهوية يقع في الخطوة الأولى: تأكيد كلمة المرور عند
+// Supabase Auth، ثم فحص الصلاحية على الخادم. وكل استدعاء لاحق
+// يمرّ بالفحص نفسه من JWT الجلسة — فالتفويض لا يعتمد على أن
+// المعالج ما زال مفتوحاً. الإلغاء ثم البدء من جديد يعيد السؤال.
+//
+// ⚠️ الإقفال يحفظ البيانات ولا يحذفها. الشيء الوحيد الذي يُحذف
+// هو ملفات المستندات. حذف بيانات الموسم عملية أخرى تماماً
+// (delete_season) تقع لاحقاً على موسم مقفل بالفعل.
+import { useState } from "react";
+import { supabase } from "../supabase";
+import type { Passenger, User } from "../types";
+import type { Season } from "../season/useSeason";
+import { Modal } from "./Modal";
+import { confirmPassword } from "../season/confirmPassword";
+import { btnP, btnS, inp, getStoragePath, fetchDocumentBytes } from "../utils";
+
+/* أعمدة المستندات الستة — مصدر العدّ ومصدر الحذف معاً.
+   ولكل عمود اسمُ ملفّ في الأرشيف ووسمٌ عربيّ يُقرأ عند الفشل. */
+const DOC_SPECS = [
+  { col: "passport_url",      file: "passport",       label: "جواز السفر" },
+  { col: "national_id_url",   file: "id-card",        label: "البطاقة الشخصية" },
+  { col: "photo_url",         file: "personal-photo", label: "الصورة الشخصية" },
+  { col: "contract_url",      file: "contract",       label: "العقد" },
+  { col: "hajj_permit_url",   file: "hajj-permit",    label: "تصريح الحج" },
+  { col: "flight_ticket_url", file: "ticket",         label: "تذكرة الطيران" },
+] as const;
+const DOC_COLUMNS = DOC_SPECS.map(d => d.col);
+
+/* ── تسمية آمنة على Windows ──────────────────────────────────
+   الأرشيف يُفتح على أجهزة المستخدمين، وأسماء الحجاج عربية فيها
+   مسافات وقد تحمل محارف يرفضها نظام الملفات. تُنقّى هنا مرّة واحدة. */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+function safeSegment(raw: string, fallback: string): string {
+  let out = (raw || "")
+    .replace(/[<>:"/\\|?*]/g, " ")
+    /* محارف التحكّم تُزال بلا تعبير نمطيّ يشكو منه المدقّق */
+    .split("").filter(ch => ch.charCodeAt(0) > 31 && ch.charCodeAt(0) !== 127).join("")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/, "");
+  if (!out) out = fallback;
+  if (WINDOWS_RESERVED.test(out)) out = `_${out}`;
+  return out.slice(0, 80);
+}
+
+/** امتداد الملفّ من مفتاح الكائن — لا من الرابط الموقّع */
+function extOf(key: string): string {
+  const ext = key.toLowerCase().split("?")[0].split(".").pop() ?? "";
+  return /^[a-z0-9]{2,5}$/.test(ext) ? ext : "bin";
+}
+
+type DocItem = {
+  /** القيمة المخزّنة (مفتاح الكائن) */
+  value: string;
+  /** مسار الملفّ داخل الأرشيف — مقروء للإنسان */
+  path: string;
+  /** لتسمية الفشل باسم صاحبه لا برقمه */
+  person: string;
+  label: string;
+};
+
+type Counts = { passengers: number; buses: number; camps: number; rooms: number };
+type Step = 1 | 2 | 3 | 4 | 5 | "executing" | "done";
+
+interface Props {
+  show: boolean;
+  onClose: () => void;
+  activeSeason: Season;
+  counts: Counts | undefined;
+  currentUser: User;
+  onGoToNewSeason: () => void;
+  /* السنواتُ الهجريّةُ القائمة — هويّةُ المواسم، وعليها فحصُ
+     التكرار قبل الإرسال. ولا فحصَ على الاسم: الأسماءُ نصٌّ حرّ،
+     وموسمان باسمين مختلفين لسنةٍ واحدةٍ هما الخطأُ لا التشابه. */
+  existingYears: number[];
+}
+
+/* الموسم التالي بالرقم إن كان الاسم رقماً محضاً، وإلا فارغ.
+   لا حساب هجريّاً: أسماء المواسم نصوص حرّة، وأي منطق تقويميّ
+   سيخطئ يوماً ما بصمت. */
+/* functions.invoke يضع الاستجابة غير الناجحة في error ويترك data
+   فارغاً، فرسالة الخادم العربية تضيع خلف رسالة عامة. هذه تستخرجها
+   من جسم الاستجابة لتصل إلى المستخدم كما كتبتها الدالة. */
+type AdminResult = { ok?: boolean; name?: string; newSeasonId?: number; closedBy?: string };
+
+async function invokeAdmin(body: Record<string, unknown>): Promise<{ data: AdminResult | null; message: string }> {
+  const { data, error } = await supabase.functions.invoke("season-admin", { body });
+  if (!error) return { data, message: "" };
+  let message = "";
+  try {
+    const ctx = (error as { context?: Response }).context;
+    if (ctx) message = (await ctx.json())?.error || "";
+  } catch { /* الجسم ليس JSON */ }
+  return { data: null, message };
+}
+
+/* اقتراحُ اسمٍ من السنة — **راحةٌ لا مصدرَ حقيقة**. المديرُ يمسحه
+   ويكتب ما شاء، والمحفوظُ هو ما في الحقل. والسنةُ تبقى عدداً
+   مستقلّاً لا يُشتقّ من الاسم ولا يُشتقُّ منه الاسمُ إلزاماً. */
+function suggestNameFromYear(year: string): string {
+  const y = year.trim();
+  return /^\d{3,4}$/.test(y) ? `موسم الحج ${y} هـ` : "";
+}
+
+function SeasonCloseWizard({ show, onClose, activeSeason, counts, currentUser, onGoToNewSeason, existingYears }: Props) {
+  const [step, setStep] = useState<Step>(1);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  /* الخطوة ٢ */
+  const [warnings, setWarnings] = useState<string[] | null>(null);
+  /* الخطوة ٣ */
+  const [docItems, setDocItems] = useState<DocItem[]>([]);
+  /* المستندات التي تعذّرت — باسم صاحبها لا برقمه */
+  const [failures, setFailures] = useState<{ person: string; label: string; why: string }[]>([]);
+  const [downloaded, setDownloaded] = useState(false);
+  const [dlProgress, setDlProgress] = useState(0);
+  /* عدد الملفات التي تعذّر ضمّها — نسخة ناقصة تُعلَن ولا تُقدَّم كاملة */
+  const [dlFailed, setDlFailed] = useState(0);
+  /* وعدد ما نجح فعلاً: الاكتمال يُقاس بمطابقة المتوقَّع، لا بغياب الفشل */
+  const [dlSucceeded, setDlSucceeded] = useState(0);
+  /* الخطوة ٤ — سنةٌ واسم، مفهومان لا مفهوم */
+  const [newYear, setNewYear] = useState(() =>
+    activeSeason.hijri_year ? String(activeSeason.hijri_year + 1) : "");
+  const [newName, setNewName] = useState(() =>
+    activeSeason.hijri_year ? suggestNameFromYear(String(activeSeason.hijri_year + 1)) : "");
+  /* هل لمس المديرُ الاسمَ بيده؟ فإن لمسه لم يَعُد الاقتراحُ يدهسه */
+  const [nameTouched, setNameTouched] = useState(false);
+  /* ⚠️ الادّعاء الوحيد المسموح بأن نسخةً موجودة: نُزّلت **وبلا فشل**.
+     خطوة التأكيد كانت تقرأ `downloaded` وحدها، فتُعلن «نُزّلت نسخة»
+     ولو فشل كل مستند — وهي الخطوة التي يُحذف بعدها الأصل. */
+  /* المتوقَّع = كل مستند في الموسم. والاكتمال **مطابقةٌ عدديّة**:
+     نجح كل ما هو متوقَّع، ولم يفشل شيء. غياب الفشل وحده لا يكفي —
+     قد لا يفشل شيء لأن شيئاً لم يُحاوَل أصلاً. */
+  const expectedDocs = docItems.length;
+  const backupComplete = expectedDocs > 0
+    && downloaded
+    && dlSucceeded === expectedDocs
+    && dlFailed === 0;
+  /* النتيجة */
+  const [result, setResult] = useState<{ newSeasonId: number; closedBy: string; at: string; docsMsg: string; docsOk: boolean } | null>(null);
+
+  const reset = () => {
+    setStep(1); setPassword(""); setError(""); setBusy(false);
+    setWarnings(null); setDocItems([]); setFailures([]); setDownloaded(false); setDlProgress(0); setDlFailed(0); setDlSucceeded(0);
+    const nextYear = activeSeason.hijri_year ? String(activeSeason.hijri_year + 1) : "";
+    setNewYear(nextYear); setNewName(suggestNameFromYear(nextYear)); setNameTouched(false);
+    setResult(null);
+  };
+
+  const closeAndReset = () => { reset(); onClose(); };
+
+  /* ── الخطوة ١: الهوية ───────────────────────────────────── */
+  const verify = async () => {
+    setBusy(true); setError("");
+
+    /* التأكيد عند Supabase Auth وحده — كلمة المرور لا تصل إلى
+       season-admin ولا إلى أي دالة من دوالنا (§٧.١) */
+    const confirmed = await confirmPassword(currentUser.email, password);
+    if (!confirmed) {
+      setError("كلمة المرور غير صحيحة.");
+      setBusy(false);
+      return;
+    }
+
+    /* الحارس الحقيقي: الهوية والصلاحية على الخادم من JWT الجلسة */
+    const { data, message } = await invokeAdmin({ action: "verify" });
+    setBusy(false);
+    if (!data?.ok) {
+      setError(message || "تعذّر التحقق، يرجى المحاولة مرة أخرى.");
+      return;
+    }
+    /* لم تعد لها حاجة بعد التأكيد — لا تبقى في الحالة حتى التفكيك */
+    setPassword("");
+    await loadReview();
+    setStep(2);
+  };
+
+  /* ── الخطوة ٢: التحذيرات + عدّ المستندات ────────────────── */
+  const loadReview = async () => {
+    const { data, error: err } = await supabase
+      .from("passengers")
+      .select(`id,name_ar,name_en,passport,national_id,bus_id,room_id,camp_mina_id,camp_arafa_id,${DOC_COLUMNS.join(",")}`)
+      .eq("season_id", activeSeason.id)
+      .order("id");
+
+    if (err || !data) {
+      /* الفحص استشاريّ، ففشله لا يوقف عملية إدارية */
+      setWarnings(null);
+      setDocItems([]);
+      return;
+    }
+    const rows = data as unknown as (Passenger & Record<string, string | null>)[];
+
+    const undistributed = rows.filter(p =>
+      !p.bus_id || !p.room_id || !p.camp_mina_id || !p.camp_arafa_id).length;
+    const noPassport = rows.filter(p => !p.passport_url).length;
+
+    /* ⚠️ الأرشيف يُفتح بعد إقفال الموسم، حين لا تكون القاعدة في
+       متناول اليد. فمجلّد اسمه «75» لا يقول لصاحبه شيئاً. الاسم هو
+       الهوية، ورقم الجواز مميّزٌ ثابت عند التشابه، والرقم الداخليّ
+       ملاذٌ أخير عند تكرار الاثنين. */
+    const used = new Map<string, number>();
+    const items: DocItem[] = [];
+    for (const p of rows) {
+      const name = safeSegment(String(p.name_ar || p.name_en || ""), `حاج ${p.id}`);
+      const tag = safeSegment(String(p.passport || p.national_id || ""), "");
+      let folder = tag && tag !== `حاج ${p.id}` ? `${name} - ${tag}` : name;
+      /* تكرارٌ حقيقيّ: يُفصل بالرقم الداخليّ — ترتيبٌ ثابت لأن
+         الصفوف مرتّبة بالمعرّف، فالأرشيف نفسه يخرج في كل مرّة */
+      const seen = used.get(folder);
+      if (seen !== undefined && seen !== p.id) folder = `${folder} (${p.id})`;
+      used.set(folder, p.id);
+
+      const person = String(p.name_ar || p.name_en || `حاج ${p.id}`);
+      for (const spec of DOC_SPECS) {
+        const value = p[spec.col] as string | null;
+        if (!value) continue;
+        const key = getStoragePath(value);
+        items.push({
+          value,
+          path: `${folder}/${spec.file}.${extOf(key || value)}`,
+          person,
+          label: spec.label,
+        });
+      }
+    }
+    setDocItems(items);
+
+    /* م٧ — تنبيهات هذا الموسم وحده: التحذير عن «ما لن يصل بعد
+       الإقفال» كان يعدّ مجدولات المواسم كلّها. */
+    const { count: scheduled } = await supabase
+      .from("announcements").select("id", { count: "exact", head: true })
+      .eq("season_id", activeSeason.id)
+      .gt("show_at", new Date().toISOString());
+
+    const list: string[] = [];
+    if (undistributed) list.push(`${undistributed} حاجاً بلا توزيع كامل (باص أو غرفة أو مخيم)`);
+    if (noPassport) list.push(`${noPassport} حاجاً بلا صورة جواز مرفوعة`);
+    if (scheduled) list.push(`${scheduled} تنبيهاً مجدولاً لن يصل بعد الإقفال`);
+    setWarnings(list);
+  };
+
+  /* ── الخطوة ٣: تنزيل نسخة ──────────────────────────────── */
+  /* ⚠️ القيم المخزّنة **مفاتيح كائنات** لا روابط (س٦/ق٤)، والحاوية
+     خاصّة. فالجلب المباشر لقيمة العمود كان يطلب مساراً نسبياً على
+     أصل التطبيق فيردّ ٤٠٤ — أي أن كل مستند كان يُعدّ فاشلاً وتخرج
+     النسخة فارغة. كل مفتاح يُوقَّع الآن قبل جلبه مباشرةً.
+
+     ولا تُسلَّم نسخة فارغة ولا تُرفع علامة نجاح: النسخة التي لم
+     تُنزَّل ليست نسخة، والمستخدم يحذف مستنداته واثقاً بها. */
+  const downloadZip = async () => {
+    setBusy(true); setError(""); setDlProgress(0); setDlFailed(0); setFailures([]);
+    const failedItems: { person: string; label: string; why: string }[] = [];
+    let added = 0;
+    try {
+      /* استيراد ديناميكي: المكتبة لا تدخل الحزمة الرئيسية،
+         وتُحمَّل عند الضغط على الزرّ لا قبله */
+      const { default: JSZip } = await import("jszip");
+      const zip = new JSZip();
+      let done = 0;
+      for (const item of docItems) {
+        try {
+          /* بايتات مُتحقَّق منها: توقيعٌ ثنائيّ يطابق نوع الملفّ.
+             والحالة ٢٠٠ وحدها لا تكفي — إعادة كتابة المسارات في
+             الاستضافة تردّ قشرة التطبيق بحالة ناجحة. */
+          const bytes = await fetchDocumentBytes(item.value);
+          zip.file(item.path, bytes);
+          added++;
+        } catch (e) {
+          const why = e instanceof Error ? e.message : "سبب غير معروف";
+          failedItems.push({ person: item.person, label: item.label, why });
+          console.error("تعذر ضمّ مستند إلى الأرشيف", { path: item.path, why });
+        }
+        setDlProgress(++done);
+      }
+      setDlFailed(failedItems.length);
+      setFailures(failedItems);
+
+      /* لا مستند واحد نجح: لا ملفّ يُسلَّم ولا `downloaded` تُرفع */
+      if (added === 0) {
+        setError("تعذّر تجهيز النسخة: لم يُنزَّل أي مستند. لا تُكمل الإقفال قبل الحصول على نسخة.");
+        setBusy(false);
+        return;
+      }
+
+      const blob = await zip.generateAsync({ type: "blob" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `مستندات-موسم-${activeSeason.name}.zip`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setDownloaded(true);
+      setDlSucceeded(added);
+    } catch (e) {
+      console.error("تعذر تجهيز نسخة المستندات", e);
+      setError("تعذّر تجهيز النسخة. يمكنك المحاولة مرة أخرى.");
+    }
+    setBusy(false);
+  };
+
+  /* ── التنفيذ ────────────────────────────────────────────── */
+  const execute = async () => {
+    setStep("executing"); setError("");
+
+    /* الإقفال أولاً: هو الجوهر، ومعاملة واحدة في القاعدة */
+    const { data, message } = await invokeAdmin({
+      action: "close",
+      newSeasonName: newName.trim(),
+      newSeasonHijriYear: Number(newYear.trim()),
+    });
+    if (!data?.newSeasonId) {
+      setError(message || "تعذّر إقفال الموسم. لم يتغيّر شيء — يمكنك إعادة المحاولة.");
+      setStep(5);
+      return;
+    }
+
+    /* حذف الملفات تنظيف تخزين لا سلامة بيانات: فشله لا يمسّ
+       الإقفال ولا يُعرض كقرار على المستخدم */
+    let docsOk = true;
+    let docsMsg = "لا مستندات في هذا الموسم.";
+    if (docItems.length > 0) {
+      const paths = docItems.map(i => getStoragePath(i.value)).filter(Boolean);
+      const { data: removedData, error: rmErr } = await supabase.storage.from("passengers-docs").remove(paths);
+      /* remove() ينجح جزئياً: ما لم يُذكر في data لم يُحذف. المسارات
+         الباقية تُسجَّل بأسمائها لا بعددها، فالملف اليتيم يُعثر عليه
+         لاحقاً بدل أن يبقى مجهولاً في الحاوية. */
+      const removed = new Set((removedData || []).map(f => f.name));
+      const orphans = paths.filter(p => !removed.has(p));
+      if (rmErr || orphans.length > 0) {
+        console.error("[season-close] مستندات لم تُحذف — ملفات يتيمة في passengers-docs", {
+          season: activeSeason.name,
+          seasonId: activeSeason.id,
+          at: new Date().toISOString(),
+          count: orphans.length,
+          paths: orphans,
+          error: rmErr,
+        });
+        docsOk = false;
+        docsMsg = `تعذّر حذف ${orphans.length || docItems.length} من مستندات موسم ${activeSeason.name}، ويمكن معالجتها لاحقاً.`;
+      } else {
+        docsMsg = `حُذفت مستندات موسم ${activeSeason.name} (${paths.length} ملفاً).`;
+      }
+    }
+
+    setResult({
+      newSeasonId: data.newSeasonId,
+      closedBy: data.closedBy || currentUser.name,
+      at: new Date().toLocaleString("ar-EG"),
+      docsMsg, docsOk,
+    });
+    setStep("done");
+  };
+
+  const locked = step === "executing";
+  const yearNum = Number(newYear.trim());
+  const yearValid = /^\d{1,4}$/.test(newYear.trim()) && yearNum > 0;
+  const yearTaken = yearValid && existingYears.includes(yearNum);
+  /* ⚠️ النسخةُ شرطٌ للهدم لا إشعارٌ عنه: كانت `backupComplete`
+     تُحسب وتُعرض نصّاً، ولا تحرس زرّاً واحداً — فيصل المديرُ إلى
+     خطوة التنفيذ ويمحو مستندات الموسم كلَّها بلا نسخةٍ في يده.
+     والموسمُ بلا مستندات لا نسخةَ له تُنتظر: الخطوة ٣ لا تُعرض له
+     أصلاً (`setStep(docItems.length > 0 ? 3 : 4)`). */
+  const backupSatisfied = docItems.length === 0 || backupComplete;
+  const canProceed = yearValid && !yearTaken && newName.trim() !== "" && backupSatisfied;
+
+  return (
+    <Modal
+      show={show}
+      /* أثناء التنفيذ: لا Escape ولا نقر خارجيّ ولا ✕ */
+      onClose={locked ? () => {} : closeAndReset}
+      title={step === "done" ? "تم إقفال الموسم" : `إقفال «${activeSeason.name}»`}
+      maxWidth={720}
+    >
+      {/* مؤشّر الخطوات */}
+      {typeof step === "number" && (
+        <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+          {["التحقق", "مراجعة الموسم", "المستندات", "الموسم الجديد", "التأكيد"].map((label, i) => (
+            <div key={label} style={{ flex: 1, textAlign: "center", fontSize: 10, fontWeight: 700,
+              padding: "5px 2px", borderRadius: 6,
+              background: i + 1 === step ? "var(--primary)" : i + 1 < step ? "var(--success-bg)" : "var(--bg-2)",
+              color: i + 1 === step ? "var(--text-inverse)" : i + 1 < step ? "var(--success)" : "var(--text-muted)" }}>
+              {i + 1}. {label}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {error && (
+        <div style={{ padding: "8px 12px", marginBottom: 12, borderRadius: 8, fontSize: 12,
+          background: "var(--danger-bg, #fdecea)", color: "var(--danger)" }}>{error}</div>
+      )}
+
+      {/* ── ١ الهوية ── */}
+      {step === 1 && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 10 }}>
+            إقفال الموسم عملية إدارية. أدخل كلمة مرورك للمتابعة.
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 6 }}>
+            المستخدم: <b>{currentUser.name}</b>
+          </div>
+          <input type="password" value={password} autoFocus
+            onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && password && !busy) verify(); }}
+            placeholder="كلمة المرور" style={inp} />
+          <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <button onClick={verify} disabled={!password || busy} style={btnP({ flex: 1, opacity: !password || busy ? 0.6 : 1 })}>
+              {busy ? "جارٍ التحقق…" : "متابعة"}
+            </button>
+            <button onClick={closeAndReset} style={btnS()}>إلغاء</button>
+          </div>
+        </>
+      )}
+
+      {/* ── ٢ مراجعة الموسم ── */}
+      {step === 2 && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 10 }}>
+            سيصير هذا المحتوى أرشيفاً للعرض فقط، ويبقى محفوظاً بالكامل.
+          </div>
+          <div style={{ background: "var(--bg-2)", borderRadius: 8, padding: 12, fontSize: 12, marginBottom: 14 }}>
+            {counts
+              ? `${counts.passengers} حاجاً · ${counts.buses} باصات · ${counts.camps} مخيمات · ${counts.rooms} غرف`
+              : "تعذّر حساب المحتوى"}
+            {docItems.length > 0 && <div style={{ marginTop: 6, color: "var(--text-muted)" }}>{docItems.length} مستنداً مرفوعاً</div>}
+          </div>
+
+          {warnings === null ? (
+            <div style={{ fontSize: 12, color: "var(--text-muted)" }}>تعذّر فحص الموسم — يمكنك المتابعة.</div>
+          ) : warnings.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--success)" }}>لا توجد ملاحظات — الموسم مكتمل.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {warnings.map(w => (
+                <div key={w} style={{ fontSize: 12, color: "var(--warning)" }}>⚠ {w}</div>
+              ))}
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
+                هذه ملاحظات للعلم ولا تمنع الإقفال.
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+            <button onClick={() => setStep(docItems.length > 0 ? 3 : 4)} style={btnP({ flex: 1 })}>التالي</button>
+            <button onClick={closeAndReset} style={btnS()}>إلغاء</button>
+          </div>
+        </>
+      )}
+
+      {/* ── ٣ المستندات ── */}
+      {step === 3 && (
+        <>
+          <div style={{ fontSize: 13, marginBottom: 8 }}>
+            موسم {activeSeason.name} يحتوي <b>{docItems.length}</b> مستنداً.
+          </div>
+          <div style={{ fontSize: 12, color: "var(--warning)", marginBottom: 14 }}>
+            ⚠ ستُحذف نهائياً عند الإقفال ولا يمكن استعادتها.
+          </div>
+          {backupComplete
+            ? <div style={{ fontSize: 12, color: "var(--success)", marginBottom: 12 }}>✓ نُزّلت النسخة كاملة.</div>
+            : (
+              <>
+                {downloaded && dlFailed > 0 && (
+                  <div style={{ fontSize: 12, color: "var(--warning)", marginBottom: 8 }}>
+                    <div style={{ marginBottom: 4 }}>
+                      ⚠ النسخة ناقصة: نجح {dlSucceeded} من {docItems.length}، وتعذّر {dlFailed}.
+                    </div>
+                    {/* ما فشل يُسمّى بصاحبه — رقمٌ مجرّد لا يُصلَح به شيء */}
+                    <ul style={{ margin: "4px 0 0", paddingInlineStart: 18, lineHeight: 1.7 }}>
+                      {failures.slice(0, 5).map((f, i) => (
+                        <li key={i}>{f.person} — {f.label} <span style={{ color: "var(--text-muted)" }}>({f.why})</span></li>
+                      ))}
+                      {failures.length > 5 && <li>وغيرها {failures.length - 5}…</li>}
+                    </ul>
+                  </div>
+                )}
+                {/* إعادة المحاولة تبقى متاحة بعد نسخة ناقصة —
+                    إخفاء الزرّ كان يترك المستخدم بلا سبيل إلى نسخة كاملة */}
+                <button onClick={downloadZip} disabled={busy} style={btnS({ width: "100%", marginBottom: 12 })}>
+                  {busy
+                    ? `جارٍ التجهيز… ${dlProgress} / ${docItems.length}`
+                    : downloaded ? "إعادة المحاولة" : "تنزيل نسخة (ZIP)"}
+                </button>
+              </>
+            )}
+          <div style={{ display: "flex", gap: 8 }}>
+            {/* الحارسُ عند موضع القرار: لا تقدّم من خطوة المستندات
+                قبل نسخةٍ كاملة. و«السابق» و«إلغاء» يبقيان مفتوحين. */}
+            <button onClick={() => setStep(4)} disabled={busy || !backupSatisfied}
+              style={btnP({ flex: 1, opacity: busy || !backupSatisfied ? 0.6 : 1 })}>التالي</button>
+            <button onClick={() => setStep(2)} disabled={busy} style={btnS()}>السابق</button>
+            <button onClick={closeAndReset} disabled={busy} style={btnS()}>إلغاء</button>
+          </div>
+        </>
+      )}
+
+      {/* ── ٤ الموسم الجديد ── */}
+      {step === 4 && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 10 }}>
+            سيبدأ الموسم الجديد فارغاً: لا حجاج ولا باصات ولا مخيمات ولا غرف، ولا بيانات فندق أو منى أو عرفات — تُدخَل من «الإعدادات ← إعدادات الموسم».
+          </div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", marginBottom: 5 }}>السنة الهجرية</div>
+          <input value={newYear} autoFocus inputMode="numeric"
+            onChange={e => {
+              const v = e.target.value.replace(/\D/g, "").slice(0, 4);
+              setNewYear(v);
+              /* الاقتراحُ يتبع السنةَ ما لم يكتب المديرُ اسماً بيده */
+              if (!nameTouched) setNewName(suggestNameFromYear(v));
+            }}
+            placeholder="1449" style={{ ...inp, direction: "ltr", textAlign: "left" }} />
+          {newYear.trim() !== "" && !yearValid && <div style={{ fontSize: 11, color: "var(--danger)", marginTop: 6 }}>السنة الهجرية يجب أن تكون عدداً صحيحاً.</div>}
+          {yearTaken && <div style={{ fontSize: 11, color: "var(--danger)", marginTop: 6 }}>يوجد موسم لهذه السنة بالفعل.</div>}
+
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", margin: "12px 0 5px" }}>اسم الموسم كما يظهر في البوابة والتقارير</div>
+          <input value={newName} onChange={e => { setNameTouched(true); setNewName(e.target.value); }}
+            placeholder="موسم الحج 1449 هـ" style={inp} />
+          <div style={{ fontSize: 10.5, color: "var(--text-muted)", marginTop: 5, lineHeight: 1.7 }}>
+            الاسم نصّ حرّ للعرض، ويمكن تعديله لاحقاً من «الإعدادات ← إعدادات الموسم». والسنة الهجرية هي هوية الموسم ولا تتغيّر.
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <button onClick={() => setStep(5)} disabled={!canProceed} style={btnP({ flex: 1, opacity: canProceed ? 1 : 0.6 })}>التالي</button>
+            <button onClick={() => setStep(docItems.length > 0 ? 3 : 2)} style={btnS()}>السابق</button>
+            <button onClick={closeAndReset} style={btnS()}>إلغاء</button>
+          </div>
+        </>
+      )}
+
+      {/* ── ٥ التأكيد ── */}
+      {step === 5 && (
+        <>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>سيتم تنفيذ الآن</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12, marginBottom: 16 }}>
+            <div>✅ سيتم إغلاق «{activeSeason.name}».</div>
+            <div>✅ سيتم إنشاء «{newName.trim()}» للسنة {newYear.trim()} هـ.</div>
+            <div>✅ سيتم حفظ جميع بيانات «{activeSeason.name}» داخل الأرشيف.</div>
+            {/* حالة الصفر تُقال صراحةً: لا تُحسب نجاحاً ولا فشلاً */}
+            {docItems.length === 0 && <div>✅ لا مستندات مرفوعة في هذا الموسم — لا شيء يُحذف.</div>}
+          </div>
+
+          {docItems.length > 0 && (
+            <>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8, color: "var(--warning)" }}>يتطلب انتباهك</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12, marginBottom: 16, color: "var(--warning)" }}>
+                <div>⚠ سيتم حذف مستندات موسم {activeSeason.name} من النظام.</div>
+                {backupComplete
+                  ? <div style={{ color: "var(--success)" }}>✓ نُزّلت نسخة كاملة من المستندات.</div>
+                  : downloaded
+                    ? <div>
+                        <b>⚠ النسخة التي نُزّلت ناقصة</b> — نجح {dlSucceeded} من {docItems.length}، وتعذّر {dlFailed}.
+                        {failures.length > 0 && (
+                          <div style={{ marginTop: 4 }}>
+                            أوّلها: {failures.slice(0, 3).map(f => `${f.person} — ${f.label}`).join(" · ")}
+                            {failures.length > 3 ? " …" : ""}
+                          </div>
+                        )}
+                        <div style={{ marginTop: 4 }}>الحذف نهائيّ، فارجع وأعد المحاولة قبل المتابعة.</div>
+                      </div>
+                    : <div>⚠ لم تُنزَّل أي نسخة. إذا كنت ترغب في الاحتفاظ بها، قم بتنزيلها قبل المتابعة.</div>}
+              </div>
+            </>
+          )}
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={execute} style={btnP({ flex: 1, background: "var(--danger)" })}>تنفيذ الإقفال</button>
+            <button onClick={() => setStep(4)} style={btnS()}>السابق</button>
+            <button onClick={closeAndReset} style={btnS()}>إلغاء</button>
+          </div>
+        </>
+      )}
+
+      {/* ── التنفيذ — بلا أزرار ── */}
+      {step === "executing" && (
+        <div style={{ padding: "24px 8px", textAlign: "center" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>جارٍ إقفال الموسم…</div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)" }}>لا تغلق هذه النافذة.</div>
+        </div>
+      )}
+
+      {/* ── الإيصال ── */}
+      {step === "done" && result && (
+        <>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12, marginBottom: 16 }}>
+            <div>✅ تم إغلاق «{activeSeason.name}» بنجاح.</div>
+            <div>✅ تم إنشاء «{newName.trim()}» للسنة {newYear.trim()} هـ.</div>
+            <div>✅ أصبح «{newName.trim()}» هو الموسم النشط.</div>
+            <div style={{ color: result.docsOk ? "var(--success)" : "var(--warning)" }}>
+              {result.docsOk && dlFailed === 0 ? "✅" : "⚠️"}{" "}
+              {downloaded && dlFailed > 0
+                ? `تم تنزيل النسخة، لكن تعذّر تنزيل ${dlFailed} مستنداً. ${result.docsMsg}`
+                : downloaded && result.docsOk
+                  ? "تم تنزيل نسخة المستندات كاملة وحُذفت من النظام."
+                  : result.docsMsg}
+            </div>
+          </div>
+
+          <div style={{ background: "var(--bg-2)", borderRadius: 8, padding: 12, fontSize: 12, marginBottom: 16 }}>
+            {[
+              ["الموسم المقفل", activeSeason.name],
+              ["الموسم الجديد", newName.trim()],
+              ["السنة الهجرية", newYear.trim()],
+              ["الحجاج", String(counts?.passengers ?? "—")],
+              ["الباصات", String(counts?.buses ?? "—")],
+              ["المخيمات", String(counts?.camps ?? "—")],
+              ["الغرف", String(counts?.rooms ?? "—")],
+              ["نفّذ العملية", result.closedBy],
+              ["التاريخ والوقت", result.at],
+            ].map(([k, v]) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0" }}>
+                <span style={{ color: "var(--text-muted)" }}>{k}</span>
+                <span style={{ fontWeight: 600 }}>{v}</span>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            {/* المزوّد يحمّل المواسم عند التركيب وحده، فالخروج من
+                الإيصال يعيد التحميل ليصير الموسم الجديد هو النشط */}
+            <button onClick={onGoToNewSeason} style={btnP({ flex: 1 })}>
+              الانتقال إلى «{newName.trim()}»
+            </button>
+            <button onClick={() => window.location.reload()} style={btnS()}>العودة إلى إدارة المواسم</button>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+export { SeasonCloseWizard };

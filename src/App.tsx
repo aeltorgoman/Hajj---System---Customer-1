@@ -1,0 +1,289 @@
+import { useState, useEffect } from "react";
+import { supabase } from "./supabase";
+import { pagePerm } from "./navigation/nav";
+import { useSidebarPrefs, useIsNarrow, useIsCompactViewport } from "./navigation/useSidebar";
+import { useStaffRoute } from "./navigation/useStaffRoute";
+import type { Passenger, User } from "./types";
+import { mapPassenger, upsertPassenger, isHajj } from "./utils/passenger";
+import type { PassengerRow } from "./utils/passenger";
+import { SeasonProvider } from "./season/SeasonContext";
+import { useSeason } from "./season/useSeason";
+import { SeasonBar } from "./season/SeasonBar";
+import { Sidebar } from "./components/Sidebar";
+import { LoginPage } from "./components/LoginPage";
+import { Dashboard } from "./components/Dashboard";
+import { DashboardBanner } from "./components/DashboardBanner";
+import { TopBar } from "./components/TopBar";
+import { PassengersPage } from "./components/PassengersPage";
+import { BusesPage } from "./components/BusesPage";
+import { FlightsPage } from "./components/FlightsPage";
+import { CampsPage } from "./components/CampsPage";
+import { HotelPage } from "./components/HotelPage";
+import { ReportsPage } from "./components/ReportsPage";
+import { SeasonManagerPage } from "./components/SeasonManagerPage";
+import { UsersPage } from "./components/UsersPage";
+import { FinancePage } from "./components/FinancePage";
+import { AdminsPage } from "./components/AdminsPage";
+import { PortalPage } from "./components/PortalPage";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { LoadingSpinner } from "./components/LoadingSpinner";
+
+/* الملفّ مصدر الصلاحيات — يُقرأ من القاعدة بمعرّف الجلسة، لا من
+   المتصفح. تعديل التخزين المحلي لا يمنح شيئاً (الثابت أ٢). */
+async function loadProfile(userId: string): Promise<User | null> {
+  const { data } = await supabase
+    .from("user_profiles")
+    .select("id, email, name, permissions, is_active")
+    .eq("id", userId)
+    .maybeSingle();
+  if (!data || data.is_active !== true) return null;
+  return {
+    id: data.id,
+    email: data.email,
+    name: data.name,
+    permissions: (data.permissions ?? {}) as Record<string, boolean>,
+    is_active: data.is_active,
+  };
+}
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [checking, setChecking] = useState(true);
+
+  /* استرجاع الجلسة عند التحميل، ومتابعة تغيّرها — الخروج من تبويب
+     آخر أو انتهاء الرمز ينعكس هنا بلا إعادة تحميل */
+  useEffect(() => {
+    let cancelled = false;
+
+    const apply = async (userId: string | undefined) => {
+      if (!userId) { if (!cancelled) { setCurrentUser(null); setChecking(false); } return; }
+      const profile = await loadProfile(userId);
+      if (cancelled) return;
+      /* جلسة صالحة بلا ملفّ = لا دخول — §٤.٣ */
+      if (!profile) await supabase.auth.signOut();
+      setCurrentUser(profile);
+      setChecking(false);
+    };
+
+    supabase.auth.getSession().then(({ data }) => apply(data.session?.user?.id));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+      void apply(session?.user?.id);
+    });
+    return () => { cancelled = true; sub.subscription.unsubscribe(); };
+  }, []);
+
+  const handleLogin = (user: User) => setCurrentUser(user);
+
+  const handleLogout = async () => {
+    /* الخروجُ يُعيد العنوانَ إلى الرئيسية:
+       الدخولُ التالي لا يرث صفحةَ من خرج */
+    window.history.replaceState(null, "", "/");
+    await supabase.auth.signOut();
+    setCurrentUser(null);
+  };
+
+  if (checking) return <LoadingSpinner />;
+  if (!currentUser) return <LoginPage onLogin={handleLogin} />;
+
+  /* المزوّد داخل الجزء المصادَق عليه وحده: لا يتأخر ظهور شاشة
+     الدخول، ولا تُجلب المواسم قبل تسجيل الدخول */
+  return (
+    <SeasonProvider>
+      <AppShell currentUser={currentUser} onLogout={handleLogout} />
+    </SeasonProvider>
+  );
+}
+
+function AppShell({ currentUser, onLogout }: { currentUser: User; onLogout: () => void }) {
+  const { viewedSeason } = useSeason();
+  /* الصفحةُ من عنوان المتصفّح؛ و`setPage` مُحوِّلٌ يدفع التاريخ — نفسُ
+     التوقيع لكلّ مستدعٍ قائم */
+  const { page, navigate: setPage } = useStaffRoute();
+  const [reportsResetKey, setReportsResetKey] = useState(0);
+  /* السايدبار: الطيُّ تفضيلُ المستخدم (محفوظٌ محلّياً) لا نتيجةُ الصفحة؛
+     وتحت عرضٍ ضيّقٍ يصير درجاً يُفتَح ويُغلَق دون مسّ الصفحة أو الموسم. */
+  const { compact, toggleCompact } = useSidebarPrefs();
+  const narrow = useIsNarrow();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerVisible = narrow && drawerOpen;
+  useEffect(() => {
+    if (!drawerVisible) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setDrawerOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [drawerVisible]);
+  const openNav = narrow ? () => setDrawerOpen(true) : undefined;
+  /* ⚠️ على الجوّال واللوحيّ: صفحةٌ أعرضُ من الشاشة (جدولُ الحجاج مثلاً) كانت تفيض
+     خارج الغلاف، فيُوسِّع متصفّحُ الجوّال «منفذَ التخطيط» كلَّه إلى عرضها
+     ويُصغِّر الصفحةَ كاملةً — الشريطَ والدرجَ معها. فيُحبَس فيضُ الصفحة في
+     منطقتها: تتمرّر أفقيّاً وحدَها ويبقى الغلافُ بعرض الشاشة. */
+  const containPage = useIsCompactViewport();
+  const pageContain: React.CSSProperties = containPage ? { minWidth: 0, maxWidth: "100vw", overflowX: "auto" } : {};
+
+  useEffect(() => {
+    const handler = () => setPage("dash");
+    window.addEventListener("hajj_return_dash", handler);
+    /* الانتقال بعد الدخول إلى موسم مؤرشَف — بنفس نمط الحدث القائم
+       أعلاه، فلا يحتاج تمرير setPage عبر الشجرة */
+    const goto = (e: Event) => setPage((e as CustomEvent<string>).detail);
+    window.addEventListener("hajj_goto_page", goto);
+    return () => {
+      window.removeEventListener("hajj_return_dash", handler);
+      window.removeEventListener("hajj_goto_page", goto);
+    };
+  }, [setPage]);
+
+  const [passengers, setPassengers] = useState<Passenger[]>([]);
+  const [passengersLoading, setPassengersLoading] = useState(true);
+  const [passengersError, setPassengersError] = useState(false);
+  const [globalShowManual, setGlobalShowManual] = useState(false);
+
+  useEffect(() => {
+    const loadPassengers = async () => {
+      const { data, error } = await supabase.from("passengers").select("*").eq("season_id", viewedSeason.id).order("sort_order", { ascending: true }).order("id", { ascending: true });
+      /* الفشل يُبلَّغ عنه بدل عرض قائمة فارغة تبدو كـ«لا يوجد حجاج» */
+      if (error || !data) {
+        setPassengersError(true);
+      } else {
+        setPassengers(data.map(mapPassenger));
+        setPassengersError(false);
+      }
+      setPassengersLoading(false);
+    };
+    loadPassengers();
+    /* ⚠️ الفلترة في العميل مقصودة — لا تستبدلها بفلتر خادميّ.
+       إضافة `filter: "season_id=eq.N"` إلى خيارات postgres_changes
+       تبدو أنظف، لكنها تكسر الحذف: حدث DELETE لا يحمل في payload.old
+       غير المفتاح الأساسي (replica identity الافتراضية)، فلا يطابق
+       شرطاً على season_id أبداً، وتختفي كل إشعارات الحذف صامتةً.
+       الفرز أدناه بدل ذلك — حدث على موسم آخر لا يدخل هذه الشاشة. */
+    const channel = supabase.channel("passengers-realtime")
+      .on<PassengerRow>("postgres_changes", { event: "*", schema: "public", table: "passengers" }, payload => {
+        if (payload.eventType === "INSERT") {
+          if (payload.new.season_id !== viewedSeason.id) return;
+          const added = mapPassenger(payload.new);
+          setPassengers(prev => upsertPassenger(prev, added));
+        } else if (payload.eventType === "UPDATE") {
+          if (payload.new.season_id !== viewedSeason.id) return;
+          const updated = mapPassenger(payload.new);
+          setPassengers(prev => prev.map(p => p.id === updated.id ? updated : p));
+        } else if (payload.eventType === "DELETE") {
+          const removedId = payload.old.id;
+          setPassengers(prev => prev.filter(p => p.id !== removedId));
+        }
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [viewedSeason.id]);
+
+  const FULL_PAGES = ["dash", "passengers", "manual", "buses", "flights", "mina", "arafa", "hotel", "finance", "admins", "users"];
+  const isFull = FULL_PAGES.includes(page);
+
+  const renderPage = () => {
+    /* الصلاحيةُ من مصدر التنقّل الواحد (navigation/nav.ts) — نفسُه الذي
+       يبني السايدبار وقائمتي ⚙، فلا تنفصل عنه إذا تغيّرت صفحة. */
+    const requiredPerm = pagePerm(page);
+    if (requiredPerm && !currentUser.permissions?.[requiredPerm]) {
+      return (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", fontSize: 15, fontWeight: 700, color: "var(--danger)" }}>
+          لا تملك صلاحية الوصول لهذه الصفحة
+        </div>
+      );
+    }
+    switch (page) {
+      case "dash":       return <Dashboard passengers={passengers} setPage={setPage} currentUser={currentUser!} onAddManual={() => { setGlobalShowManual(true); (window as any).__hajj_scan_return_dash__ = true; setPage("passengers"); }} onScan={(file) => { (window as any).__hajj_pending_scan_file__ = file; (window as any).__hajj_scan_return_dash__ = true; setPage("passengers"); }} />;
+      case "passengers": return <PassengersPage passengers={passengers} setPassengers={setPassengers} currentUser={currentUser!} globalShowManual={globalShowManual} onGlobalManualClose={() => setGlobalShowManual(false)} />;
+      case "buses":      return <BusesPage passengers={passengers} setPassengers={setPassengers} />;
+      case "flights":    return <FlightsPage passengers={passengers} setPassengers={setPassengers} />;
+      case "mina":       return <CampsPage pageType="منى" passengers={passengers} setPassengers={setPassengers} />;
+      case "arafa":      return <CampsPage pageType="عرفة" passengers={passengers} setPassengers={setPassengers} />;
+      case "hotel":      return <HotelPage passengers={passengers} setPassengers={setPassengers} />;
+      case "reports":    return <ReportsPage passengers={passengers} resetKey={reportsResetKey} currentUser={currentUser!} />;
+      case "archive":    return <SeasonManagerPage currentUser={currentUser} />;
+      case "users":      return <UsersPage currentUser={currentUser} />;
+      case "finance":    return <FinancePage passengers={passengers} setPassengers={setPassengers} currentUser={currentUser!} />;
+      case "admins":     return <AdminsPage passengers={passengers} setPassengers={setPassengers} currentUser={currentUser!} />;
+      case "portal":     return <PortalPage currentUser={currentUser!} />;
+      default:           return <Dashboard passengers={passengers} setPage={setPage} currentUser={currentUser!} />;
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh", direction: "rtl", fontFamily: "var(--font-body)", background: "var(--ivory)" }}>
+
+      {/* شريط سياق الموسم — لا يظهر إلا عند تصفّح موسم مؤرشَف */}
+      <SeasonBar />
+
+      {/* البانر — كامل العرض فوق الكل، يظهر فقط في الداشبورد */}
+      {page === "dash" && (
+        <DashboardBanner setPage={setPage} currentUser={currentUser!} onLogout={onLogout} onOpenNav={openNav} />
+      )}
+
+      {/* الجسم — السايدبار + المحتوى */}
+      <div style={{ flex: 1, display: "flex", alignItems: "flex-start" }}>
+        {/* السايدبار ثابت — على العرض الضيّق يصير درجاً فوق المحتوى */}
+        {!narrow && (
+          <div style={{ position: "sticky", top: 0, height: "100vh", flexShrink: 0 }}>
+            <Sidebar
+              page={page} setPage={setPage}
+              count={passengers.filter(p => isHajj(p)).length}
+              currentUser={currentUser}
+              onReportsClick={() => setReportsResetKey(k => k + 1)}
+              compact={compact} onToggleCompact={toggleCompact}
+            />
+          </div>
+        )}
+        {drawerVisible && (
+          <div style={{ position: "fixed", inset: 0, zIndex: 10000 }}>
+            <div onClick={() => setDrawerOpen(false)} aria-hidden="true" style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,.45)" }} />
+            <div role="dialog" aria-modal="true" aria-label="القائمة" style={{ position: "absolute", top: 0, bottom: 0, right: 0, display: "flex" }}>
+              <Sidebar
+                page={page} setPage={setPage}
+                count={passengers.filter(p => isHajj(p)).length}
+                currentUser={currentUser}
+                onReportsClick={() => setReportsResetKey(k => k + 1)}
+                compact={false} drawer onNavigate={() => setDrawerOpen(false)}
+              />
+              <button type="button" className="nav-menu-btn" onClick={() => setDrawerOpen(false)} aria-label="إغلاق القائمة"
+                style={{ position: "absolute", top: 10, left: -44, width: 36, height: 36, borderRadius: 10, border: "none", background: "rgba(0,0,0,.55)", color: "white", cursor: "pointer", fontSize: 18, lineHeight: 1, zIndex: 3 }}>×</button>
+            </div>
+          </div>
+        )}
+
+        {/* المحتوى — يتمرر بشكل طبيعي */}
+        <div style={{ flex: 1, minWidth: 0, minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+          {page !== "dash" && (
+            <TopBar page={page} setPage={setPage} currentUser={currentUser!} onLogout={onLogout} onOpenNav={openNav} />
+          )}
+          {isFull ? (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", ...pageContain }}>
+              {/* key= يُعيد تركيب شجرة الصفحات عند تبديل الموسم، فلا
+                  تتسرّب مودالات ولا تحديدات ولا مسوّدات من موسم سابق */}
+              <ErrorBoundary key={viewedSeason.id}>
+                {passengersLoading ? <LoadingSpinner /> : passengersError ? (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 6, padding: 24, textAlign: "center" }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: "var(--danger)" }}>تعذر تحميل بيانات الحجاج</div>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)" }}>يرجى التحقق من الاتصال وتحديث الصفحة</div>
+                </div>
+                ) : renderPage()}
+              </ErrorBoundary>
+            </div>
+          ) : (
+            <div style={{ background: "var(--ivory)", padding: "20px", ...pageContain }}>
+              <div style={{ maxWidth: (page as string) === "scan" ? 620 : 900, margin: "0 auto" }}>
+                <ErrorBoundary key={viewedSeason.id}>
+                  {passengersLoading ? <LoadingSpinner /> : passengersError ? (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 6, padding: 24, textAlign: "center" }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: "var(--danger)" }}>تعذر تحميل بيانات الحجاج</div>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)" }}>يرجى التحقق من الاتصال وتحديث الصفحة</div>
+                </div>
+                ) : renderPage()}
+                </ErrorBoundary>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

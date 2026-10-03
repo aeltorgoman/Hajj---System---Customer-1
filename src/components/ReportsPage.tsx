@@ -1,0 +1,2392 @@
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { useSeason } from "../season/useSeason";
+import { isHajj, orderHajjThenAdmins } from "../utils/passenger";
+/* ═══ الكشوفُ المشتركة ═══
+   من في الباص والمخيّم والرحلة، وبأيّ ترتيب، وبأيّ عنوان — من المصدر
+   نفسه الذي تطبع منه صفحاتُ الإسناد. فالورقةُ واحدةٌ من أيّ باب طُبعت. */
+import { busManifest, campManifest, campSubtitle, flightPassengers, campsInOrder, flightsInOrder,
+         busesReportDocument, busReportDocument,
+         campsReportDocument, campReportDocument,
+         flightReportDocument, flightsReportDocument,
+         docFileKind, docImageBody, docFailedBody, loadPdfPageRenderer,
+         hotelReportDocument, initialPrintOptions, chromeFromOptions,
+         compactHeaderHTML, chromeMetaHTML, pageStampHTML, PAGE_MARGIN_REPORT,
+         type PrintReportKey, type PrintOptionsState } from "../print";
+import { PrintOptionsMenu } from "./PrintOptionsMenu";
+import * as XLSX from "xlsx";
+import { supabase } from "../supabase";
+import { useCompanyPortal, useReportBranding } from "../company/CompanyContext";
+import type { Passenger, Bus, Camp, Room, Flight, User } from "../types";
+import { makeHTML, buildStickersHTML, printInPage, freezeHeaderRow, addSummarySheet, styleTitleRow, styleHeaderRow, safeSheetName, ROOM_COLORS, HOTEL_ROOM_TYPES, roomCapacity, btnP, btnS, DOC_TTL, signedDocUrl, fetchDocumentBytes } from "../utils";
+import { AlertModal, useAlert } from "./AlertModal";
+import { REPORTS_RESPONSIVE_CSS } from "./reports.responsive";
+
+// ============================================================
+// تحويل الجنسية لكود إنجليزي موحّد لتقرير خطوط الطيران
+// ============================================================
+const NAT_CODE_MAP: Record<string, string> = {
+  "قطري": "QAT", "قطرية": "QAT",
+  "سعودي": "KSA", "سعودية": "KSA",
+  "اماراتي": "UAE", "إماراتي": "UAE", "اماراتية": "UAE", "إماراتية": "UAE",
+  "كويتي": "KWT", "كويتية": "KWT",
+  "بحريني": "BHR", "بحرينية": "BHR",
+  "عماني": "OMN", "عمانية": "OMN", "عُماني": "OMN",
+  "مصري": "EGY", "مصرية": "EGY",
+  "يمني": "YEM", "يمنية": "YEM",
+  "سوري": "SYR", "سورية": "SYR",
+  "لبناني": "LBN", "لبنانية": "LBN",
+  "اردني": "JOR", "أردني": "JOR", "اردنية": "JOR", "أردنية": "JOR",
+  "فلسطيني": "PLE", "فلسطينية": "PLE",
+  "عراقي": "IRQ", "عراقية": "IRQ",
+  "سوداني": "SDN", "سودانية": "SDN",
+  "ليبي": "LBY", "ليبية": "LBY",
+  "تونسي": "TUN", "تونسية": "TUN",
+  "جزائري": "ALG", "جزائرية": "ALG",
+  "مغربي": "MAR", "مغربية": "MAR",
+  "هندي": "IND", "هندية": "IND",
+  "باكستاني": "PAK", "باكستانية": "PAK",
+  "بنغلاديشي": "BAN", "بنغلاديشية": "BAN",
+  "فلبيني": "PHI", "فلبينية": "PHI",
+  "نيبالي": "NEP", "نيبالية": "NEP",
+  "سريلانكي": "SRI", "سريلانكية": "SRI",
+};
+const NAT_EN_PATTERNS: [RegExp, string][] = [
+  [/qatar/i, "QAT"], [/saudi/i, "KSA"], [/emirat|uae/i, "UAE"], [/kuwait/i, "KWT"],
+  [/bahrain/i, "BHR"], [/oman/i, "OMN"], [/egypt/i, "EGY"], [/yemen/i, "YEM"],
+  [/syria/i, "SYR"], [/lebanon|lebanes/i, "LBN"], [/jordan/i, "JOR"], [/palestin/i, "PLE"],
+  [/iraq/i, "IRQ"], [/sudan/i, "SDN"], [/liby/i, "LBY"], [/tunis/i, "TUN"],
+  [/algeri/i, "ALG"], [/morocc/i, "MAR"], [/india/i, "IND"], [/pakistan/i, "PAK"],
+  [/banglades/i, "BAN"], [/philippin/i, "PHI"], [/nepal/i, "NEP"], [/sri ?lank/i, "SRI"],
+];
+function natCode(nat: string | undefined | null): string {
+  const v = (nat || "").trim();
+  if (!v) return "—";
+  if (NAT_CODE_MAP[v]) return NAT_CODE_MAP[v];
+  for (const [re, code] of NAT_EN_PATTERNS) if (re.test(v)) return code;
+  // غير معروفة: أول 3 حروف بالإنجليزي لو متاحة، وإلا القيمة الأصلية
+  return /^[A-Za-z]/.test(v) ? v.slice(0, 3).toUpperCase() : v;
+}
+
+// دالة خالصة لا تقرأ إلا وسيطها، فمكانها خارج المكوّن حتى تبقى مرجعيتها
+// ثابتة ولا تُبطل الاشتقاقات المذكَّرة التي تستعملها
+const floorKey = (r: Room) => r.floor ? String(r.floor) : "بدون طابق";
+
+function ReportsPage({ passengers: rawPassengers, resetKey, currentUser }: { passengers: Passenger[]; resetKey?: number; currentUser: User }) {
+  const { alert: alertState, showAlert } = useAlert();
+  /* صفحة قراءة بحتة: تحترم الموسم المعروض في بياناتها، ولا تعرف
+     readOnly ولا تُعطَّل فيها طباعة ولا تصدير ولا بحث */
+  /* ...إلا فعلاً واحداً: **إرسال واتساب ليس قراءة**. وهو الفعلُ
+     الصادرُ الوحيد في هذه الصفحة، فيأخذ حارسَيه — الصلاحيةَ
+     والموسمَ — ولا يمتدّ الحارسان إلى شيءٍ آخر فيها. */
+  const { viewedSeason, canWrite } = useSeason();
+
+  /* `view_reports` تفتح الصفحة، و`manage_portal` وحدها تأذن
+     بالإرسال — وهي الصلاحية نفسها التي تحرس `send-pilgrim-push`.
+     والخادمُ يفرضها في `whatsapp-send`؛ هذا الشرطُ هنا يوافقه فلا
+     يُعرَض زرٌّ ينتهي إلى ٤٠٣. */
+  const canSendWhatsapp = currentUser.permissions?.manage_portal === true;
+  /* وموسمٌ مؤرشَف لا يُراسَل: الخادمُ يرفضه بـ٤٠٤ لكلّ حاجّ، فلا
+     يُترك الموظّف يكتشفه صفّاً صفّاً. */
+  const waBlockReason = !canSendWhatsapp
+    ? "الإرسال يحتاج صلاحية «بوابة الحاج (التنبيهات والإعدادات)»."
+    : !canWrite
+      ? `موسم ${viewedSeason.name} للعرض فقط — لا تُرسَل رسائل لحجّاج موسمٍ مؤرشَف.`
+      : null;
+  const waBlocked = waBlockReason !== null;
+  const passengers = useMemo(() => [...rawPassengers].sort((a, b) => ((a.sort_order ?? 0) - (b.sort_order ?? 0))), [rawPassengers]);
+  /* ترتيب كشف طلب الحجز — ثلاثة أوضاع ولا رابع، ولا «حسب الرحلة» */
+  const [bookingSort, setBookingSort] = useState<"manual" | "alpha" | "gender">("manual");
+  /* عمودُ انتهاء الجواز — اختياريّ: تطلبه بعضُ الخطوط ولا تطلبه أخرى.
+     ⚠️ وهو **عمودُ بيانات** لا خيارُ عرض، فيبقى مستقلّاً عن «خيارات
+     الطباعة» ولا يُدرَج فيها. */
+  const [airlineShowExpiry, setAirlineShowExpiry] = useState(false);
+
+  /* خياراتُ العرض لكلّ منطقة تقرير — خريطةٌ واحدة، لا حالةٌ لكلّ تقرير.
+     وكلُّ مفتاحٍ يبدأ بمظهره المعتمَد كما تصفه `PRINT_SPECS`. */
+  const [printOpts, setPrintOpts] = useState<Record<string, PrintOptionsState>>({});
+  const optsFor = (k: PrintReportKey) => printOpts[k] ?? initialPrintOptions(k);
+  const setOptsFor = (k: PrintReportKey) => (next: PrintOptionsState) =>
+    setPrintOpts(prev => ({ ...prev, [k]: next }));
+  const chromeFor = (k: PrintReportKey, inputs: Parameters<typeof chromeFromOptions>[2] = {}) =>
+    chromeFromOptions(k, optsFor(k), inputs);
+  const optionsMenu = (k: PrintReportKey) => (
+    <PrintOptionsMenu report={k} value={optsFor(k)} onChange={setOptsFor(k)} />
+  );
+  // طالب درجة أولى: لو الدرجة المخصصة "درجة أولى" أو لو ده طلبه الأصلي في بياناته
+  const wantsFirstClass = (p: Passenger) => p.flight_class === "درجة أولى" || p.services?.flight === "درجة أولى";
+  /* ── كشف طلب الحجز ──────────────────────────────────────────
+     تعريف واحد للسكّان تقرأه الطبقات الأربع: بطاقة الدخول
+     والمعاينة والطباعة وملف الإكسل. كان لكلٍّ منها تعريفه، فتعطي
+     الشاشة رقماً ويعطي المطبوع رقماً آخر.
+
+     والكشف يُرسَل إلى شركة الطيران **قبل** أن تصل الحجوزات وأرقام
+     الرحلات ومواعيدها، فلا دور لـ`flight_id` ولا `return_flight_id`
+     في الدخول: المعيار هو من تطلب له الحملة تذكرة.
+
+     الحاجّ يعبّر عن ذلك بخدمته، والإداري بـ`wants_flight`. */
+  const bookingPopulation = useMemo(
+    () => passengers.filter(p => isHajj(p) ? p.services?.flight !== "بدون" : !!p.wants_flight),
+    [passengers],
+  );
+
+  /* ── ترتيب كشف طلب الحجز ────────────────────────────────────
+     ثلاثة أوضاع يختارها الموظّف، ولا رابع. ولا «ترتيب حسب الرحلة»:
+     الكشف يُرسَل قبل أن توجد الرحلات أصلاً.
+
+     «ترتيب الحجاج» وحده يضع الإداريين بعد الحجّاج، ويستعمل الترتيب
+     اليدويّ المعتمَد (`passengers.sort_order`) عبر
+     `orderHajjThenAdmins` — المصدر الوحيد، ولا ترتيبَ ثانٍ يُبتكر.
+
+     والوضعان الآخران يعاملان الحاجّ والإداريّ سواءً: لا يُدفع
+     الإداريّ إلى الذيل. */
+  const arCmp = (a: Passenger, b: Passenger) =>
+    (a.short_ar || a.name_ar || "").localeCompare(b.short_ar || b.name_ar || "", "ar") || a.id - b.id;
+
+  const bookingList = useMemo(() => {
+    if (bookingSort === "alpha") return [...bookingPopulation].sort(arCmp);
+    if (bookingSort === "gender") {
+      const males = bookingPopulation.filter(p => p.gender === "ذكر").sort(arCmp);
+      const females = bookingPopulation.filter(p => p.gender !== "ذكر").sort(arCmp);
+      return [...males, ...females];
+    }
+    return orderHajjThenAdmins(bookingPopulation);
+  }, [bookingPopulation, bookingSort]);
+
+  /* علامة المجموعة — رقمٌ خفيف يجمع أفراد الأسرة الواحدة ليفهم
+     موظّف شركة الطيران أن المتجاورين أسرة. لا يغيّر الترتيب، ولا
+     يُظهر `family_id` ولا يخترع صلةً (زوج/ابن) لا يحفظها النظام.
+     ويظهر في وضع «ترتيب الحجاج» وحده — حيث التجاور ذو معنى. */
+  const familyGroupNo = useMemo(() => {
+    const m = new Map<number, number>();
+    if (bookingSort !== "manual") return m;
+    const counts = new Map<string, number>();
+    bookingList.forEach(p => { if (p.family_id) counts.set(p.family_id, (counts.get(p.family_id) || 0) + 1); });
+    let n = 0;
+    const seen = new Map<string, number>();
+    bookingList.forEach(p => {
+      if (!p.family_id || (counts.get(p.family_id) || 0) < 2) return;
+      if (!seen.has(p.family_id)) seen.set(p.family_id, ++n);
+      m.set(p.id, seen.get(p.family_id)!);
+    });
+    return m;
+  }, [bookingList, bookingSort]);
+  /* نزلاء الغرفة — كل من `room_id` يشير إليها. كان الكشف المطبوع
+     يحذف الإداري من كرت غرفته، فيوزّع موظّف الفندق المفاتيح على
+     أسماء ناقصة. والتقرير داخلي، فالتفصيل حاج/إداري مطلوب فيه. */
+  const roomOccupants = (roomId: number) => passengers.filter(p => p.room_id === roomId);
+  /* أسطر التركيبة في ملخّصات الإكسل — تظهر حين يوجد إداري فعلاً،
+     فلا يُثقَل الملخّص بسطر «صفر إداريين» في حملة بلا إداريين.
+     موحّدة للفندق والباصات والمخيّمات: سؤال واحد وجواب واحد. */
+  const breakdownRows = (list: Passenger[]): (string | number)[][] => {
+    const admins = list.filter(p => !isHajj(p)).length;
+    return admins ? [["منهم حجاج", list.length - admins], ["منهم إداريون", admins]] : [];
+  };
+
+
+  const bookingPilgrims = bookingList.filter(p => isHajj(p)).length;
+  const bookingAdmins = bookingList.length - bookingPilgrims;
+
+  // الحجاج المرتبطين برحلة معينة — ذهاب عبر flight_id، إياب عبر return_flight_id (مستقلين)
+  /* كشف الرحلة الواحدة: الترتيب اليدويّ المعتمَد للحجّاج ثم
+     الإداريون بعدهم — المصدر نفسه الذي تستعمله صفحة الرحلات
+     وطباعتها، فلا ترتيبَ ثانٍ ولا محدّد ترتيبٍ منفصل. */
+  const passengersOfFlight = (flight: Flight) => flightPassengers(flight, passengers);
+  // اسم الرحلة المرتبط بالحاج (لرسائل الواتساب) — ذهاب أولاً ثم إياب
+  const flightNameFor = (p: Passenger) => flights.find(f => f.id === p.flight_id)?.name || flights.find(f => f.id === p.return_flight_id)?.name || "—";
+  const reportBranding = useReportBranding();
+  const companyPortal = useCompanyPortal();
+  const { companyName, primaryColor } = reportBranding;
+  // ألوان التقارير المطبوعة = لون الشركة الثابت من الإعدادات (مستقل عن ثيم الواجهة)
+  // بحيث يثبّت كل عميل/شركة لونه الخاص في المطبوعات بصرف النظر عن الثيم الذي يستخدمه الموظف على الشاشة
+  /* هوية الطباعة — نسخة واحدة تخدم كل مولّدات التقارير أدناه */
+  const branding = reportBranding;
+
+  const [activeReport, setActiveReport] = useState<string | null>(null);
+  const [expandedItems, setExpandedItems] = useState<Set<number>>(new Set());
+  const toggleExpandedItem = (id: number) => setExpandedItems(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const [openPanels, setOpenPanels] = useState<Set<string>>(new Set());
+  const togglePanel = (key: string) => setOpenPanels(prev => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+
+  // الرجوع لقائمة التقارير لو ضغط المستخدم على "التقارير" في القايمة الجانبية وهو بالفعل داخل تقرير
+  useEffect(() => {
+    if (resetKey !== undefined) { const t = setTimeout(() => setActiveReport(null), 0); return () => clearTimeout(t); }
+  }, [resetKey]);
+
+  const [buses, setBuses] = useState<Bus[]>([]);
+  const [camps, setCamps] = useState<Camp[]>([]);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [flights, setFlights] = useState<Flight[]>([]);
+  /* ── حالةُ كلّ مرجعٍ على حدة ──────────────────────────────────
+     كانت رايةٌ واحدة (`refDataError`) ترتفع إن سقط أيُّ استعلامٍ من
+     الأربعة، فيُعطَّل تقريرُ الباصات لأنّ استعلامَ الرحلات تعثّر —
+     وهما لا يمسّ أحدهما الآخر. والآن لكلّ مرجعٍ حالتُه، فلا يُعطَّل
+     إلا ما سقط فعلاً.
+     وإعادةُ المحاولة نداءُ دالّةٍ لا تحديثُ صفحة. */
+  type LoadState = "idle" | "loading" | "ready" | "error";
+  type RefKey = "buses" | "camps" | "rooms" | "flights";
+  const [refState, setRefState] = useState<Record<RefKey, LoadState>>({
+    buses: "idle", camps: "idle", rooms: "idle", flights: "idle",
+  });
+  const isLoading = (...keys: RefKey[]) => keys.some(k => refState[k] === "loading" || refState[k] === "idle");
+  const isFailed  = (...keys: RefKey[]) => keys.some(k => refState[k] === "error");
+
+  const loadingBox = (
+    <div style={{ textAlign: "center", padding: "2rem", color: "var(--text-muted)", fontSize: 13 }}>
+      <div className="rep-spin" style={{ width: 22, height: 22, margin: "0 auto 10px", borderRadius: "50%", border: "2.5px solid var(--line)", borderTopColor: "var(--primary)" }} />
+      جاري التحميل...
+    </div>
+  );
+  /* الخطأُ يقول ما الذي سقط، ويعطي بابَ الخروج منه */
+  const errorBox = (keys: RefKey[], what: string) => (
+    <div style={{ textAlign: "center", padding: "1.6rem", color: "var(--danger)", fontWeight: 700, fontSize: 13 }}>
+      <div style={{ marginBottom: 4 }}>تعذّر تحميل {what}</div>
+      <div style={{ fontSize: 11, fontWeight: 600, color: "var(--muted)", marginBottom: 12 }}>تحقّق من الاتصال ثم أعد المحاولة — لا حاجة لتحديث الصفحة</div>
+      <button onClick={() => loadRefData(keys)} style={{ ...btnP({ fontSize: 12, fontWeight: 700, padding: "6px 16px", borderRadius: "var(--radius-sm)" }) }}>
+        إعادة المحاولة
+      </button>
+    </div>
+  );
+  const emptyBox = (what: string, hint?: string) => (
+    <div style={{ textAlign: "center", padding: "2rem", color: "var(--text-muted)", fontSize: 13 }}>
+      <div style={{ fontWeight: 700, marginBottom: hint ? 4 : 0 }}>{what}</div>
+      {hint && <div style={{ fontSize: 11 }}>{hint}</div>}
+    </div>
+  );
+
+  // تحديد عناصر التقرير (لطباعة عنصر واحد بس أو أكثر)
+  const [selectedBusIds, setSelectedBusIds] = useState<Set<number>>(new Set());
+  const [selectedFlightIds, setSelectedFlightIds] = useState<Set<number>>(new Set());
+  const [selectedMinaCampIds, setSelectedMinaCampIds] = useState<Set<number>>(new Set());
+  const [selectedArafaCampIds, setSelectedArafaCampIds] = useState<Set<number>>(new Set());
+  const [selectedFloors, setSelectedFloors] = useState<Set<string>>(new Set());
+
+  // تقرير الفندق — فلتر الطباعة
+  const [hotelPrintFilter, setHotelPrintFilter] = useState<"all" | "type">("all");
+  const [hotelPrintType, setHotelPrintType] = useState<string>("");
+  const floorItems = useMemo(() => [...new Set(rooms.map(r => floorKey(r)))]
+    .sort((a, b) => {
+      if (a === "بدون طابق") return 1;
+      if (b === "بدون طابق") return -1;
+      return Number(a) - Number(b);
+    })
+    .map(f => ({ id: f, label: f === "بدون طابق" ? f : `طابق ${f}` })), [rooms]);
+
+  // تقرير الطيران — نوع التقرير الفرعي
+  const [flightSubReport, setFlightSubReport] = useState<"airline" | "per_flight" | null>(null);
+  const [docType, setDocType] = useState<"passport_url" | "national_id_url" | "hajj_permit_url" | "flight_ticket_url">("passport_url");
+  const [docSelected, setDocSelected] = useState<Record<string, Set<number>>>({});
+  const [docPerPage, setDocPerPage] = useState<1 | 2 | 4>(2);
+  /* تصييرُ الـPDF يأخذ وقتاً — والزرُّ يقول ذلك بدل أن يبدو معطَّلاً */
+  const [docPreparing, setDocPreparing] = useState(false);
+  const [docPersonFilter, setDocPersonFilter] = useState<"all" | "hajj" | "admin">("all");
+
+  /* ─── مطبوعات الشنط ─── */
+  const [stkFilter, setStkFilter] = useState<"all" | "bus" | "room" | "one">("all");
+  // @ts-ignore
+  const [stkBusId, setStkBusId] = useState<number | null>(null);
+  // @ts-ignore
+  const [stkRoomId, setStkRoomId] = useState<number | null>(null);
+  // @ts-ignore
+  const [stkPassId, setStkPassId] = useState<number | null>(null);
+  const [stkTypes, setStkTypes] = useState({ sticker: true, hand_tag: true, long_tag: true });
+  // @ts-ignore — مستخدم داخل IIFE في JSX
+  const [stkDrawerOpen, setStkDrawerOpen] = useState(false);
+  // @ts-ignore — مستخدم داخل IIFE في JSX
+  const [stkSearch, setStkSearch] = useState("");
+  // @ts-ignore — مستخدم داخل IIFE في JSX
+  const [stkSelected, setStkSelected] = useState<Set<number>>(() => new Set());
+  const [printDates, setPrintDates] = useState<Record<number, string>>(() => {
+    try { return JSON.parse(localStorage.getItem("stk_print_dates") || "{}"); } catch { return {}; }
+  });
+
+  // ===== WhatsApp State =====
+  const [waTemplate, setWaTemplate] = useState(() => localStorage.getItem("wa_template") ||
+`السلام عليكم {الاسم}،
+تفاصيل رحلتك:
+🚌 الباص: {الباص}
+الرحلة: {الرحلة}
+🏨 الغرفة: {الغرفة}
+⛺ مخيم منى: {منى}
+⛺ مخيم عرفة: {عرفة}
+بارك الله في حجكم`);
+  const [waSendDocs, setWaSendDocs] = useState({ permit: true, ticket: true });
+  const [waSending, setWaSending] = useState(false);
+  const [waResults, setWaResults] = useState<{ name: string; phone: string; status: "success" | "error" | "pending" }[]>([]);
+  const [waSelectedIds, setWaSelectedIds] = useState<Set<number>>(new Set());
+  const [waSelectMode, setWaSelectMode] = useState<"all" | "select">("all");
+
+  /* ═══ محوُ نسخِ الرمز القديمة من الأجهزة ═══
+     كان الرمز يُحفظ في `localStorage` على كل جهازٍ أُرسل منه، وهو
+     يبقى هناك بعد أن تزول الشيفرةُ التي كتبته. فالحذفُ يقع عند كل
+     فتحٍ للصفحة: تنظيفٌ لا قراءة — القيمةُ القديمة لا تُقرأ ولا
+     تُرسَل ولا تُهاجَر إلى مكانٍ آخر.
+     ويبقى السطران ما بقيت أجهزةٌ لم تفتح الصفحة بعد. */
+  useEffect(() => {
+    try {
+      localStorage.removeItem("wa_token");
+      localStorage.removeItem("wa_phone_id");
+    } catch { /* التخزين غير متاح — لا شيء يُمحى ولا شيء يُعطَّل */ }
+  }, []);
+
+  /* ═══ إرسال واتساب — الخادم وحده ═══
+     `whatsapp-send` تحقن رمز Meta من أسرار البنية، فلا رمزَ في
+     المتصفّح ولا نداءَ إلى Meta منه. **رسالة واحدة لكل استدعاء**
+     عمداً: الحلقة والتقدّم يبقيان هنا، فلا سقف زمنيّ على الخادم
+     ولا تضيع حالة الصفوف الحيّة.
+
+     ولا مسارَ احتياطيّ: احتياطيٌّ في المتصفّح يعني رمزاً في
+     المتصفّح، وهو بعينه ما جاء هذا العمل ليُنهيه. فإخفاقُ الخادم
+     إخفاقٌ يُعلَن، لا بابٌ خلفيٌّ يُسلَك. */
+  const waSendServer = async (payload: Record<string, unknown>): Promise<boolean> => {
+    const { data, error } = await supabase.functions.invoke("whatsapp-send", { body: payload });
+    if (error) return false;
+    return (data as { ok?: boolean } | null)?.ok === true;
+  };
+
+  /** نصّ إلى حاجّ — الخادم يتحقّق من الحاجّ ورقمه وموسمه.
+      والرقمُ من سجلّ الحاجّ لا من حقلٍ حرّ: الدالّة لا تقبل غيره. */
+  const waSendText = async (p: Passenger, text: string): Promise<boolean> => {
+    const phone = (p.phone || "").replace(/\D/g, "");
+    if (!phone) return false;
+    return waSendServer({ kind: "text", to: phone, passengerId: p.id, text });
+  };
+
+  /** مستند حاجّ — الخادم يقرأ مفتاحه من السجلّ ويوقّعه بنفسه بعد
+      التحقّق من الموسم ومن أن الرقم رقمُ صاحبه. فلا يُوقَّع رابطٌ
+      في المتصفّح ولا يمرّ مفتاحُ مستندٍ فيه. */
+  const waSendDoc = async (
+    p: Passenger, docType: "hajj_permit" | "flight_ticket",
+  ): Promise<boolean> => {
+    const phone = (p.phone || "").replace(/\D/g, "");
+    if (!phone) return false;
+    return waSendServer({ kind: "document", to: phone, passengerId: p.id, docType });
+  };
+
+  // الأعمدة لتقرير الحجاج
+  const ALL_COLS = [
+    { key: "name_ar", label: "الاسم بالعربي", group: "شخصية", get: (p: Passenger) => p.name_ar },
+    { key: "short_ar", label: "الاسم العربي المختصر", group: "شخصية", get: (p: Passenger) => p.short_ar },
+    { key: "name_en", label: "الاسم بالإنجليزي", group: "شخصية", get: (p: Passenger) => p.name_en },
+    { key: "short_en", label: "الاسم الإنجليزي المختصر", group: "شخصية", get: (p: Passenger) => (p as any).short_en },
+    { key: "gender", label: "الجنس", group: "شخصية", get: (p: Passenger) => p.gender },
+    { key: "dob", label: "تاريخ الميلاد", group: "شخصية", get: (p: Passenger) => p.dob },
+    { key: "nat", label: "الجنسية", group: "شخصية", get: (p: Passenger) => p.nat },
+    { key: "phone", label: "التليفون", group: "شخصية", get: (p: Passenger) => p.phone },
+    { key: "passport", label: "رقم الجواز", group: "وثائق", get: (p: Passenger) => p.passport },
+    { key: "national_id", label: "رقم البطاقة", group: "وثائق", get: (p: Passenger) => p.national_id },
+    { key: "expiry", label: "انتهاء الجواز", group: "وثائق", get: (p: Passenger) => p.expiry },
+    { key: "bus", label: "نوع الباص", group: "خدمات", get: (p: Passenger) => p.services?.bus },
+    { key: "bus_name", label: "رقم الباص", group: "خدمات", get: (p: Passenger) => buses.find(b => b.id === p.bus_id)?.name || "" },
+    { key: "flight", label: "الطيران", group: "خدمات", get: (p: Passenger) => p.services?.flight },
+    { key: "flight_dep", label: "رحلة الذهاب", group: "خدمات", get: (p: Passenger) => flights.find(f => f.id === p.flight_id)?.name || "" },
+    { key: "flight_ret", label: "رحلة الإياب", group: "خدمات", get: (p: Passenger) => flights.find(f => f.id === p.return_flight_id)?.name || "" },
+    { key: "hotel_type", label: "نوع الغرفة", group: "خدمات", get: (p: Passenger) => p.services?.hotel_type },
+    { key: "hotel_view", label: "إطلالة الغرفة", group: "خدمات", get: (p: Passenger) => p.services?.hotel_view },
+    { key: "room_number", label: "رقم الغرفة", group: "خدمات", get: (p: Passenger) => rooms.find(r => r.id === p.room_id)?.number || "" },
+    { key: "camp_mina", label: "منى (نوع)", group: "خدمات", get: (p: Passenger) => p.services?.camp_mina },
+    { key: "camp_mina_name", label: "مخيم منى", group: "خدمات", get: (p: Passenger) => camps.find(c => c.id === p.camp_mina_id)?.name || "" },
+    { key: "camp_arafa", label: "عرفة (نوع)", group: "خدمات", get: (p: Passenger) => p.services?.camp_arafa },
+    { key: "camp_arafa_name", label: "مخيم عرفة", group: "خدمات", get: (p: Passenger) => camps.find(c => c.id === p.camp_arafa_id)?.name || "" },
+  ];
+  const [selectedCols, setSelectedCols] = useState<string[]>(ALL_COLS.map(c => c.key));
+  const toggleCol = (key: string) => setSelectedCols(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]);
+  const toggleAll = () => setSelectedCols(prev => prev.length === ALL_COLS.length ? [] : ALL_COLS.map(c => c.key));
+  const [filterNat, setFilterNat] = useState<string>("الكل");
+  const [filterPType, setFilterPType] = useState<string>("الكل");
+  const nats = useMemo(() => ["الكل", ...Array.from(new Set(passengers.map(p => p.nat).filter(Boolean)))], [passengers]);
+  const filteredPassengers = useMemo(() => passengers.filter(p => {
+    const hajj = isHajj(p);
+    return (filterNat === "الكل" || p.nat === filterNat) &&
+      (filterPType === "الكل" || (filterPType === "حجاج" ? hajj : !hajj));
+  }), [passengers, filterNat, filterPType]);
+  const activeCols = ALL_COLS.filter(c => selectedCols.includes(c.key));
+
+  /* جالبٌ واحدٌ لكلّ مرجع — يُنادى للكلّ عند فتح الصفحة، ولواحدٍ
+     عند إعادة المحاولة. وسقوطُ أحدها لا يمسّ إخوته. */
+  const loadRefData = useCallback(async (keys: RefKey[] = ["buses", "camps", "rooms", "flights"]) => {
+    const want = new Set(keys);
+    setRefState(prev => {
+      const next = { ...prev };
+      keys.forEach(k => { next[k] = "loading"; });
+      return next;
+    });
+    const sid = viewedSeason.id;
+    const mark = (k: RefKey, ok: boolean) => setRefState(prev => ({ ...prev, [k]: ok ? "ready" : "error" }));
+
+    const jobs: Promise<void>[] = [];
+    if (want.has("buses")) jobs.push((async () => {
+      const { data, error } = await supabase.from("buses").select("*").eq("season_id", sid).order("created_at");
+      if (error || !data) { mark("buses", false); return; }
+      const valid = (data as Bus[]).filter(x => x.type || passengers.some(p => p.bus_id === x.id));
+      setBuses(valid); setSelectedBusIds(new Set(valid.map(x => x.id))); mark("buses", true);
+    })());
+    /* المخيّماتُ بترتيبها المحفوظ (#113) لا بتسلسل إنشائها، والرحلاتُ
+       بالتاريخ ثم الوقت ثم المعرّف — كصفحتَيهما بالضبط. */
+    if (want.has("camps")) jobs.push((async () => {
+      const { data, error } = await supabase.from("camps").select("*").eq("season_id", sid).order("sort_order", { nullsFirst: false }).order("id");
+      if (error || !data) { mark("camps", false); return; }
+      const valid = (data as Camp[]).filter(x => x.type || passengers.some(p => p.camp_mina_id === x.id || p.camp_arafa_id === x.id));
+      setCamps(valid);
+      setSelectedMinaCampIds(new Set(valid.filter(x => x.page_type === "منى").map(x => x.id)));
+      setSelectedArafaCampIds(new Set(valid.filter(x => x.page_type === "عرفة").map(x => x.id)));
+      mark("camps", true);
+    })());
+    if (want.has("rooms")) jobs.push((async () => {
+      const { data, error } = await supabase.from("rooms").select("*").eq("season_id", sid).order("number");
+      if (error || !data) { mark("rooms", false); return; }
+      setRooms(data as Room[]);
+      setSelectedFloors(new Set((data as Room[]).map(x => x.floor ? String(x.floor) : "بدون طابق")));
+      mark("rooms", true);
+    })());
+    if (want.has("flights")) jobs.push((async () => {
+      const { data, error } = await supabase.from("flights").select("*").eq("season_id", sid).order("date").order("time").order("id");
+      if (error || !data) { mark("flights", false); return; }
+      const valid = (data as Flight[]).filter(x => x.type || passengers.some(p => p.flight_id === x.id || p.return_flight_id === x.id));
+      setFlights(valid); setSelectedFlightIds(new Set(valid.map(x => x.id))); mark("flights", true);
+    })());
+    await Promise.all(jobs);
+  // `passengers` تُقرأ للتصفية وحدها؛ إدراجُها يعيد الجلب مع كل تحديث حيّ
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewedSeason.id]);
+
+  useEffect(() => { void loadRefData(); }, [loadRefData]);
+
+  // ============================================================
+  // تقرير الحجاج
+  // ============================================================
+  /* نطاقُ كشف الحجاج — الجنسيةُ والفئةُ وعددُ الأعمدة المعروضة */
+  const passengersScopeCaption = (): string | null => {
+    const parts: string[] = [];
+    if (filterNat !== "الكل") parts.push(`الجنسية: ${filterNat}`);
+    if (filterPType !== "الكل") parts.push(`الفئة: ${filterPType}`);
+    if (activeCols.length !== ALL_COLS.length) parts.push(`${activeCols.length} من ${ALL_COLS.length} عموداً`);
+    return parts.length ? parts.join(" · ") : null;
+  };
+
+  const getPassengersHTML = () => {
+    const rows = filteredPassengers.map((p, i) =>
+      `<tr><td style="text-align:center">${i + 1}</td>${activeCols.map(c => `<td>${c.get(p) || "—"}</td>`).join("")}</tr>`
+    ).join("");
+    const body = `<table style="width:100%;border-collapse:collapse;table-layout:auto"><tr><th style="text-align:center;width:25pt;background:${primaryColor};color:#fff;padding:5pt 4pt;font-size:9pt">م</th>${activeCols.map(c => `<th style="background:${primaryColor};color:#fff;padding:5pt 6pt;font-size:9pt;text-align:right">${c.label}</th>`).join("")}</tr>${rows}</table>`;
+    return makeHTML("كشف الحجاج", body, reportBranding, {
+      landscape: activeCols.length > 5,
+      chrome: chromeFor("pilgrims", {
+        season: viewedSeason,
+        resultCount: { label: "عدد النتائج", value: filteredPassengers.length },
+        scope: passengersScopeCaption(),
+      }),
+    });
+  };
+
+  const exportPassengersXLSX = () => {
+    const headers = ["م", ...activeCols.map(c => c.label)];
+    const rows = filteredPassengers.map((p, i) => [i + 1, ...activeCols.map(c => c.get(p) || "")]);
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    ws["!cols"] = [{ wch: 4 }, ...activeCols.map(c => ({ wch: Math.max(c.label.length + 2, 15) }))];
+    freezeHeaderRow(ws);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "الحجاج");
+    addSummarySheet(wb, XLSX, "كشف الحجاج", companyName, [
+      ["إجمالي عدد الحجاج", filteredPassengers.length],
+      ["عدد الرجال", filteredPassengers.filter(p => p.gender === "ذكر").length],
+      ["عدد النساء", filteredPassengers.filter(p => p.gender === "أنثى").length],
+      ["عدد الأعمدة المعروضة", activeCols.length],
+    ]);
+    XLSX.writeFile(wb, "تقرير_الحجاج.xlsx");
+  };
+
+  // ============================================================
+  // تقرير الطيران — خطوط الطيران (airline list)
+  // ============================================================
+  const REPORT_AIRLINE_LOGOS: Record<string, string> = {
+  qatar: "https://upload.wikimedia.org/wikipedia/en/thumb/9/9b/Qatar_Airways_Logo.svg/120px-Qatar_Airways_Logo.svg.png",
+  saudia: "data:image/png;base64,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",
+};
+const getReportAirlineLogo = (airline: string): string | null => {
+  const a = (airline || "").toLowerCase();
+  if (a.includes("qatar")) return REPORT_AIRLINE_LOGOS.qatar;
+  if (a.includes("saudi") || a.includes("saudia") || a.includes("سعودي")) return REPORT_AIRLINE_LOGOS.saudia;
+  return null;
+};
+
+  /* المستند الخارجي: الجميع «Passengers» بلا تصنيف داخلي. شركة
+     الطيران تحجز مقاعد لأشخاص، ولا يعنيها من منهم إداري — وإظهار
+     ذلك يسرّب بنية الحملة بلا فائدة. أما الدرجة فتبقى: تؤثّر في
+     الحجز. والتفصيل حاج/إداري يسكن الشاشة الداخلية وحدها. */
+  const airlineScopeCaption = (): string | null => {
+    const label = bookingSort === "alpha" ? "ترتيب أبجدي" : bookingSort === "gender" ? "ترتيب حسب الجنس" : "ترتيب الحجاج";
+    return label;
+  };
+
+  const getAirlineHTML = () => {
+    const list = bookingList;
+    const grp = familyGroupNo.size > 0;
+    const rows = list.map((p, i) => {
+      const nat = natCode(p.nat);
+      const gender = p.gender === "ذكر" ? "MR." : "MRS.";
+      const cls = wantsFirstClass(p) ? "FIRST CLASS" : "";
+      /* علامة المجموعة خفيفة وصالحة للطباعة: رقمٌ لا لون ولا صلة */
+      const g = grp ? `<td style="text-align:center;color:#666">${familyGroupNo.get(p.id) ?? ""}</td>` : "";
+      const exp = airlineShowExpiry ? `<td>${p.expiry || "—"}</td>` : "";
+      return `<tr><td style="text-align:center">${i + 1}</td>${g}<td>${p.name_en}</td><td>${nat}</td><td>${p.passport}</td>${exp}<td>${p.phone || "—"}</td><td>${gender}</td><td>${cls}</td></tr>`;
+    }).join("");
+    const first = list.filter(p => wantsFirstClass(p)).length;
+    const summary = `<div dir="ltr" style="text-align:left;margin-bottom:8pt;font-size:10pt"><strong>Total Passengers:</strong> ${list.length} &nbsp;·&nbsp; <strong>First Class:</strong> ${first} &nbsp;·&nbsp; <strong>Economy:</strong> ${list.length - first}</div>`;
+    const grpTh = grp ? `<th style="text-align:center;width:34px">GRP</th>` : "";
+    const expTh = airlineShowExpiry ? `<th>PASSPORT EXPIRY</th>` : "";
+    const body = `${summary}<div dir="ltr" style="text-align:left"><table class="flight-table ltr-table" style="direction:ltr;margin-left:0;margin-right:auto"><tr><th style="text-align:center;width:30px">S.N.</th>${grpTh}<th>FULL NAME</th><th>NAT.</th><th>PASSPORT NO.</th>${expTh}<th>TEL. NO.</th><th>GENDER</th><th>CLASS</th></tr>${rows}</table></div>`;
+    return makeHTML("Flight Booking List", body, reportBranding, {
+      chrome: chromeFor("airline", {
+        season: viewedSeason,
+        resultCount: { label: "عدد المسافرين", value: list.length },
+        scope: airlineScopeCaption(),
+      }),
+    });
+  };
+
+  const exportAirlineXLSX = () => {
+    const list = bookingList;
+    const grp = familyGroupNo.size > 0;
+    const headers = ["S.N.", ...(grp ? ["GRP"] : []), "FULL NAME", "NAT.", "PASSPORT NO.", ...(airlineShowExpiry ? ["PASSPORT EXPIRY"] : []), "TEL. NO.", "GENDER", "CLASS"];
+    const rows = list.map((p, i) => [
+      i + 1, ...(grp ? [familyGroupNo.get(p.id) ?? ""] : []), p.name_en,
+      natCode(p.nat),
+      p.passport, ...(airlineShowExpiry ? [p.expiry || "—"] : []), p.phone || "—",
+      p.gender === "ذكر" ? "MR." : "MRS.",
+      wantsFirstClass(p) ? "FIRST CLASS" : ""
+    ]);
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    ws["!cols"] = [{ wch: 5 }, ...(grp ? [{ wch: 5 }] : []), { wch: 32 }, { wch: 6 }, { wch: 14 }, ...(airlineShowExpiry ? [{ wch: 15 }] : []), { wch: 14 }, { wch: 7 }, { wch: 13 }];
+    freezeHeaderRow(ws);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Flight List");
+    /* «إجمالي عدد الحجاج» فوق قائمة فيها إداريون كان اسماً يخالف
+       محتواه، ويخرج إلى طرف خارجي. */
+    addSummarySheet(wb, XLSX, "Flight Booking List", companyName, [
+      ["Total Passengers", list.length],
+      ["First Class", list.filter(p => wantsFirstClass(p)).length],
+      ["Economy", list.filter(p => !wantsFirstClass(p)).length],
+    ]);
+    XLSX.writeFile(wb, "flight_booking_list.xlsx");
+  };
+
+  // ============================================================
+  // تقرير الطيران — كل رحلة
+  // ============================================================
+  const getPerFlightHTML = () =>
+    flightsReportDocument(flights.filter(f => selectedFlightIds.has(f.id)), passengers, branding,
+      chromeFor("flights", { season: viewedSeason }));
+
+  const exportPerFlightXLSX = () => {
+    const selFlights = flightsInOrder(flights.filter(f => selectedFlightIds.has(f.id)));
+    const wb = XLSX.utils.book_new();
+    selFlights.forEach(flight => {
+      const fp = passengersOfFlight(flight);
+      const headers = ["م", "اسم الحاج / الحاجة", "الجنسية", "رقم الجواز", "التليفون", "الجنس", "الدرجة"];
+      const info = [["الرحلة:", flight.name], ["الخط:", flight.airline], ["التاريخ:", flight.date], ["الوقت:", flight.time], ["من:", flight.from_airport], ["إلى:", flight.to_airport], []];
+      const rows = fp.map((p, i) => [
+        i + 1, p.name_en || p.name_ar, p.nat, p.passport, p.phone || "—", p.gender,
+        wantsFirstClass(p) ? "درجة أولى" : "اقتصادية"
+      ]);
+      const ws = XLSX.utils.aoa_to_sheet([...info, headers, ...rows]);
+      ws["!cols"] = [{ wch: 5 }, { wch: 30 }, { wch: 10 }, { wch: 14 }, { wch: 14 }, { wch: 8 }, { wch: 12 }];
+      freezeHeaderRow(ws, info.length + 1);
+      XLSX.utils.book_append_sheet(wb, ws, flight.name.slice(0, 31));
+    });
+    addSummarySheet(wb, XLSX, "تقرير الرحلات", companyName, [
+      ["إجمالي عدد الرحلات", selFlights.length],
+      ["إجمالي عدد الحجاج", selFlights.reduce((sum, f) => sum + passengersOfFlight(f).length, 0)],
+      ...selFlights.map(f => [f.name, passengersOfFlight(f).length]),
+    ]);
+    XLSX.writeFile(wb, "تقرير_الرحلات.xlsx");
+  };
+
+  // ============================================================
+  // عرض قائمة أسماء: عمود واحد لو أقل من 20، وعمودين لو 20 فأكثر
+  // ============================================================
+  // تقرير الباصات
+  // ============================================================
+  /* الباص: الموسمُ معتمَد، والترقيمُ **لا** يُفرَض — الهيئةُ التشغيليّة
+     البسيطة تبقى كما هي. */
+  const getBusesHTML = () =>
+    busesReportDocument(buses.filter(b => selectedBusIds.has(b.id)), passengers, branding,
+      chromeFor("bus", { season: viewedSeason }));
+
+  const getSingleBusHTML = (bus: Bus) =>
+    busReportDocument(bus, passengers, branding, chromeFor("bus", { season: viewedSeason }));
+
+  const exportBusesXLSX = () => {
+    const selBuses = buses.filter(b => selectedBusIds.has(b.id));
+    const wb = XLSX.utils.book_new();
+    const usedNames = new Set<string>();
+    selBuses.forEach(bus => {
+      /* الإكسلُ يقرأ الكشفَ المشترك كالمطبوع — لا ترتيبَ ثالثاً */
+      const m = busManifest(bus, passengers);
+      const bp = m.people;
+      const title = m.title;
+      const aoa: (string | number | null)[][] = [[title], ["م", "اسم الحاج / الحاجة", "الجنس", "الجنسية"]];
+      bp.forEach((p, i) => aoa.push([i + 1, p.short_ar || p.name_ar, p.gender, p.nat]));
+      if (bp.length === 0) aoa.push(["", "لا يوجد مسافرون", "", ""]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = [{ wch: 4 }, { wch: 30 }, { wch: 8 }, { wch: 12 }];
+      styleTitleRow(ws, 0, 4, primaryColor);
+      styleHeaderRow(ws, 1, 4, primaryColor);
+      freezeHeaderRow(ws, 2);
+      const name = safeSheetName(`${bus.name}${bus.type === "VIP" ? " VIP" : ""}`);
+      let n = name, i = 2;
+      while (usedNames.has(n)) { n = safeSheetName(`${name} ${i++}`); }
+      usedNames.add(n);
+      XLSX.utils.book_append_sheet(wb, ws, n);
+    });
+    const allRiders = selBuses.flatMap(b => busManifest(b, passengers).people);
+    addSummarySheet(wb, XLSX, "تقرير الباصات", companyName, [
+      ["إجمالي عدد الباصات", selBuses.length],
+      ["إجمالي عدد المسافرين", allRiders.length],
+      ...breakdownRows(allRiders),
+      ...selBuses.map(b => [`${b.name}${b.type === "VIP" ? " (VIP)" : ""}`, busManifest(b, passengers).people.length]),
+    ]);
+    XLSX.writeFile(wb, "تقرير_الباصات.xlsx");
+  };
+
+  // ============================================================
+  // تقرير المخيمات (منى / عرفة)
+  // ============================================================
+  const getCampsHTML = (pageType: "منى" | "عرفة") => {
+    const selectedCampIds = pageType === "منى" ? selectedMinaCampIds : selectedArafaCampIds;
+    return campsReportDocument(camps.filter(c => c.page_type === pageType && selectedCampIds.has(c.id)), passengers, pageType, branding,
+      chromeFor(pageType === "منى" ? "mina" : "arafa", { season: viewedSeason }));
+  };
+
+  const getSingleCampHTML = (camp: Camp, pageType: "منى" | "عرفة") =>
+    campReportDocument(camp, passengers, pageType, branding,
+      chromeFor(pageType === "منى" ? "mina" : "arafa", { season: viewedSeason }));
+
+  const exportCampsXLSX = (pageType: "منى" | "عرفة") => {
+    const campIdKey = pageType === "منى" ? "camp_mina_id" : "camp_arafa_id";
+    const selectedCampIds = pageType === "منى" ? selectedMinaCampIds : selectedArafaCampIds;
+    const pageCamps = campsInOrder(camps.filter(c => c.page_type === pageType && selectedCampIds.has(c.id)));
+    const wb = XLSX.utils.book_new();
+    const usedNames = new Set<string>();
+    pageCamps.forEach(camp => {
+      const cp = campManifest(camp, passengers, pageType).people;
+      const isMale = camp.gender === "ذكر";
+      const half = Math.ceil(cp.length / 2);
+      const col1 = cp.slice(0, half);
+      const col2 = cp.slice(half);
+      const maxRows = Math.max(col1.length, col2.length);
+      const title = `مخيم ${pageType} ${camp.name} — ${isMale ? "رجال" : "نساء"}`;
+      const aoa: (string | number | null)[][] = [[title], ["م", "اسم الحاج", "م", "اسم الحاج"]];
+      for (let i = 0; i < maxRows; i++) {
+        const p1 = col1[i], p2 = col2[i];
+        aoa.push([p1 ? i + 1 : "", p1 ? (p1.short_ar || p1.name_ar) : "", p2 ? half + i + 1 : "", p2 ? (p2.short_ar || p2.name_ar) : ""]);
+      }
+      if (cp.length === 0) aoa.push(["", "لا يوجد مسافرون", "", ""]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = [{ wch: 4 }, { wch: 28 }, { wch: 4 }, { wch: 28 }];
+      styleTitleRow(ws, 0, 4, primaryColor);
+      styleHeaderRow(ws, 1, 4, primaryColor);
+      freezeHeaderRow(ws, 2);
+      const name = safeSheetName(camp.name);
+      let n = name, i = 2;
+      while (usedNames.has(n)) { n = safeSheetName(`${name} ${i++}`); }
+      usedNames.add(n);
+      XLSX.utils.book_append_sheet(wb, ws, n);
+    });
+    const campPeople = passengers.filter(p => (p as any)[campIdKey]);
+    addSummarySheet(wb, XLSX, `تقرير مخيمات ${pageType}`, companyName, [
+      ["إجمالي عدد المخيمات", pageCamps.length],
+      ["إجمالي عدد الأشخاص", campPeople.length],
+      ...breakdownRows(campPeople),
+      ...pageCamps.map(c => [`${c.name} (${campSubtitle(c)})`, campManifest(c, passengers, pageType).people.length]),
+    ]);
+    XLSX.writeFile(wb, `تقرير_مخيمات_${pageType}.xlsx`);
+  };
+
+  // ============================================================
+  // تقرير الفندق
+  // ============================================================
+  /* وصفٌ مُوجَز لنطاق المطبوع — يُكتب حين يضيف معنًى فقط، فإن كان
+     التقريرُ شاملاً لم يُكتب شيء. */
+  const hotelScopeCaption = (): string | null => {
+    const parts: string[] = [];
+    if (hotelPrintFilter === "type" && hotelPrintType) parts.push(`النوع: ${hotelPrintType}`);
+    const allFloors = floorItems.length > 0 && floorItems.every(f => selectedFloors.has(f.id));
+    if (!allFloors) parts.push(`الطوابق: ${floorItems.filter(f => selectedFloors.has(f.id)).map(f => f.label).join("، ") || "—"}`);
+    return parts.length ? parts.join(" · ") : null;
+  };
+
+  const getFilteredRooms = () => {
+    let r = rooms.filter(rm => selectedFloors.has(floorKey(rm)));
+    if (hotelPrintFilter === "type") r = r.filter(rm => rm.type === hotelPrintType);
+    return r;
+  };
+
+  /* حالةُ الغرفة — بالسعة المعتمَدة (`roomCapacity`) لا بجدولٍ محلّيّ.
+     كان هنا `ROOM_TYPE_CAP` ثانٍ بلا «خاص» وبـ«خماسية» لا وجود لها،
+     فتُقرأ الغرفةُ نفسها بحالتين بين شاشتين. */
+  const ROOM_STATUS_COLOR: Record<string, string> = { "مكتملة": "#7D1F3C", "قيد التسكين": "#1D4ED8", "جاهزة": "#059669", "مجلس": "#7C3AED", "تجاوز": "#C0392B", "غير محدّدة": "#888888" };
+  const getRoomStatus = (room: Room): string => {
+    if (room.type === "مجلس") return "مجلس";
+    const cap = roomCapacity(room);
+    const occ = passengers.filter(p => p.room_id === room.id).length;
+    if (cap == null) return "غير محدّدة";
+    if (occ > cap) return "تجاوز";
+    if (occ === 0) return "جاهزة";
+    if (occ >= cap) return "مكتملة";
+    return "قيد التسكين";
+  };
+
+  /* مستندُ الفندق يُبنى في `print.reports.ts` — تناديه هذه الصفحة
+     وصفحةُ الفندق معاً، فلا نسختان. والنوعُ والسعةُ من القاعدة:
+     `rooms.type` و`roomCapacity()`، لا من عدد الساكنين. */
+  const getHotelHTML = (opts?: { landscape?: boolean; showPattern?: boolean }) =>
+    hotelReportDocument(getFilteredRooms(), passengers, branding, {
+      landscape: opts?.landscape ?? false,
+      showPattern: opts?.showPattern ?? true,
+      subtitle: hotelPrintFilter === "type" ? ` — ${hotelPrintType}` : "",
+      chrome: { season: viewedSeason, pageNumbers: true, scope: hotelScopeCaption() },
+    });
+
+  const exportHotelXLSX = () => {
+    const filtered = getFilteredRooms();
+    const MAX_GUESTS = 4;
+    const COLS = 4; // 4 غرف في كل صف
+
+    const wb = XLSX.utils.book_new();
+
+    // شيت واحد بشكل 4 غرف في الصف
+    // كل غرفة تاخد عمودين: رقم الغرفة/النوع + الأسماء
+    // الترتيب: غرفة1 | غرفة2 | غرفة3 | غرفة4 ... كل 4 غرف في صف
+
+    const aoa: (string | number | null)[][] = [];
+
+    for (let i = 0; i < filtered.length; i += COLS) {
+      const rowRooms = filtered.slice(i, i + COLS);
+      // بادينج لو أقل من 4
+      while (rowRooms.length < COLS) rowRooms.push(null as any);
+
+      // صف header الغرف
+      const headerRow: (string | number | null)[] = [];
+      rowRooms.forEach(room => {
+        if (room) {
+          headerRow.push(`غرفة ${room.number}${room.floor ? ` — ط${room.floor}` : ""} (${room.type})`);
+          headerRow.push(""); // دمج
+        } else {
+          headerRow.push(""); headerRow.push("");
+        }
+      });
+      aoa.push(headerRow);
+
+      // صف عناوين الأعمدة
+      const subHeader: (string | number | null)[] = [];
+      rowRooms.forEach(() => { subHeader.push("م"); subHeader.push("الاسم"); });
+      aoa.push(subHeader);
+
+      // صفوف الحجاج (4 صفوف ثابتة)
+      for (let g = 0; g < MAX_GUESTS; g++) {
+        const guestRow: (string | number | null)[] = [];
+        rowRooms.forEach(room => {
+          if (room) {
+            const rp = roomOccupants(room.id);
+            const p = rp[g];
+            guestRow.push(p ? g + 1 : "");
+            guestRow.push(p ? (p.short_ar || p.name_ar) : "");
+          } else {
+            guestRow.push(""); guestRow.push("");
+          }
+        });
+        aoa.push(guestRow);
+      }
+
+      // صف فاصل
+      aoa.push([]);
+    }
+
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    // عرض الأعمدة: كل غرفة = عمود رقم (4) + عمود اسم (22)
+    ws["!cols"] = Array.from({ length: COLS * 2 }, (_, i) => ({ wch: i % 2 === 0 ? 4 : 22 }));
+
+    const subtitle = hotelPrintFilter === "type" ? ` — ${hotelPrintType}` : "";
+    XLSX.utils.book_append_sheet(wb, ws, safeSheetName(`تقرير الفندق${subtitle}`));
+
+    const guests = passengers.filter(p => p.room_id && filtered.some(r => r.id === p.room_id));
+    const majlisCount = filtered.filter(r => r.type === "مجلس").length;
+    addSummarySheet(wb, XLSX, `تقرير الفندق${subtitle}`, companyName, [
+      ["إجمالي عدد الغرف", filtered.length],
+      ...(majlisCount ? [["عدد المجالس", majlisCount]] : []),
+      ["إجمالي عدد النزلاء", guests.length],
+      ...breakdownRows(guests),
+      /* الأنواعُ الستّةُ المعتمَدة — و«خاص» و«مجلس» منها، وكانتا تسقطان */
+      ...HOTEL_ROOM_TYPES.filter(t => t !== "مجلس").map(t => [`غرف ${t}`, filtered.filter(r => r.type === t).length]),
+    ]);
+    XLSX.writeFile(wb, "تقرير_الفندق.xlsx");
+  };
+
+  // ============================================================
+  // أزرار التصدير (عرض / Excel / طباعة) — موحّدة وثابتة أعلى التقرير
+  // Excel: لون الهوية الأساسي | طباعة: لون رمادي داكن موحّد
+  // أحجام مدمجة (ليست flex:1) حتى لا تأخذ سطراً كاملاً بمفردها
+  // ============================================================
+  const printBtnStyle = { display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, background: "var(--bg-2)", border: "1px solid var(--border)", color: "var(--text)", padding: "5px 11px", borderRadius: "var(--radius-sm)", fontSize: 12, cursor: "pointer", fontWeight: 600, fontFamily: "var(--font-body)", transition: "var(--transition)" };
+  const excelBtnStyle = { ...btnP({ fontSize: 12, fontWeight: 600, padding: "5px 11px", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, borderRadius: "var(--radius-sm)" }) };
+  const printIcon = <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>;
+  const excelIcon = <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>;
+
+  /* `onView` كان وسيطاً لا يمرّره أحد — زرٌّ موعودٌ لا وجود له.
+     والمعاينةُ مؤجَّلة، فلا يبقى في الواجهة وعدٌ لا يُنجَز. */
+  /* `onPrint` زرُّ طباعةٍ واحد، و`printActions` بديلُه حين يكون
+     للتقرير اتّجاهان (الفندق) — لا مسارَ طباعةٍ ثالث، بل موضعٌ
+     في الشريط نفسه. */
+  /* `options` موضعُ زرّ «خيارات الطباعة» — ولا يُمرَّر للفندق: مطبوعُه
+     أُقفل بشكله المقبول فلا خيارَ يُعرَض عليه. */
+  const ExportButtons = ({
+    title, onExcel, onPrint, printActions, options
+  }: { title?: string; onExcel: () => void; onPrint?: () => void; printActions?: React.ReactNode; options?: React.ReactNode }) => (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 10, flexWrap: "wrap", position: "sticky", top: 0, zIndex: 5, background: "var(--bg)", padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+      {title && <div style={{ fontSize: 14, fontWeight: 600 }}>{title}</div>}
+      <div className="rep-actions" style={{ display: "flex", gap: 6, flexWrap: "wrap", marginInlineStart: "auto" }}>
+        {options}
+        <button onClick={onExcel} style={excelBtnStyle}>{excelIcon} Excel</button>
+        {printActions ?? (onPrint && <button onClick={onPrint} style={printBtnStyle}>{printIcon} طباعة</button>)}
+      </div>
+    </div>
+  );
+
+  // ============================================================
+  // اختيار عناصر التقرير (طباعة عنصر واحد أو أكثر بدل الكل)
+  // ============================================================
+  const SelectionPanel = ({
+    title, items, selected, setSelected, panelKey, alwaysOpen
+  }: { title: string; items: { id: number | string; label: string }[]; selected: Set<any>; setSelected: (s: Set<any>) => void; panelKey: string; alwaysOpen?: boolean }) => {
+    const allSelected = items.length > 0 && items.every(it => selected.has(it.id));
+    const open = alwaysOpen || openPanels.has(panelKey);
+    return (
+      <div style={{ border: "0.5px solid var(--border)", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+        <div onClick={() => !alwaysOpen && togglePanel(panelKey)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: alwaysOpen ? "default" : "pointer", marginBottom: open ? 8 : 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {!alwaysOpen && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s", color: "var(--text-muted)" }}><polyline points="9 18 15 12 9 6"/></svg>}
+            <div style={{ fontSize: 12, fontWeight: 500 }}>{title}</div>
+            {!open && <div style={{ fontSize: 10, color: "var(--text-muted)" }}>({allSelected ? "الكل" : `${[...selected].length} من ${items.length}`})</div>}
+          </div>
+          {open && (
+            <div onClick={e => { e.stopPropagation(); setSelected(allSelected ? new Set() : new Set(items.map(i => i.id))); }} style={{ fontSize: 11, color: "var(--em7)", cursor: "pointer" }}>
+              {allSelected ? "إلغاء الكل" : "تحديد الكل"}
+            </div>
+          )}
+        </div>
+        {open && (
+          <>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {items.map(it => {
+                const checked = selected.has(it.id);
+                return (
+                  <div key={it.id} onClick={() => {
+                    const next = new Set(selected);
+                    if (next.has(it.id)) next.delete(it.id); else next.add(it.id);
+                    setSelected(next);
+                  }} style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: 8, border: `1.5px solid ${checked ? "var(--em7)" : "var(--border)"}`, background: checked ? "var(--success-bg)" : "transparent", cursor: "pointer", fontSize: 12, color: checked ? "var(--em7)" : "var(--text-muted)" }}>
+                    <div style={{ width: 14, height: 14, borderRadius: 4, background: checked ? "var(--em7)" : "var(--bg-card)", border: `1.5px solid ${checked ? "var(--em7)" : "var(--border)"}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                      {checked && <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>}
+                    </div>
+                    {it.label}
+                  </div>
+                );
+              })}
+            </div>
+            {items.length > 0 && !allSelected && <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 6 }}>سيشمل التقرير فقط العناصر المحددة ({[...selected].length} من {items.length})</div>}
+          </>
+        )}
+      </div>
+    );
+  };
+
+
+  // ============================================================
+  // طباعة المستندات (جواز / بطاقة / تصريح / تذكرة)
+  // ============================================================
+  const DOC_TYPES: { key: "passport_url" | "national_id_url" | "hajj_permit_url" | "flight_ticket_url"; label: string }[] = [
+    { key: "passport_url", label: "جواز السفر" },
+    { key: "national_id_url", label: "البطاقة الشخصية" },
+    { key: "hajj_permit_url", label: "التصريح" },
+    { key: "flight_ticket_url", label: "تذكرة الطيران" },
+  ];
+  const docTypeLabel = DOC_TYPES.find(d => d.key === docType)?.label || "";
+  const isAdminPerson = (p: Passenger) => !!p.passenger_type && p.passenger_type !== "حاج";
+  const docListAll = passengers.filter(p => (p as any)[docType]);
+  const docList = docListAll.filter(p =>
+    docPersonFilter === "all" ? true :
+    docPersonFilter === "admin" ? isAdminPerson(p) :
+    !isAdminPerson(p)
+  );
+  const docSelectedIds = docSelected[docType] || new Set<number>();
+  const toggleDocSelected = (id: number) => setDocSelected(prev => {
+    const cur = new Set(prev[docType] || []);
+    if (cur.has(id)) cur.delete(id); else cur.add(id);
+    return { ...prev, [docType]: cur };
+  });
+  /* ⚠️ أعمدةُ المستندات تحمل **مفاتيحَ كائنات** لا روابط منذ خصخصةِ
+     الحاوية (س٦): `<img src="{المفتاح}">` يُفسَّر مساراً نسبياً فلا
+     تظهر صورة. والمسارُ الوحيد للقراءة رابطٌ موقَّعٌ قصير العمر
+     (`signedDocUrl` بـ`DOC_TTL.view` = خمس دقائق) — وهو ما تستعمله
+     شاشاتُ العرض أصلاً. فلا حاويةَ تُفتح، ولا رابطَ دائمٌ يُكشَف. */
+  /* ⚠️ مسارُ المستندات — بابٌ واحدٌ لكلّ نوع:
+       الصورة → رابطٌ موقَّعٌ مباشرةً في `<img>`
+       الـPDF  → بايتاتُه تُقرأ بالبوّابات الثلاث، ثم تُصيَّر صفحاتُه
+                 صوراً بـpdf.js، فتدخل المطبوع كأيّ صورة
+     فصفحاتُ التصريح تُطبَع مع الباقي في ورقةٍ واحدة، ولا يُطلَب من
+     الموظّف أن يطبعها من نافذةٍ أخرى. والمستندُ متعدّدُ الصفحات
+     يأخذ بطاقةً لكل صفحة، مرقَّمةً.
+     والأمنُ كما هو: توقيعٌ قصير العمر، والتصييرُ في متصفّح الموظّف. */
+  const printDocuments = async () => {
+    const toPrint = docList.filter(p => docSelectedIds.has(p.id));
+    if (!toPrint.length) { showAlert("warning", "يرجى تحديد حاج واحد على الأقل"); return; }
+
+    setDocPreparing(true);
+    /* مصيِّرُ الـPDF يُحمَّل عند أوّل ملفٍّ يحتاجه، لا قبل ذلك */
+    let renderPdf: Awaited<ReturnType<typeof loadPdfPageRenderer>> | null = null;
+    type Card = { name: string; body: string };
+    const cards: Card[] = [];
+    let failed = 0;
+    try {
+      for (const p of toPrint) {
+        const value = (p as unknown as Record<string, string>)[docType];
+        const name = p.short_ar || p.name_ar;
+        const kind = docFileKind(value);
+        if (!value) { failed++; cards.push({ name, body: docFailedBody("لا مستند") }); continue; }
+        if (kind === "pdf") {
+          try {
+            if (!renderPdf) renderPdf = await loadPdfPageRenderer();
+            const bytes = await fetchDocumentBytes(value);
+            const pages = await renderPdf(bytes);
+            if (pages.length === 0) { failed++; cards.push({ name, body: docFailedBody() }); continue; }
+            pages.forEach((src, i) => cards.push({
+              name: pages.length > 1 ? `${name} (${i + 1}/${pages.length})` : name,
+              body: docImageBody(src),
+            }));
+          } catch { failed++; cards.push({ name, body: docFailedBody() }); }
+          continue;
+        }
+        const url = await signedDocUrl(value, DOC_TTL.view);
+        if (!url) { failed++; cards.push({ name, body: docFailedBody() }); continue; }
+        cards.push({ name, body: docImageBody(url) });
+      }
+    } finally {
+      setDocPreparing(false);
+    }
+
+    if (failed === toPrint.length) { showAlert("error", "تعذّر تجهيز المستندات للطباعة — تحقّق من رفعها ثم أعد المحاولة"); return; }
+    if (failed > 0) showAlert("warning", `${failed} من المحدَّدين تعذّر تجهيز مستندهم — طُبع الباقي`);
+
+    const cols = docPerPage === 4 ? 2 : 1;
+    const rows = docPerPage === 1 ? 1 : 2;
+    const pages: Card[][] = [];
+    for (let i = 0; i < cards.length; i += docPerPage) pages.push(cards.slice(i, i + docPerPage));
+
+    /* ⚠️ درسُ الفندق مطبَّقاً على المستندات — لا منقولاً عنه حرفاً:
+       كانت الورقةُ هنا ثلاثةَ مشاركين مستقلّين في التقطيع (ترويسةُ
+       القشرة، وشبكاتُ البطاقات، وتذييلُ القشرة)، فكان المتصفّح يقطع
+       بينها كما يشاء. وقد قِيس ذلك لا خُمِّن: كلُّ حالةٍ من أربعَ
+       عشرةَ حالةً مقيسةً أخرجت ورقةً زائدةً في آخرها ليس فيها إلا
+       التذييل، وكلُّ حالةٍ أُشعلت فيها الترويسةُ أخرجت ورقةً ثانيةً
+       زائدةً لأنّ `height:100vh` كان يقيس الورقةَ كاملةً (٢٩٧مم) بينما
+       المساحةُ المطبوعة ٢٦٩مم، فيفيض كلُّ سطحٍ بفارقٍ يصير ورقة.
+
+       فصارت كلُّ ورقةٍ مقصودةٍ غلافاً ذرّيّاً واحداً يملك قياسَه
+       وحاشيتَه وترويستَه وترقيمَه، والقشرةُ بلا هامشٍ ولا ترويسةٍ ولا
+       تذييل. والقطعُ **بين** الأغلفة فقط — فلا قطعَ بعد آخرها، ولا
+       ورقةَ تولد من فيض. ومسارُ التصيير (pdf.js ← صورُ صفحات ← HTML)
+       لم يُمسّ: البطاقاتُ أعلاه هي هي. */
+    const docChrome = chromeFor("documents", { season: viewedSeason });
+    const docHead = docChrome.header === "none" ? "" : compactHeaderHTML(reportBranding, docTypeLabel);
+    const docMeta = chromeMetaHTML(docChrome);
+    const docCSS = `<style>
+      .doc-print-page { box-sizing: border-box; width: 210mm; height: 297mm; margin: 0;
+        padding: ${PAGE_MARGIN_REPORT}; overflow: hidden; display: flex; flex-direction: column;
+        break-inside: avoid; page-break-inside: avoid; }
+      .doc-print-page + .doc-print-page { break-before: page; page-break-before: always; }
+      .doc-print-page > * { flex-shrink: 0; }
+      .doc-print-grid { flex: 1 1 auto; min-height: 0; display: grid; gap: 10px; }
+      .doc-card { border: 1px solid #ddd; border-radius: 8px; overflow: hidden;
+                  display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+      .doc-card-title { background: ${primaryColor}; color: #fff; padding: 6px 12px;
+                        font-size: 13px; font-weight: 700; }
+      .doc-card-body { flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
+                       padding: 6px; min-height: 0; overflow: hidden; }
+    </style>`;
+    const pagesHTML = pages.map((pg, i) => `
+      <div class="doc-print-page">
+        ${docHead}${docMeta}
+        <div class="doc-print-grid" style="grid-template-columns:repeat(${cols},1fr);grid-template-rows:repeat(${rows},1fr)">
+          ${pg.map(c => `
+            <div class="doc-card">
+              <div class="doc-card-title">${c.name} — ${docTypeLabel}</div>
+              <div class="doc-card-body">${c.body}</div>
+            </div>`).join("")}
+        </div>
+        ${docChrome.pageNumbers ? pageStampHTML(i + 1, pages.length) : ""}
+      </div>`).join("");
+    /* كلُّ المحتوى صارَ صوراً — فانتظارُ الصور يغطّي الـPDF كذلك */
+    printInPage(makeHTML(docTypeLabel, docCSS + pagesHTML, reportBranding, {
+      chrome: { header: "none" }, pageMargin: "0", footer: false,
+    }), { waitForImages: true });
+  };
+
+
+  // ============================================================
+  // قائمة التقارير
+  // ============================================================
+  // ============================================================
+  // KPI calculations للـ gateway
+  // ============================================================
+  /* عددان لا واحد: `hajjCount` هو العدد الحقيقيّ، و`hajjTotal` مقامُ
+     النسبة وحده. و`|| 1` حارسُ قسمةٍ على صفر — فإن خدم العدَّ أيضاً
+     صار «صفر حاجّ» يُقرأ «حاجٌّ واحد ناقص»، وهو ما كانت تعرضه أربع
+     بطاقات على قاعدة فارغة. والنمط هنا هو نمط بطاقة الطيران أعلاه
+     نفسه: `flightDen` للمقام و`flightNeeded.length` للعدّ. */
+  const hajjCount = passengers.filter(p => isHajj(p)).length;
+  const hajjTotal = hajjCount || 1;
+  /* ── اكتمال توزيع الطيران ──
+     المقام ليس كل الحجاج بل **المطلوب لهم طيران** وحدهم: من خدمته
+     «بدون» لا ينقصه شيء، وعدّه ناقصاً يجعل المؤشّر يشكو ممّا لا
+     شكوى فيه. والمكتمل من له الساقان معاً — فلا حالة عمل مشروعة
+     لساق واحدة، والاكتفاء بـ`flight_id` كان يخفي العودة تماماً.
+     وهذا وحده مؤشّر توزيع؛ بقيّة البطاقات على حالها. */
+  const flightNeeded = passengers.filter(p => isHajj(p) && p.services?.flight !== "بدون");
+  const flightOut    = flightNeeded.filter(p => p.flight_id != null).length;
+  const flightRet    = flightNeeded.filter(p => p.return_flight_id != null).length;
+  const flightBoth   = flightNeeded.filter(p => p.flight_id != null && p.return_flight_id != null).length;
+  const flightDen    = flightNeeded.length || 1;
+  const noFlight     = flightNeeded.length - flightBoth;
+  const pctFlight    = Math.round(flightBoth / flightDen * 100);
+  const withBus    = passengers.filter(p => (isHajj(p)) && p.bus_id != null).length;
+  const withMina   = passengers.filter(p => (isHajj(p)) && p.camp_mina_id != null).length;
+  const withArafa  = passengers.filter(p => (isHajj(p)) && p.camp_arafa_id != null).length;
+  const withRoom   = passengers.filter(p => (isHajj(p)) && p.room_id != null).length;
+  const noBus      = hajjCount - withBus;
+  const noMina     = hajjCount - withMina;
+  const noArafa    = hajjCount - withArafa;
+  const noRoom     = hajjCount - withRoom;
+  const pctBus     = Math.round(withBus    / hajjTotal * 100);
+  const pctMina    = Math.round(withMina   / hajjTotal * 100);
+  const pctArafa   = Math.round(withArafa  / hajjTotal * 100);
+  const pctRoom    = Math.round(withRoom   / hajjTotal * 100);
+
+
+  // ============================================================
+  // الـ UI
+  // ============================================================
+  return (
+    <div style={{ padding: "0 2px", overflowY: "auto", height: "100%" }}>
+      {/* الاستجابة CSS لا JavaScript — وفوق ٨٨٠ بكسل لا شيء يتغيّر */}
+      <style>{REPORTS_RESPONSIVE_CSS}{"@keyframes rep-spin{to{transform:rotate(360deg)}}.rep-spin{animation:rep-spin .7s linear infinite}"}</style>
+      <AlertModal alert={alertState} onClose={() => showAlert(null)} />
+      {!activeReport ? (
+        <>
+          {/* Quick Actions */}
+          <div className="rep-quick" style={{ display:"flex", gap:10, marginBottom:16 }}>
+            {[
+              { id:"documents", label:"طباعة المستندات", sub:"جواز · بطاقة · تصريح · تذكرة", bg:"rgba(125,31,60,0.08)", color:"var(--primary)", icon:`<path d="M3 3h18v18H3z M12 8a2 2 0 1 0 0 4 2 2 0 0 0 0-4z M8 16s1-2 4-2 4 2 4 2"/>` },
+              { id:"whatsapp",  label:"رسائل WhatsApp",  sub:"إرسال رسائل مخصصة للحجاج",    bg:"rgba(37,211,102,0.08)", color:"#25D366", icon:`<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>` },
+              { id:"stickers",   label:"مطبوعات الشنط",   sub:"استيكر · تاج اليد · التاج المعلق", bg:"rgba(212,160,23,0.1)", color:"#8a6a10", icon:`<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>` },
+            ].map(qa => (
+              <div key={qa.id} onClick={() => { setActiveReport(qa.id); setFlightSubReport(null); }}
+                style={{ flex:1, display:"flex", alignItems:"center", gap:12, padding:"11px 16px", borderRadius:12, border:"1.5px solid var(--line)", background:"var(--paper)", cursor:"pointer", transition:"all 0.15s" }}
+                onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.borderColor="var(--primary)"; (e.currentTarget as HTMLDivElement).style.boxShadow="0 4px 14px rgba(125,31,60,0.1)"; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.borderColor="var(--line)"; (e.currentTarget as HTMLDivElement).style.boxShadow="none"; }}>
+                <div style={{ width:36, height:36, borderRadius:9, background:qa.bg, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={qa.color} strokeWidth="1.7" strokeLinecap="round" dangerouslySetInnerHTML={{ __html: qa.icon }} />
+                </div>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontSize:13, fontWeight:700, color:"var(--ink)" }}>{qa.label}</div>
+                  <div style={{ fontSize:11, color:"var(--muted)", marginTop:1 }}>{qa.sub}</div>
+                </div>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg>
+              </div>
+            ))}
+          </div>
+
+          {/* Smart Cards Grid */}
+          <div style={{ fontSize:10, fontWeight:700, color:"var(--muted)", letterSpacing:"0.08em", marginBottom:10, display:"flex", alignItems:"center", gap:8 }}>
+            تقارير الأقسام
+            <div style={{ flex:1, height:1, background:"linear-gradient(to left, transparent, var(--line))" }} />
+          </div>
+          <div className="rep-cards" style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
+            {[
+              { id:"passengers_report", name:"تقرير الحجاج",  icon:`<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>`, color:"#2A9D8F", bg:"rgba(42,157,143,0.1)",  kpiNum: String(passengers.filter(p=>!p.passenger_type||p.passenger_type==="حاج").length), kpiLabel:"إجمالي الحجاج", kpiSub:"", pct:100, alert:false },
+              { id:"flight",            name:"تقرير الطيران", icon:`<path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/>`,                             color:"#0C447C", bg:"rgba(12,68,124,0.1)",   kpiNum:`${flightBoth}/${flightNeeded.length}`, kpiLabel:`اكتمل توزيعهم ذهاباً وعودة (من ${flightNeeded.length} مطلوب لهم طيران)`, kpiSub: `ذهاب ${flightOut} · عودة ${flightRet}${noFlight > 0 ? ` · ${noFlight} لم تكتمل رحلاتهم` : ""}`, pct:pctFlight, alert: noFlight>0 },
+              { id:"buses",             name:"تقرير الباصات", icon:`<path d="M8 6v6"/><path d="M15 6v6"/><path d="M2 12h19.6"/><path d="M18 18h3s.5-1.7.8-2.8c.1-.4.2-.8.2-1.2 0-.4-.1-.8-.2-1.2l-1.4-5C20.1 6.8 19.1 6 18 6H4a2 2 0 0 0-2 2v10h3"/><circle cx="7" cy="18" r="2"/><circle cx="15" cy="18" r="2"/>`, color:"#3F51B5", bg:"rgba(63,81,181,0.1)",  kpiNum:pctBus+"%",    kpiLabel:`موزّعون على الباصات (من ${hajjCount} حاجاً)`,  kpiSub: noBus   > 0 ? noBus+  " بدون باص"    : "جميعهم مكتملون", pct:pctBus,    alert: noBus>0 },
+              { id:"mina",              name:"تقرير منى",     icon:`<path d="M3.5 21 14 3"/><path d="M20.5 21 10 3"/><path d="M15.5 21 12 15l-3.5 6"/><path d="M2 21h20"/>`,                                                                           color:"#5C7C2E", bg:"rgba(92,124,46,0.1)",   kpiNum:pctMina+"%",   kpiLabel:`في مخيمات منى (من ${hajjCount} حاجاً)`,        kpiSub: noMina  > 0 ? noMina+ " لم يُعيَّنوا" : "جميعهم مكتملون", pct:pctMina,   alert: noMina>0 },
+              { id:"arafa",             name:"تقرير عرفة",    icon:`<path d="M3.5 21 14 3"/><path d="M20.5 21 10 3"/><path d="M15.5 21 12 15l-3.5 6"/><path d="M2 21h20"/>`,                                                                           color:"#B5651D", bg:"rgba(181,101,29,0.1)",  kpiNum:pctArafa+"%",  kpiLabel:`في مخيمات عرفة (من ${hajjCount} حاجاً)`,       kpiSub: noArafa > 0 ? noArafa+" لم يُعيَّنوا" : "جميعهم مكتملون", pct:pctArafa,  alert: noArafa>0 },
+              { id:"hotel",             name:"تقرير الفندق",  icon:`<path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M10 6h4"/><path d="M10 10h4"/>`,                                                                                    color:"#8B3A6B", bg:"rgba(139,58,107,0.1)",  kpiNum:pctRoom+"%",   kpiLabel:`تم تسكينهم بالفندق (من ${hajjCount} حاجاً)`,  kpiSub: noRoom  > 0 ? noRoom+ " بدون غرفة"   : "جميعهم مكتملون", pct:pctRoom,   alert: noRoom>0 },
+            ].map(card => (
+              <div key={card.id} onClick={() => { setActiveReport(card.id); setFlightSubReport(null); }}
+                style={{ background:"var(--paper)", border:"1.5px solid var(--line)", borderRadius:16, padding:"16px 16px 0", cursor:"pointer", display:"flex", flexDirection:"column", overflow:"hidden", position:"relative", transition:"all 0.2s" }}
+                onMouseEnter={e => { const el = e.currentTarget as HTMLDivElement; el.style.borderColor=card.color; el.style.boxShadow="0 8px 24px "+card.color+"22"; el.style.transform="translateY(-2px)"; }}
+                onMouseLeave={e => { const el = e.currentTarget as HTMLDivElement; el.style.borderColor="var(--line)"; el.style.boxShadow="none"; el.style.transform="none"; }}>
+                {/* Header */}
+                <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:12 }}>
+                  <div>
+                    <div style={{ width:34, height:34, borderRadius:9, background:card.bg, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={card.color} strokeWidth="1.7" strokeLinecap="round" dangerouslySetInnerHTML={{ __html: card.icon }} />
+                    </div>
+                    <div style={{ fontSize:12, fontWeight:700, color:"var(--ink)", marginTop:8 }}>{card.name}</div>
+                  </div>
+                  <div style={{ width:22, height:22, borderRadius:6, background:"var(--ivory2)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+                  </div>
+                </div>
+                {/* KPI */}
+                <div style={{ marginBottom:14 }}>
+                  <div style={{ fontSize:30, fontWeight:900, lineHeight:1, color:card.color, marginBottom:3 }}>{card.kpiNum}</div>
+                  <div style={{ fontSize:10, color:"var(--muted)", fontWeight:600 }}>{card.kpiLabel}</div>
+                  {card.kpiSub && <div style={{ fontSize:10, marginTop:4, display:"inline-block", padding:"2px 7px", borderRadius:99, background: card.alert?"rgba(192,57,43,0.1)":"rgba(42,157,143,0.1)", color: card.alert?"#C0392B":"#2A9D8F", fontWeight:700 }}>{card.kpiSub}</div>}
+                </div>
+                {/* Progress Bar */}
+                <div style={{ height:4, background:"var(--ivory2)", margin:"0 -16px", overflow:"hidden" }}>
+                  <div style={{ height:"100%", width:card.pct+"%", background:"linear-gradient(to left, #D4A017, "+card.color+")", transition:"width 0.8s ease" }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div style={{ textAlign: "right" }}>
+          <button onClick={() => setActiveReport(null)} style={{ ...btnS(), display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 14 }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+            رجوع
+          </button>
+
+          {/* ===== تقرير الحجاج ===== */}
+          {activeReport === "passengers_report" && (
+            <>
+              {/* شريط العنوان */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+                <div style={{ width: 44, height: 44, borderRadius: 12, background: "rgba(42,157,143,.12)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#2A9D8F" strokeWidth="1.8" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                </div>
+                <div>
+                  <div style={{ fontFamily: "var(--font-heading)", fontSize: 17, fontWeight: 700, color: "var(--ink)" }}>تقرير الحجاج</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>كشف بيانات الحجاج قابل للتخصيص</div>
+                </div>
+              </div>
+
+              <ExportButtons
+                title="تقرير الحجاج"
+                onExcel={exportPassengersXLSX}
+                onPrint={() => printInPage(getPassengersHTML())}
+                options={optionsMenu("pilgrims")}
+              />
+
+              {/* كارت اختيار الأعمدة — مجموعات */}
+              <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 14, overflow: "hidden", marginBottom: 16, boxShadow: "0 2px 8px rgba(92,24,48,.05)" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", background: "linear-gradient(135deg, var(--em7), var(--em8))", color: "#fff" }}>
+                  <span style={{ fontSize: 13, fontWeight: 800, display: "flex", alignItems: "center", gap: 8 }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 3h18v18H3z"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
+                    اختر الأعمدة
+                  </span>
+                  <span onClick={toggleAll} style={{ fontSize: 11, color: "var(--g3)", cursor: "pointer", fontWeight: 700 }}>
+                    {selectedCols.length === ALL_COLS.length ? "إلغاء الكل" : "تحديد الكل"}
+                  </span>
+                </div>
+                <div style={{ padding: 14 }}>
+                  {([
+                    ["شخصية", "بيانات شخصية", `<circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/>`],
+                    ["وثائق", "الوثائق", `<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>`],
+                    ["خدمات", "الخدمات (باص · طيران · فندق · مخيمات)", `<path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/>`],
+                  ] as [string, string, string][]).map(([grp, title, icon]) => (
+                    <div key={grp} style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 11, fontWeight: 800, color: "var(--em7)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--g6)" strokeWidth="2" strokeLinecap="round" dangerouslySetInnerHTML={{ __html: icon }} />
+                        {title}
+                        <span style={{ flex: 1, height: 1, background: "linear-gradient(90deg, var(--line), transparent)" }} />
+                      </div>
+                      <div className="rep-cols" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                        {ALL_COLS.filter(c => c.group === grp).map(col => {
+                          const on = selectedCols.includes(col.key);
+                          return (
+                            <div key={col.key} onClick={() => toggleCol(col.key)}
+                              style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 10px", borderRadius: 9, cursor: "pointer", fontSize: 11, background: on ? "#eef7f2" : "var(--ivory)", border: `1px solid ${on ? "#2A9D8F" : "var(--line)"}` }}>
+                              <div style={{ width: 16, height: 16, borderRadius: 5, background: on ? "#2A9D8F" : "var(--paper)", border: `1.5px solid ${on ? "#2A9D8F" : "var(--line)"}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                                {on && <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>}
+                              </div>
+                              <span>{col.label}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* شريط الفلاتر */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 16, padding: "12px 14px", background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12 }}>
+                <span style={{ fontSize: 11, fontWeight: 800, color: "var(--muted)" }}>النوع:</span>
+                {["الكل", "حجاج", "إداريون"].map(t => (
+                  <div key={t} onClick={() => setFilterPType(t)} style={{ padding: "5px 13px", borderRadius: 99, fontSize: 11, fontWeight: 700, cursor: "pointer", background: filterPType === t ? "var(--em7)" : "var(--ivory)", color: filterPType === t ? "#fff" : "var(--muted)", border: `1px solid ${filterPType === t ? "var(--em7)" : "var(--line)"}` }}>
+                    {t}
+                  </div>
+                ))}
+                <span style={{ width: 1, height: 20, background: "var(--line)" }} />
+                <span style={{ fontSize: 11, fontWeight: 800, color: "var(--muted)" }}>الجنسية:</span>
+                <select value={filterNat} onChange={e => setFilterNat(e.target.value)} style={{ padding: "5px 10px", borderRadius: 99, fontSize: 11, border: "1px solid var(--line)", background: "var(--ivory)", color: "var(--ink)", cursor: "pointer" }}>
+                  {nats.map(n => <option key={n} value={n}>{n === "الكل" ? "الكل" : n}</option>)}
+                </select>
+                <span style={{ marginRight: "auto", fontSize: 11, fontWeight: 700, color: "#fff", background: "var(--g5)", padding: "5px 12px", borderRadius: 99 }}>{filteredPassengers.length} حاج · {activeCols.length} عمود</span>
+              </div>
+
+              {/* معاينة البيانات الحية */}
+              {activeCols.length > 0 && filteredPassengers.length > 0 && (
+                <>
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                    معاينة أول صفوف الكشف
+                  </div>
+                  <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", overflowX: "auto", boxShadow: "0 2px 8px rgba(92,24,48,.05)", marginBottom: 12 }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                      <thead><tr style={{ background: "linear-gradient(135deg, var(--em7), var(--em8))", color: "#fff" }}>
+                        {activeCols.map(c => <th key={c.key} style={{ padding: "8px 12px", textAlign: "right", fontWeight: 700, whiteSpace: "nowrap" }}>{c.label}</th>)}
+                      </tr></thead>
+                      <tbody>
+                        {filteredPassengers.slice(0, 3).map((p, i) => (
+                          <tr key={p.id} style={{ background: i % 2 === 0 ? "var(--paper)" : "rgba(212,160,23,.05)" }}>
+                            {activeCols.map(c => <td key={c.key} style={{ padding: "7px 12px", borderBottom: "1px solid var(--line)", whiteSpace: "nowrap" }}>{c.get(p) || "—"}</td>)}
+                          </tr>
+                        ))}
+                        {filteredPassengers.length > 3 && (
+                          <tr><td colSpan={activeCols.length} style={{ padding: 6, textAlign: "center", fontSize: 10, color: "var(--muted)" }}>… و{filteredPassengers.length - 3} حاج آخرين في الكشف الكامل</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {/* ===== تقرير الطيران ===== */}
+          {activeReport === "flight" && (
+            <>
+              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير الطيران</div>
+              {!flightSubReport ? (
+                <div className="rep-cols" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  {[
+                    { id: "airline", num: bookingList.length, label: "مطلوب لهم حجز", sub: `${bookingPilgrims} حاج · ${bookingAdmins} إداري`, color: "var(--primary)", name: "تقرير خطوط الطيران", icon: `<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/>` },
+                    { id: "per_flight", num: flights.length, label: "رحلة", sub: "قائمة الحجاج لكل رحلة", color: "#1565C0", name: "تقرير كل رحلة", icon: `<path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/>` },
+                  ].map(sub => (
+                    <div key={sub.id} onClick={() => setFlightSubReport(sub.id as "airline" | "per_flight")}
+                      style={{ border: `1px solid var(--line)`, borderRadius: 14, overflow: "hidden", cursor: "pointer", background: "var(--paper)", boxShadow: "0 2px 8px rgba(0,0,0,.05)", transition: ".15s" }}
+                      onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.transform = "translateY(-2px)"; (e.currentTarget as HTMLDivElement).style.boxShadow = "0 6px 20px rgba(0,0,0,.1)"; }}
+                      onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.transform = ""; (e.currentTarget as HTMLDivElement).style.boxShadow = "0 2px 8px rgba(0,0,0,.05)"; }}>
+                      <div style={{ height: 6, background: sub.color }} />
+                      <div style={{ padding: "14px 16px" }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                          <span style={{ fontSize: 12, fontWeight: 800, color: "var(--muted)" }}>{sub.name}</span>
+                          <div style={{ width: 32, height: 32, borderRadius: 9, background: `${sub.color}18`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={sub.color} strokeWidth="1.8" strokeLinecap="round" dangerouslySetInnerHTML={{ __html: sub.icon }} />
+                          </div>
+                        </div>
+                        <div style={{ fontFamily: "var(--font-heading)", fontSize: 36, fontWeight: 900, color: sub.color, lineHeight: 1, marginBottom: 4 }}>{sub.num}</div>
+                        <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 700 }}>{sub.label}</div>
+                        <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 2 }}>{sub.sub}</div>
+                      </div>
+                      <div style={{ padding: "8px 16px", borderTop: "1px solid var(--line)", background: "var(--ivory)", display: "flex", justifyContent: "flex-end" }}>
+                        <span style={{ fontSize: 11, color: sub.color, fontWeight: 800 }}>فتح التقرير ←</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <>
+                  <button onClick={() => setFlightSubReport(null)} style={{ ...btnS(), marginBottom: 14, fontSize: 11 }}>رجوع للطيران</button>
+
+                  {/* خطوط الطيران */}
+                  {flightSubReport === "airline" && (
+                    <>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: "var(--ink)", marginBottom: 12 }}>تقرير خطوط الطيران</div>
+                      <ExportButtons
+                        title="تقرير خطوط الطيران"
+                        onExcel={exportAirlineXLSX}
+                        onPrint={() => printInPage(getAirlineHTML())}
+                        options={optionsMenu("airline")}
+                      />
+                      {/* خيارات الترتيب */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                        <span style={{ fontSize: 11, fontWeight: 800, color: "var(--muted)" }}>ترتيب حسب:</span>
+                        {/* ثلاثة أوضاع ولا رابع — ولا «حسب الرحلة»: الكشف
+                            يُرسَل قبل أن توجد الرحلات. والوضع يسري على
+                            المعاينة والطباعة والإكسل معاً، فلا تقول
+                            الشاشة ترتيباً ويقول المطبوع غيره. */}
+                        {([["manual", "ترتيب الحجاج"], ["alpha", "أبجدي"], ["gender", "رجال ثم نساء"]] as const).map(([val, lbl]) => (
+                          <button key={val} onClick={() => setBookingSort(val)}
+                            style={{ padding: "4px 11px", borderRadius: 8, border: `1.5px solid ${bookingSort === val ? "var(--primary)" : "var(--line)"}`, background: bookingSort === val ? "var(--primary)" : "var(--paper)", color: bookingSort === val ? "var(--text-inverse)" : "var(--muted)", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "var(--font-body)" }}>
+                            {lbl}
+                          </button>
+                        ))}
+                        {bookingSort === "manual" && familyGroupNo.size > 0 && (
+                          <span style={{ fontSize: 10, color: "var(--muted)", fontWeight: 700 }}>· عمود GRP يجمع أفراد الأسرة الواحدة</span>
+                        )}
+                      </div>
+                      {/* عمودٌ اختياريّ — تطلبه بعضُ الخطوط. يسري على
+                          المطبوع والإكسل معاً، فلا يفترق البابان. */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                        <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700, color: airlineShowExpiry ? "var(--primary)" : "var(--muted)", cursor: "pointer" }}>
+                          <input type="checkbox" checked={airlineShowExpiry} onChange={e => setAirlineShowExpiry(e.target.checked)} style={{ cursor: "pointer" }} />
+                          إظهار عمود انتهاء الجواز (PASSPORT EXPIRY)
+                        </label>
+                      </div>
+                      {/* accordion الجدول */}
+                      <div style={{ border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", marginBottom: 12 }}>
+                        <div onClick={() => toggleExpandedItem(-999)} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: "linear-gradient(135deg, var(--primary), var(--primary-dark))", cursor: "pointer", color: "#fff" }}>
+                          <span style={{ fontSize: 13, fontWeight: 800 }}>قائمة الركاب</span>
+                          {/* الشاشة داخلية: التفصيل حاج/إداري مطلوب هنا،
+                              وممنوع في المستند الخارجي */}
+                          <span style={{ fontSize: 11, fontWeight: 700, opacity: .85 }}>{bookingList.length} مطلوب لهم حجز · {bookingPilgrims} حاج · {bookingAdmins} إداري · {expandedItems.has(-999) ? "▲" : "▼"}</span>
+                        </div>
+                        {expandedItems.has(-999) && (() => {
+                          /* `bookingList` مرتَّبةٌ بالوضع المختار أصلاً —
+                             فالمعاينة والمطبوع والإكسل ترتيبٌ واحد. */
+                          const sorted = bookingList;
+                          const isAdmin = (p: any) => p.passenger_type && p.passenger_type !== "حاج";
+                          return (
+                        <div style={{ overflowX: "auto", direction: "ltr" }}>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, direction: "ltr" }}>
+                            <thead>
+                              <tr style={{ background: "var(--ivory2)" }}>
+                                {["S.N.", "FULL NAME", "NAT.", "PASSPORT NO.", "TEL. NO.", "GENDER", "CLASS"].map((h, hi) =>
+                                  <th key={h} style={{ padding: "8px 10px", textAlign: hi === 0 ? "center" : "left", whiteSpace: "nowrap", color: "var(--muted)", fontWeight: 800, fontSize: 10.5 }}>{h}</th>
+                                )}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {sorted.map((p, i) => (
+                                <tr key={p.id} style={{ borderBottom: "1px solid var(--line)", background: i % 2 === 0 ? "var(--paper)" : "var(--ivory)" }}>
+                                  <td style={{ padding: "6px 10px", textAlign: "center", color: "var(--muted)" }}>{i + 1}</td>
+                                  <td style={{ padding: "6px 10px", textAlign: "left" }}>
+                                    <span style={{ fontWeight: 700, color: "var(--ink)" }}>{p.name_en || p.name_ar}</span>
+                                    {isAdmin(p) && <span style={{ fontSize: 9, fontWeight: 800, padding: "1px 6px", borderRadius: 99, background: "var(--warning-bg)", color: "var(--warning)", marginLeft: 5 }}>{p.passenger_type}</span>}
+                                  </td>
+                                  <td style={{ padding: "6px 10px", textAlign: "left" }}>{natCode(p.nat)}</td>
+                                  <td style={{ padding: "6px 10px", textAlign: "left" }}>{p.passport}</td>
+                                  <td style={{ padding: "6px 10px", textAlign: "left" }}>{p.phone || "—"}</td>
+                                  <td style={{ padding: "6px 10px", textAlign: "left" }}>{p.gender === "ذكر" ? "MR." : "MRS."}</td>
+                                  <td style={{ padding: "6px 10px", textAlign: "left" }}>{wantsFirstClass(p) ? "FIRST CLASS" : ""}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                          );
+                        })()}
+                      </div>
+                    </>
+                  )}
+
+                  {/* كل رحلة */}
+                  {flightSubReport === "per_flight" && (
+                    <>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 10, flexWrap: "wrap", position: "sticky", top: 0, zIndex: 5, background: "var(--bg)", padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+                        <div style={{ fontSize: 13, fontWeight: 500, display: "flex", alignItems: "center", gap: 5 }}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg> تقرير كل رحلة</div>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginInlineStart: "auto" }}>
+                          <button onClick={exportPerFlightXLSX} style={excelBtnStyle}>{excelIcon} Excel</button>
+                          {optionsMenu("flights")}
+                          <button onClick={() => printInPage(getPerFlightHTML())} style={printBtnStyle}>{printIcon} طباعة</button>
+                        </div>
+                      </div>
+                      {!isLoading("flights") && !isFailed("flights") && flights.length > 0 && (
+                        <SelectionPanel
+                          title="الرحلات المطلوبة في التقرير"
+                          items={flights.map(f => ({ id: f.id, label: `${f.name} — ${f.type}` }))}
+                          selected={selectedFlightIds}
+                          panelKey="flights"
+                          alwaysOpen
+                          setSelected={(s) => setSelectedFlightIds(s as Set<number>)}
+                        />
+                      )}
+                      {isLoading("flights") ? loadingBox :
+                        isFailed("flights") ? errorBox(["flights"], "بيانات الرحلات") :
+                        flights.length === 0 ? emptyBox("لا يوجد رحلات", "أضف الرحلات من صفحة الطيران أولاً") :
+                        flights.map((flight) => {
+                          const fp = passengersOfFlight(flight);
+                          const isOpen = expandedItems.has(flight.id);
+                          const fromIATA = (flight.from_airport || "").split(" ")[0] || flight.from_airport || "";
+                          const toIATA = (flight.to_airport || "").split(" ")[0] || flight.to_airport || "";
+                          const isReturn = flight.type === "إياب";
+                          const firstClass = fp.filter(p => p.services?.flight === "درجة أولى").length;
+                          const economy = fp.length - firstClass;
+                          return (
+                            <div key={flight.id} style={{ border: "1px solid var(--line)", borderRadius: 14, marginBottom: 12, overflow: "hidden", background: "var(--paper)" }}>
+                              {/* هيدر الكارت — شبيه صفحة التنظيم */}
+                              <div style={{ background: "linear-gradient(135deg, var(--primary), var(--primary-dark))", padding: "12px 16px 0", color: "var(--text-inverse)", position: "relative" }}>
+                                <div style={{ display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 12 }}>
+                                  {/* شعار الشركة */}
+                                  {getReportAirlineLogo(flight.airline || "") && (
+                                    <div style={{ width: 52, height: 52, borderRadius: 10, background: "rgba(255,255,255,.92)", display: "flex", alignItems: "center", justifyContent: "center", padding: 5, flexShrink: 0 }}>
+                                      <img src={getReportAirlineLogo(flight.airline || "")!} alt={flight.airline} style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                                    </div>
+                                  )}
+                                  {/* معلومات الشركة */}
+                                  <div style={{ flex: 1 }}>
+                                    <div style={{ fontSize: 11, fontWeight: 800, opacity: .7, marginBottom: 2 }}>{flight.airline}</div>
+                                    <div style={{ fontSize: 15, fontWeight: 900, marginBottom: 2 }}>{flight.type === "ذهاب" ? "رحلة ذهاب" : "رحلة إياب"} — {flight.name}</div>
+                                    {flight.date && <div style={{ fontSize: 10, opacity: .65 }}>{flight.date}{flight.time ? ` · ${flight.time}` : ""}</div>}
+                                  </div>
+                                  {/* أيقونة طباعة */}
+                                  <button onClick={e => { e.stopPropagation(); printInPage(flightReportDocument(flight, passengers, branding)); }} title="طباعة هذه الرحلة" style={{ width: 30, height: 30, borderRadius: 8, border: "none", background: "rgba(255,255,255,.15)", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                                  </button>
+                                </div>
+                                {/* مسار الرحلة */}
+                                <div style={{ display: "flex", alignItems: "center", gap: 0, background: "rgba(0,0,0,.18)", borderRadius: 10, padding: "10px 14px", marginBottom: 0 }}>
+                                  <div style={{ textAlign: "center", minWidth: 60 }}>
+                                    <div style={{ fontFamily: "var(--font-heading)", fontSize: 22, fontWeight: 700, color: "#fff", lineHeight: 1 }}>{isReturn ? toIATA : fromIATA}</div>
+                                    <div style={{ fontSize: 9, color: "rgba(255,255,255,.6)", marginTop: 2 }}>{flight.time || ""}</div>
+                                  </div>
+                                  <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", padding: "0 10px" }}>
+                                    <div style={{ width: "100%", height: 1, background: "rgba(255,255,255,.3)", position: "relative", marginBottom: 4 }}>
+                                      <div style={{ position: "absolute", top: "50%", left: "50%", transform: `translate(-50%,-55%)${isReturn ? " scaleX(-1)" : ""}` }}>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.8" strokeLinecap="round"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>
+                                      </div>
+                                    </div>
+                                    <div style={{ fontFamily: "monospace", fontSize: 9, color: "rgba(255,255,255,.55)" }}>{flight.date || ""}</div>
+                                  </div>
+                                  <div style={{ textAlign: "center", minWidth: 60 }}>
+                                    <div style={{ fontFamily: "var(--font-heading)", fontSize: 22, fontWeight: 700, color: "rgba(255,255,255,.9)", lineHeight: 1 }}>{isReturn ? fromIATA : toIATA}</div>
+                                    <div style={{ fontSize: 9, color: "rgba(255,255,255,.6)", marginTop: 2 }}>{(flight as any).arrival_time || ""}</div>
+                                  </div>
+                                </div>
+                              </div>
+                              {/* جسم الكارت */}
+                              <div style={{ padding: "10px 14px", display: "flex", alignItems: "center", gap: 14, borderBottom: "1px solid var(--line)", cursor: "pointer" }} onClick={() => toggleExpandedItem(flight.id)}>
+                                <div style={{ display: "flex", gap: 8 }}>
+                                  {firstClass > 0 && <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 9px", borderRadius: 99, background: "#FFF8E1", color: "#B8880F" }}>درجة أولى · {firstClass}</span>}
+                                  {economy > 0 && <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 9px", borderRadius: 99, background: "var(--ivory)", color: "var(--muted)", border: "1px solid var(--line)" }}>سياحية · {economy}</span>}
+                                </div>
+                                <span style={{ fontSize: 11, fontWeight: 800, color: "var(--primary)", marginRight: "auto" }}>{fp.length === 1 ? `${fp.length} مسافر` : fp.length === 2 ? `${fp.length} مسافران` : `${fp.length} مسافرين`}</span>
+                                <span style={{ fontSize: 10, color: "var(--blue)", fontWeight: 800 }}>{isOpen ? "▲ إغلاق" : "▼ تفاصيل"}</span>
+                              </div>
+                              {isOpen && fp.length > 0 && (
+                                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                                  <thead><tr style={{ background: "var(--ivory2)" }}>
+                                    {["م", "اسم الحاج / الحاجة", "الجنسية", "رقم الجواز", "التليفون", "الجنس", "الدرجة"].map(h =>
+                                      <th key={h} style={{ padding: "8px 12px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>{h}</th>
+                                    )}
+                                  </tr></thead>
+                                  <tbody>{fp.map((p, i) =>
+                                    <tr key={p.id} style={{ borderBottom: "1px solid var(--line)", background: i % 2 === 0 ? "var(--paper)" : "var(--ivory)" }}>
+                                      <td style={{ padding: "8px 12px", textAlign: "center", color: "var(--muted)", fontSize: 11 }}>{i + 1}</td>
+                                      <td style={{ padding: "8px 12px", color: "var(--primary)", fontWeight: 900 }}>{p.short_ar || p.name_ar}</td>
+                                      <td style={{ padding: "8px 12px", color: "var(--muted)", fontSize: 11 }}>{p.nat}</td>
+                                      <td style={{ padding: "8px 12px", fontSize: 11 }}>{p.passport}</td>
+                                      <td style={{ padding: "8px 12px", fontSize: 11 }}>{p.phone || "—"}</td>
+                                      <td style={{ padding: "8px 12px", fontSize: 11 }}>{p.gender}</td>
+                                      <td style={{ padding: "8px 12px", fontSize: 11 }}>{p.services?.flight === "درجة أولى" ? "أولى" : "اقتصادية"}</td>
+                                    </tr>
+                                  )}</tbody>
+                                </table>
+                              )}
+                            </div>
+                          );
+                        })
+                      }
+                    </>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          {/* ===== تقرير الباصات ===== */}
+          {activeReport === "buses" && (
+            <>
+              {isLoading("buses") ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير الباصات</div>{loadingBox}</> :
+                isFailed("buses") ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير الباصات</div>{errorBox(["buses"], "بيانات الباصات")}</> :
+                buses.length === 0 ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير الباصات</div><div style={{ textAlign: "center", padding: "2rem", color: "var(--text-muted)" }}>لا يوجد باصات</div></> :
+                <>
+                  <ExportButtons
+                    title="تقرير الباصات"
+                    onExcel={exportBusesXLSX}
+                    options={optionsMenu("bus")}
+                    onPrint={() => printInPage(getBusesHTML())}
+                  />
+                  <SelectionPanel
+                    title="الباصات المطلوبة في التقرير"
+                    panelKey="buses"
+                    alwaysOpen
+                    items={buses.map(b => ({ id: b.id, label: `${b.name}${b.type === "VIP" ? " — VIP" : ""}` }))}
+                    selected={selectedBusIds}
+                    setSelected={(s) => setSelectedBusIds(s as Set<number>)}
+                  />
+                  <div className="rep-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 14 }}>
+                    {buses.map((bus) => {
+                      const bp = busManifest(bus, passengers).people;
+                      const isOpen = expandedItems.has(bus.id);
+                      const isVip = bus.type === "VIP";
+                      const stripBg = isVip ? "linear-gradient(135deg,#D4A017,#B8880F)" : "linear-gradient(135deg,#1976D2,#1565C0)";
+                      const fillCls = isVip ? "#D4A017" : "#1976D2";
+                      /* السعةُ عمودٌ `not null` في القاعدة — ولا يُختلَق لها بديل */
+                      const capacity = bus.capacity;
+                      const pct = capacity ? Math.round(bp.length / capacity * 100) : 0;
+                      return (
+                        <div key={bus.id} onClick={() => toggleExpandedItem(bus.id)} style={{ borderRadius: 14, overflow: "hidden", border: `1.5px solid ${isOpen ? "#90CAF9" : "var(--line)"}`, background: "var(--paper)", cursor: "pointer", transition: ".15s" }}>
+                          <div style={{ height: 42, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", background: stripBg, color: "#fff" }}>
+                            <span style={{ fontSize: 17, fontWeight: 900, fontFamily: "var(--font-heading)" }}>{bus.name}{isVip && " — VIP"}</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              {isVip && <span style={{ fontSize: 9, fontWeight: 900, background: "rgba(255,255,255,.25)", padding: "2px 8px", borderRadius: 99 }}>VIP</span>}
+                              <button onClick={e => { e.stopPropagation(); printInPage(getSingleBusHTML(bus)); }} title="طباعة هذا الباص" style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "rgba(255,255,255,.18)", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                              </button>
+                            </div>
+                          </div>
+                          <div style={{ padding: "11px 13px" }}>
+                            <div style={{ display: "flex", alignItems: "baseline", gap: 4, marginBottom: 8 }}>
+                              <span style={{ fontSize: 24, fontWeight: 900, color: "var(--ink)", lineHeight: 1, fontFamily: "var(--font-heading)" }}>{bp.length}</span>
+                              <span style={{ fontSize: 13, color: "var(--muted)" }}>/</span>
+                              <span style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600 }}>{capacity} مقعد</span>
+                            </div>
+                            <div style={{ height: 7, borderRadius: 99, background: "var(--ivory2)", overflow: "hidden", marginBottom: 4 }}>
+                              <div style={{ height: "100%", width: `${pct}%`, borderRadius: 99, background: fillCls }} />
+                            </div>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: "var(--muted)", display: "flex", justifyContent: "space-between" }}>
+                              <span>إشغال {pct}٪</span>
+                              <span style={{ color: "#1565C0", fontWeight: 800 }}>اضغط للتفاصيل ▾</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* التفاصيل تحت صف الكروت */}
+                  {buses.filter(bus => expandedItems.has(bus.id) && selectedBusIds.has(bus.id)).map(bus => {
+                    const bp = busManifest(bus, passengers).people;
+                    const isVip = bus.type === "VIP";
+                    const stripBg = isVip ? "linear-gradient(135deg,#D4A017,#B8880F)" : "linear-gradient(135deg,#1976D2,#1565C0)";
+                    return (
+                      <div key={`detail-${bus.id}`} style={{ borderRadius: 14, overflow: "hidden", border: "1.5px solid #90CAF9", background: "var(--paper)", marginBottom: 8 }}>
+                        <div onClick={() => toggleExpandedItem(bus.id)} style={{ height: 38, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", background: stripBg, cursor: "pointer", color: "#fff" }}>
+                          <span style={{ fontSize: 15, fontWeight: 900, fontFamily: "var(--font-heading)" }}>{bus.name}{isVip ? " — VIP" : ""} ▲</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, opacity: .85 }}>{bp.length === 1 ? `${bp.length} مسافر` : bp.length === 2 ? `${bp.length} مسافران` : `${bp.length} مسافرين`}</span>
+                        </div>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                          <thead><tr style={{ background: "var(--ivory2)" }}>
+                            <th style={{ padding: "7px 12px", textAlign: "center", width: 36, color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>م</th>
+                            <th style={{ padding: "7px 12px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>الاسم</th>
+                            <th style={{ padding: "7px 12px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>الجنسية</th>
+                          </tr></thead>
+                          <tbody>{bp.map((p, i) =>
+                            <tr key={p.id} style={{ borderBottom: "1px solid var(--line)", background: i % 2 === 0 ? "var(--paper)" : "var(--ivory)" }}>
+                              <td style={{ padding: "7px 12px", textAlign: "center", color: "var(--muted)", fontSize: 11 }}>{i + 1}</td>
+                              <td style={{ padding: "7px 12px", color: "var(--primary)", fontWeight: 900 }}>{(p as any).short_ar || p.name_ar}</td>
+                              <td style={{ padding: "7px 12px", color: "var(--muted)", fontSize: 11 }}>{p.nat}</td>
+                            </tr>
+                          )}</tbody>
+                        </table>
+                      </div>
+                    );
+                  })}
+                </>
+              }
+            </>
+          )}
+
+          {/* ===== تقرير منى ===== */}
+          {activeReport === "mina" && (
+            <>
+              {isLoading("camps") ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير مخيمات منى</div>{loadingBox}</> :
+                isFailed("camps") ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير مخيمات منى</div>{errorBox(["camps"], "بيانات المخيمات")}</> :
+                camps.filter(c => c.page_type === "منى").length === 0 ?
+                  <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير مخيمات منى</div><div style={{ textAlign: "center", padding: "2rem", color: "var(--text-muted)" }}>لا يوجد مخيمات</div></> :
+                <>
+                  <ExportButtons
+                    title="تقرير مخيمات منى"
+                    onExcel={() => exportCampsXLSX("منى")}
+                    options={optionsMenu("mina")}
+                    onPrint={() => printInPage(getCampsHTML("منى"))}
+                  />
+                  <SelectionPanel
+                    title="مخيمات منى المطلوبة في التقرير"
+                    panelKey="mina"
+                    alwaysOpen
+                    items={camps.filter(c => c.page_type === "منى").map(c => ({ id: c.id, label: `${c.name} (${c.gender === "ذكر" ? "رجال" : "نساء"})` }))}
+                    selected={selectedMinaCampIds}
+                    setSelected={(s) => setSelectedMinaCampIds(s as Set<number>)}
+                  />
+                  <div className="rep-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 14 }}>
+                    {camps.filter(c => c.page_type === "منى").map(camp => {
+                      const cp = passengers.filter(p => p.camp_mina_id === camp.id);
+                      const isMale = camp.gender === "ذكر";
+                      const isSpecial = camp.type === "خاص";
+                      const isOpen = expandedItems.has(camp.id);
+                      const stripBg = isSpecial ? "linear-gradient(135deg,#D4A017,#B8880F)" : "linear-gradient(135deg,#2E7D32,#1B5E20)";
+                      return isOpen ? (
+                        <div key={camp.id} style={{ gridColumn: "1 / -1", borderRadius: 14, overflow: "hidden", border: `1.5px solid ${isSpecial ? "#FFD54F" : "#A5D6A7"}`, background: "var(--paper)" }}>
+                          <div onClick={() => toggleExpandedItem(camp.id)} style={{ height: 42, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", background: stripBg, cursor: "pointer", color: "#fff" }}>
+                            <span style={{ fontSize: 17, fontWeight: 900, fontFamily: "var(--font-heading)" }}>مخيم {camp.name} ▾</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span style={{ fontSize: 11, padding: "1px 8px", borderRadius: 99, background: "rgba(255,255,255,.2)", fontWeight: 800 }}>{isMale ? "رجال" : "نساء"}</span>
+                              <span style={{ fontSize: 11, fontWeight: 700, opacity: .85 }}>{cp.length === 1 ? `${cp.length} مسافر` : cp.length === 2 ? `${cp.length} مسافران` : `${cp.length} مسافرين`}</span>
+                              <button onClick={e => { e.stopPropagation(); printInPage(getSingleCampHTML(camp, "منى")); }} title="طباعة هذا المخيم" style={{ width: 28, height: 28, borderRadius: 8, border: "none", background: "rgba(255,255,255,.2)", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                              </button>
+                            </div>
+                          </div>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                            <thead><tr style={{ background: "var(--ivory2)" }}>
+                              <th style={{ padding: "8px 13px", textAlign: "center", width: 36, color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>م</th>
+                              <th style={{ padding: "8px 13px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>الاسم</th>
+                              <th style={{ padding: "8px 13px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>الجنسية</th>
+                            </tr></thead>
+                            <tbody>{cp.map((p, i) =>
+                              <tr key={p.id} style={{ borderBottom: "1px solid var(--line)", background: i % 2 === 0 ? "var(--paper)" : "var(--ivory)" }}>
+                                <td style={{ padding: "8px 13px", textAlign: "center", color: "var(--muted)", fontSize: 11 }}>{i + 1}</td>
+                                <td style={{ padding: "8px 13px", color: "var(--primary)", fontWeight: 900 }}>{(p as any).short_ar || p.name_ar}</td>
+                                <td style={{ padding: "8px 13px", color: "var(--muted)", fontSize: 11 }}>{p.nat}</td>
+                              </tr>
+                            )}</tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div key={camp.id} onClick={() => toggleExpandedItem(camp.id)} style={{ borderRadius: 14, overflow: "hidden", border: `1.5px solid ${isSpecial ? "#FFD54F" : "var(--line)"}`, background: "var(--paper)", cursor: "pointer" }}>
+                          <div style={{ height: 42, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", background: stripBg, color: "#fff" }}>
+                            <span style={{ fontSize: 17, fontWeight: 900, fontFamily: "var(--font-heading)" }}>{camp.name}</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ fontSize: 9, fontWeight: 900, background: "rgba(255,255,255,.25)", padding: "2px 8px", borderRadius: 99 }}>{isMale ? "رجال" : "نساء"}</span>
+                              {isSpecial && <span style={{ fontSize: 9, fontWeight: 900, background: "rgba(255,255,255,.25)", padding: "2px 8px", borderRadius: 99 }}>خاص</span>}
+                              <button onClick={e => { e.stopPropagation(); printInPage(getSingleCampHTML(camp, "منى")); }} title="طباعة" style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "rgba(255,255,255,.18)", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                              </button>
+                            </div>
+                          </div>
+                          <div style={{ padding: "11px 13px" }}>
+                            <div style={{ display: "flex", alignItems: "baseline", gap: 4, marginBottom: 6 }}>
+                              <span style={{ fontSize: 24, fontWeight: 900, color: "var(--ink)", lineHeight: 1, fontFamily: "var(--font-heading)" }}>{cp.length}</span>
+                              <span style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600 }}>مسافر</span>
+                            </div>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: "var(--muted)", display: "flex", justifyContent: "space-between" }}>
+                              <span>{camp.type}</span>
+                              <span style={{ color: "#2E7D32", fontWeight: 800 }}>اضغط للتفاصيل ▾</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              }
+            </>
+          )}
+
+          {/* ===== تقرير عرفة ===== */}
+          {activeReport === "arafa" && (
+            <>
+              {isLoading("camps") ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير مخيمات عرفة</div>{loadingBox}</> :
+                isFailed("camps") ? <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير مخيمات عرفة</div>{errorBox(["camps"], "بيانات المخيمات")}</> :
+                camps.filter(c => c.page_type === "عرفة").length === 0 ?
+                  <><div style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>تقرير مخيمات عرفة</div><div style={{ textAlign: "center", padding: "2rem", color: "var(--text-muted)" }}>لا يوجد مخيمات</div></> :
+                <>
+                  <ExportButtons
+                    title="تقرير مخيمات عرفة"
+                    onExcel={() => exportCampsXLSX("عرفة")}
+                    options={optionsMenu("arafa")}
+                    onPrint={() => printInPage(getCampsHTML("عرفة"))}
+                  />
+                  <SelectionPanel
+                    title="مخيمات عرفة المطلوبة في التقرير"
+                    panelKey="arafa"
+                    alwaysOpen
+                    items={camps.filter(c => c.page_type === "عرفة").map(c => ({ id: c.id, label: `${c.name} (${c.gender === "ذكر" ? "رجال" : "نساء"})` }))}
+                    selected={selectedArafaCampIds}
+                    setSelected={(s) => setSelectedArafaCampIds(s as Set<number>)}
+                  />
+                  <div className="rep-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 14 }}>
+                    {camps.filter(c => c.page_type === "عرفة").map(camp => {
+                      const cp = passengers.filter(p => p.camp_arafa_id === camp.id);
+                      const isMale = camp.gender === "ذكر";
+                      const isSpecial = camp.type === "خاص";
+                      const isOpen = expandedItems.has(camp.id);
+                      const stripBg = isSpecial ? "linear-gradient(135deg,#D4A017,#B8880F)" : "linear-gradient(135deg,#6A1B9A,#4A148C)";
+                      return isOpen ? (
+                        <div key={camp.id} style={{ gridColumn: "1 / -1", borderRadius: 14, overflow: "hidden", border: `1.5px solid ${isSpecial ? "#FFD54F" : "#CE93D8"}`, background: "var(--paper)" }}>
+                          <div onClick={() => toggleExpandedItem(camp.id)} style={{ height: 42, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", background: stripBg, cursor: "pointer", color: "#fff" }}>
+                            <span style={{ fontSize: 17, fontWeight: 900, fontFamily: "var(--font-heading)" }}>مخيم {camp.name} ▾</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span style={{ fontSize: 11, padding: "1px 8px", borderRadius: 99, background: "rgba(255,255,255,.2)", fontWeight: 800 }}>{isMale ? "رجال" : "نساء"}</span>
+                              <span style={{ fontSize: 11, fontWeight: 700, opacity: .85 }}>{cp.length === 1 ? `${cp.length} مسافر` : cp.length === 2 ? `${cp.length} مسافران` : `${cp.length} مسافرين`}</span>
+                              <button onClick={e => { e.stopPropagation(); printInPage(getSingleCampHTML(camp, "عرفة")); }} title="طباعة هذا المخيم" style={{ width: 28, height: 28, borderRadius: 8, border: "none", background: "rgba(255,255,255,.2)", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                              </button>
+                            </div>
+                          </div>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                            <thead><tr style={{ background: "var(--ivory2)" }}>
+                              <th style={{ padding: "8px 13px", textAlign: "center", width: 36, color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>م</th>
+                              <th style={{ padding: "8px 13px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>الاسم</th>
+                              <th style={{ padding: "8px 13px", textAlign: "right", color: "var(--muted)", fontSize: 10.5, fontWeight: 800 }}>الجنسية</th>
+                            </tr></thead>
+                            <tbody>{cp.map((p, i) =>
+                              <tr key={p.id} style={{ borderBottom: "1px solid var(--line)", background: i % 2 === 0 ? "var(--paper)" : "var(--ivory)" }}>
+                                <td style={{ padding: "8px 13px", textAlign: "center", color: "var(--muted)", fontSize: 11 }}>{i + 1}</td>
+                                <td style={{ padding: "8px 13px", color: "var(--primary)", fontWeight: 900 }}>{(p as any).short_ar || p.name_ar}</td>
+                                <td style={{ padding: "8px 13px", color: "var(--muted)", fontSize: 11 }}>{p.nat}</td>
+                              </tr>
+                            )}</tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div key={camp.id} onClick={() => toggleExpandedItem(camp.id)} style={{ borderRadius: 14, overflow: "hidden", border: `1.5px solid ${isSpecial ? "#FFD54F" : "var(--line)"}`, background: "var(--paper)", cursor: "pointer" }}>
+                          <div style={{ height: 42, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", background: stripBg, color: "#fff" }}>
+                            <span style={{ fontSize: 17, fontWeight: 900, fontFamily: "var(--font-heading)" }}>{camp.name}</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ fontSize: 9, fontWeight: 900, background: "rgba(255,255,255,.25)", padding: "2px 8px", borderRadius: 99 }}>{isMale ? "رجال" : "نساء"}</span>
+                              {isSpecial && <span style={{ fontSize: 9, fontWeight: 900, background: "rgba(255,255,255,.25)", padding: "2px 8px", borderRadius: 99 }}>خاص</span>}
+                              <button onClick={e => { e.stopPropagation(); printInPage(getSingleCampHTML(camp, "عرفة")); }} title="طباعة" style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "rgba(255,255,255,.18)", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                              </button>
+                            </div>
+                          </div>
+                          <div style={{ padding: "11px 13px" }}>
+                            <div style={{ display: "flex", alignItems: "baseline", gap: 4, marginBottom: 6 }}>
+                              <span style={{ fontSize: 24, fontWeight: 900, color: "var(--ink)", lineHeight: 1, fontFamily: "var(--font-heading)" }}>{cp.length}</span>
+                              <span style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600 }}>مسافر</span>
+                            </div>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: "var(--muted)", display: "flex", justifyContent: "space-between" }}>
+                              <span>{camp.type}</span>
+                              <span style={{ color: "#6A1B9A", fontWeight: 800 }}>اضغط للتفاصيل ▾</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              }
+            </>
+          )}
+
+          {/* ===== تقرير الفندق ===== */}
+          {activeReport === "hotel" && (
+            <>
+              {/* شريط العنوان */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+                <div style={{ width: 44, height: 44, borderRadius: 12, background: "rgba(139,58,107,.12)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#8B3A6B" strokeWidth="1.8" strokeLinecap="round"><path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M10 6h4M10 10h4M10 14h4"/></svg>
+                </div>
+                <div>
+                  <div style={{ fontFamily: "var(--font-heading)", fontSize: 17, fontWeight: 700, color: "var(--ink)" }}>تقرير الفندق</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>كشف التسكين حسب الطابق ونوع الغرفة</div>
+                </div>
+              </div>
+
+              {/* صف KPI */}
+              {(() => {
+                const shown = getFilteredRooms();
+                const cDone = shown.filter(r => getRoomStatus(r) === "مكتملة").length;
+                const cProg = shown.filter(r => getRoomStatus(r) === "قيد التسكين").length;
+                const cReady = shown.filter(r => getRoomStatus(r) === "جاهزة").length;
+                const kpis: [string, string, string][] = [
+                  [String(shown.length), "إجمالي الغرف", "var(--em7)"],
+                  [String(cDone), "مكتملة", "#059669"],
+                  [String(cProg), "قيد التسكين", "#1D4ED8"],
+                  [String(cReady), "جاهزة (شاغرة)", "var(--g6)"],
+                ];
+                return (
+                  <div className="rep-kpis" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 16 }}>
+                    {kpis.map(([num, lbl, clr]) => (
+                      <div key={lbl} style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", boxShadow: "0 2px 8px rgba(92,24,48,.05)" }}>
+                        <div style={{ height: 4, background: clr }} />
+                        <div style={{ padding: "11px 13px" }}>
+                          <div style={{ fontFamily: "var(--font-heading)", fontSize: 26, fontWeight: 900, lineHeight: 1, color: clr }}>{num}</div>
+                          <div style={{ fontSize: 10.5, color: "var(--muted)", fontWeight: 700, marginTop: 3 }}>{lbl}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+
+              {/* نطاق التقرير — كارت برأس عنابي */}
+              <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 14, overflow: "hidden", marginBottom: 16, boxShadow: "0 2px 8px rgba(92,24,48,.05)" }}>
+                <div style={{ padding: "11px 16px", background: "linear-gradient(135deg, #8B3A6B, #5C1830)", color: "#fff", fontSize: 13, fontWeight: 800, display: "flex", alignItems: "center", gap: 8 }}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+                  نطاق التقرير
+                </div>
+                <div style={{ padding: 14 }}>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                    {[["all", "كل الغرف"], ["type", "نوع معين"]].map(([val, label]) => (
+                      <div key={val} onClick={() => setHotelPrintFilter(val as "all" | "type")}
+                        style={{ flex: 1, padding: "9px", borderRadius: 10, border: `1.5px solid ${hotelPrintFilter === val ? "var(--info)" : "var(--line)"}`, background: hotelPrintFilter === val ? "var(--male-bg)" : "var(--ivory)", cursor: "pointer", textAlign: "center", fontSize: 12, fontWeight: 700, color: hotelPrintFilter === val ? "var(--info)" : "var(--muted)" }}>
+                        {label}
+                      </div>
+                    ))}
+                  </div>
+                  {hotelPrintFilter === "type" && (
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 12 }}>
+                      {HOTEL_ROOM_TYPES.map(t => {
+                        const [bg, clr] = ROOM_COLORS[t] ?? ["var(--ivory2)", "var(--muted)"];
+                        return (
+                          <div key={t} onClick={() => setHotelPrintType(t)}
+                            style={{ flex: 1, padding: 6, borderRadius: 8, border: `1.5px solid ${hotelPrintType === t ? clr : "var(--line)"}`, background: hotelPrintType === t ? bg : "var(--ivory)", cursor: "pointer", textAlign: "center", fontSize: 11, fontWeight: 700, color: hotelPrintType === t ? clr : "var(--muted)" }}>
+                            {t}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, fontWeight: 800, color: "var(--muted)", marginBottom: 8 }}>الطوابق المطلوبة في التقرير</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {floorItems.map(f => {
+                      const on = selectedFloors.has(f.id);
+                      return (
+                        <div key={f.id} onClick={() => { const s = new Set(selectedFloors); on ? s.delete(f.id) : s.add(f.id); setSelectedFloors(s); }}
+                          style={{ padding: "7px 14px", borderRadius: 9, border: `1.5px solid var(--em7)`, background: on ? "var(--em7)" : "var(--paper)", color: on ? "#fff" : "var(--em7)", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                          {f.label}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* اتّجاهُ الورقة اختيارٌ صريحٌ لا زرٌّ جانبيّ: «بالطول»
+                  ستّ عشرة غرفةً في الورقة، و«بالعرض» خمسَ عشرة بكروتٍ
+                  أعرض تُبقي الاسمَ الطويل في سطرٍ واحد. وكلاهما
+                  ينادي `hotelReportDocument` نفسه — لا بانيَ ثانٍ.
+                  وقد حلّا محلَّ زرّ «طباعة عرضيّة» المنفصل، فلا يبقى
+                  مساران في الواجهة يعنيان الشيءَ نفسه. */}
+              <ExportButtons
+                onExcel={exportHotelXLSX}
+                printActions={
+                  <>
+                    <button onClick={() => printInPage(getHotelHTML({ landscape: false }))} style={printBtnStyle} title="ستّ عشرة غرفة في الورقة">
+                      {printIcon} طباعة بالطول
+                    </button>
+                    <button onClick={() => printInPage(getHotelHTML({ landscape: true }))} style={printBtnStyle} title="خمس عشرة غرفة في الورقة — أسماء أوسع">
+                      {printIcon} طباعة بالعرض
+                    </button>
+                  </>
+                }
+              />
+
+              {/* مفتاح الألوان */}
+              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 16, padding: "10px 14px", background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 10 }}>
+                {([["مكتملة", "#7D1F3C"], ["قيد التسكين", "#1D4ED8"], ["جاهزة", "#059669"], ["مجلس", "#7C3AED"]] as [string, string][]).map(([lbl, clr]) => (
+                  <span key={lbl} style={{ fontSize: 11, fontWeight: 700, color: "var(--muted)", display: "flex", alignItems: "center", gap: 5 }}>
+                    <i style={{ width: 10, height: 10, borderRadius: 3, background: clr, display: "inline-block" }} />{lbl}
+                  </span>
+                ))}
+              </div>
+
+              {isLoading("rooms") ? loadingBox :
+                isFailed("rooms") ? errorBox(["rooms"], "بيانات الغرف") :
+                rooms.length === 0 ? emptyBox("لا يوجد غرف", "أضف الغرف من صفحة الفندق أولاً") :
+                getFilteredRooms().length === 0 ? emptyBox("لا توجد غرف ضمن النطاق المحدّد", "اختر طابقاً واحداً على الأقل") :
+                <>
+                  {/* عرض بالطوابق — كروت مربّعة */}
+                  {[...new Set(getFilteredRooms().map(r => floorKey(r)))].sort((a, b) => parseInt(a) - parseInt(b) || a.localeCompare(b)).map(floor => {
+                    const floorRooms = getFilteredRooms().filter(r => floorKey(r) === floor);
+                    const fDone = floorRooms.filter(r => getRoomStatus(r) === "مكتملة").length;
+                    const fReady = floorRooms.filter(r => getRoomStatus(r) === "جاهزة").length;
+                    const fOcc = floorRooms.reduce((s, r) => s + passengers.filter(p => p.room_id === r.id).length, 0);
+                    return (
+                      <div key={floor} style={{ marginBottom: 20 }}>
+                        {/* عنوان الطابق */}
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                          <div style={{ width: 34, height: 34, borderRadius: 10, background: "linear-gradient(135deg, var(--em7), var(--em8))", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "var(--font-heading)", fontWeight: 900, fontSize: 14, flexShrink: 0 }}>{floor}</div>
+                          <div>
+                            <div style={{ fontFamily: "var(--font-heading)", fontSize: 15, fontWeight: 700, color: "var(--ink)" }}>طابق {floor}</div>
+                            <div style={{ fontSize: 10.5, color: "var(--muted)" }}>{floorRooms.length} غرفة · {fOcc} حاج</div>
+                          </div>
+                          <span style={{ flex: 1, height: 1, background: "linear-gradient(90deg, var(--line), transparent)" }} />
+                          <span style={{ fontSize: 11, color: "var(--muted)", fontWeight: 700 }}>{fDone} مكتملة · {fReady} جاهزة</span>
+                        </div>
+                        {/* شبكة الغرف */}
+                        <div className="rep-doc-grid" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
+                          {floorRooms.map(room => {
+                            const rp = passengers.filter(p => p.room_id === room.id);
+                            const status = getRoomStatus(room);
+                            const color = ROOM_STATUS_COLOR[status] || "var(--em7)";
+                            const isMajlis = room.type === "مجلس";
+                            const isEmpty = rp.length === 0 && !isMajlis;
+                            const visible = rp.slice(0, 2);
+                            const extra = rp.length - 2;
+                            return (
+                              <div key={room.id} style={{ background: status === "مكتملة" ? "#f3f4f6" : "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,.06)", display: "flex", flexDirection: "column", minHeight: 120, opacity: status === "مكتملة" ? .88 : 1 }}>
+                                <div style={{ height: 4, background: color, flexShrink: 0 }} />
+                                <div style={{ padding: "8px 10px", display: "flex", flexDirection: "column", flex: 1 }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
+                                    <span style={{ fontSize: 18, fontWeight: 900, color, lineHeight: 1, flexShrink: 0 }}>{room.number}</span>
+                                    {!isMajlis && <span style={{ fontSize: 9, color: "var(--muted)", fontWeight: 700 }}>{room.type}</span>}
+                                    {isMajlis
+                                      ? <span style={{ fontSize: 9, color: "#7C3AED", fontWeight: 700, marginRight: "auto" }}>مجلس</span>
+                                      : <span style={{ fontSize: 9, fontWeight: 800, padding: "1px 6px", borderRadius: 99, marginRight: "auto", whiteSpace: "nowrap", background: `${color}15`, color }}>{status}</span>}
+                                  </div>
+                                  {isMajlis ? (
+                                    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#7C3AED", opacity: .6 }}>
+                                      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                                    </div>
+                                  ) : isEmpty ? (
+                                    <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "var(--muted)", fontWeight: 700 }}>— شاغرة —</div>
+                                  ) : (
+                                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                                      {visible.map(p => (
+                                        <div key={p.id} style={{ fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                          <span style={{ width: 3, height: 3, borderRadius: "50%", background: color, flexShrink: 0 }} />
+                                          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{p.short_ar || p.name_ar.split(" ").slice(0, 2).join(" ")}</span>
+                                        </div>
+                                      ))}
+                                      {extra > 0 && <div style={{ fontSize: 10, color, fontWeight: 800 }}>+{extra}</div>}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
+              }
+            </>
+          )}
+
+          {/* ===== طباعة المستندات ===== */}
+          {activeReport === "documents" && (
+            <>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 10, flexWrap: "wrap", position: "sticky", top: 0, zIndex: 5, background: "var(--bg)", padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+                <div style={{ fontSize: 14, fontWeight: 600 }}>طباعة المستندات</div>
+                {docList.length > 0 && (
+                  <div className="rep-actions" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {optionsMenu("documents")}
+                    <button onClick={() => { void printDocuments(); }} disabled={docPreparing} style={printBtnStyle}>{printIcon} {docPreparing ? "جارٍ التجهيز..." : `طباعة (${docSelectedIds.size})`}</button>
+                  </div>
+                )}
+              </div>
+
+              {/* نوع المستند */}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                {DOC_TYPES.map(d => (
+                  <div key={d.key} onClick={() => setDocType(d.key)}
+                    style={{ flex: 1, minWidth: 90, padding: "8px 10px", borderRadius: 8, border: `1.5px solid ${docType === d.key ? "var(--em7)" : "var(--border)"}`, background: docType === d.key ? "var(--success-bg)" : "transparent", cursor: "pointer", textAlign: "center", fontSize: 12, color: docType === d.key ? "var(--em7)" : "var(--text-muted)" }}>
+                    {d.label} ({passengers.filter(p => (p as any)[d.key]).length})
+                  </div>
+                ))}
+              </div>
+
+              {/* فلتر حجاج / إداريين / الكل */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>عرض:</div>
+                {([["all", "الكل"], ["hajj", "الحجاج"], ["admin", "الإداريون"]] as const).map(([key, label]) => (
+                  <div key={key} onClick={() => setDocPersonFilter(key)}
+                    style={{ padding: "6px 14px", borderRadius: 99, border: `1.5px solid ${docPersonFilter === key ? "var(--warning)" : "var(--border)"}`, background: docPersonFilter === key ? "var(--warning-bg)" : "transparent", cursor: "pointer", fontSize: 12, fontWeight: 600, color: docPersonFilter === key ? "var(--warning)" : "var(--text-muted)" }}>
+                    {label} ({key === "all" ? docListAll.length : key === "admin" ? docListAll.filter(isAdminPerson).length : docListAll.filter(p => !isAdminPerson(p)).length})
+                  </div>
+                ))}
+              </div>
+
+              {/* عدد المستندات في الصفحة */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>عدد المستندات في الصفحة:</div>
+                {[1, 2, 4].map(n => (
+                  <div key={n} onClick={() => setDocPerPage(n as 1 | 2 | 4)}
+                    style={{ padding: "6px 16px", borderRadius: 8, border: `1.5px solid ${docPerPage === n ? "var(--info)" : "var(--border)"}`, background: docPerPage === n ? "var(--male-bg)" : "transparent", cursor: "pointer", fontSize: 12, fontWeight: 600, color: docPerPage === n ? "var(--info)" : "var(--text-muted)" }}>
+                    {n}
+                  </div>
+                ))}
+              </div>
+
+              {docList.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "2rem", color: "var(--text-muted)" }}>
+                  لا يوجد {docPersonFilter === "admin" ? "إداريون" : docPersonFilter === "hajj" ? "حجاج" : "أشخاص"} عندهم {docTypeLabel} مرفوع
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 500 }}>{docTypeLabel} ({docList.length})</div>
+                    <div onClick={() => setDocSelected(prev => ({ ...prev, [docType]: docSelectedIds.size === docList.length ? new Set() : new Set(docList.map(p => p.id)) }))} style={{ fontSize: 11, color: "var(--em7)", cursor: "pointer" }}>
+                      {docSelectedIds.size === docList.length ? "إلغاء الكل" : "تحديد الكل"}
+                    </div>
+                  </div>
+                  <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", marginBottom: 14 }}>
+                    {docList.map((p, i) => (
+                      <div key={p.id} onClick={() => toggleDocSelected(p.id)}
+                        style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px", borderBottom: "0.5px solid var(--line)", cursor: "pointer", background: docSelectedIds.has(p.id) ? "rgba(125,31,60,0.05)" : "transparent", transition: "background 0.1s" }}>
+                        {/* Checkbox */}
+                        <div style={{ width: 18, height: 18, borderRadius: 5, border: `2px solid ${docSelectedIds.has(p.id) ? "var(--em7)" : "var(--line)"}`, background: docSelectedIds.has(p.id) ? "var(--em7)" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all 0.1s" }}>
+                          {docSelectedIds.has(p.id) && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>}
+                        </div>
+                        {/* رقم */}
+                        <span style={{ fontSize: 11, color: "var(--text-muted)", width: 24, flexShrink: 0 }}>{i + 1}</span>
+                        {/* الاسم */}
+                        <span style={{ fontSize: 13, fontWeight: 500, flex: 1 }}>{p.short_ar || p.name_ar}</span>
+                        {/* علامة تمييز: إداري / نوعه — لا تظهر للحجاج */}
+                        {isAdminPerson(p) && (
+                          <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "var(--warning-bg)", color: "var(--warning)" }}>{p.passenger_type}</span>
+                        )}
+                        {/* الجواز */}
+                        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{p.passport || "—"}</span>
+                        {/* الجنس */}
+                        <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: p.gender === "أنثى" ? "var(--fb)" : "var(--mb)", color: p.gender === "أنثى" ? "var(--ff)" : "var(--mf)" }}>{p.gender === "أنثى" ? "أنثى" : "ذكر"}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {passengers.filter(p => !(p as any)[docType]).length > 0 && (
+                <div style={{ marginTop: 12, padding: "10px 14px", background: "var(--warning-bg)", borderRadius: 10, fontSize: 11, color: "var(--warning)" }}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ marginLeft: 6 }}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                  {passengers.filter(p => !(p as any)[docType]).length} حاج مش عندهم {docTypeLabel} مرفوع
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ═══════════════════════════════════════════════════
+              مطبوعات الشنط — استيكر + تاج اليد + التاج المعلق
+              ═══════════════════════════════════════════════════ */}
+          {activeReport === "stickers" && (() => {
+            /* ─── بناء قائمة الحجاج المستهدفين ─── */
+            const stkPassengers = (() => {
+              if (stkFilter === "all") return passengers;
+              if (stkFilter === "bus")  return passengers.filter(p => p.bus_id === stkBusId);
+              if (stkFilter === "room") return passengers.filter(p => p.room_id === stkRoomId);
+              if (stkFilter === "one")  return passengers.filter(p => p.id === stkPassId);
+              return passengers;
+            })();
+
+            /* ══ الطباعة عبر الدالة الموحّدة المشتركة مع ملف الحاج (utils) ══ */
+            const finalPassengers = stkSelected.size > 0
+              ? passengers.filter(pp => stkSelected.has(pp.id))
+              : stkPassengers;
+
+            const doPrint = () => {
+              if (!finalPassengers.length) { showAlert("warning", "يرجى اختيار حاج واحد على الأقل."); return; }
+              const now = new Date().toLocaleDateString("ar-EG");
+              const newDates: Record<number, string> = { ...printDates };
+              for (const p of finalPassengers) newDates[p.id] = now;
+              setPrintDates(newDates);
+              localStorage.setItem("stk_print_dates", JSON.stringify(newDates));
+              printInPage(buildStickersHTML(
+                finalPassengers as any,
+                { color_primary: reportBranding.primaryColor, color_accent: reportBranding.accentColor, name_ar: reportBranding.companyName,
+                /* الموسمُ المعروض — لا الحملة. فاستيكرُ موسمٍ مؤرشفٍ يحمل اسمَه وفندقَه هو. */
+                season_name: viewedSeason.name, hotel_name: viewedSeason.hotel_name || "", hotel_address: viewedSeason.hotel_address || "",
+                admin_phone: companyPortal.supportPhone, logo_url: reportBranding.logoUrl },
+                { rooms: rooms as any, buses: buses as any, camps: camps as any },
+                { sticker: stkTypes.sticker, hand_tag: stkTypes.hand_tag, long_tag: stkTypes.long_tag }
+              ));
+            };
+
+
+            return (
+              <>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "var(--ink)", marginBottom: 14 }}>مطبوعات الشنط</div>
+
+                {/* Drawer جانبي */}
+                {stkDrawerOpen && (
+                  <div style={{ position: "fixed", inset: 0, zIndex: 200, display: "flex" }}>
+                    <div onClick={() => setStkDrawerOpen(false)} style={{ flex: 1, background: "rgba(0,0,0,.45)" }} />
+                    <div style={{ width: 320, background: "var(--paper)", display: "flex", flexDirection: "column", boxShadow: "-8px 0 30px rgba(0,0,0,.2)", height: "100%", overflowY: "auto" }}>
+                      <div style={{ padding: "16px 16px 10px", borderBottom: "1px solid var(--line)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                        <div style={{ fontSize: 14, fontWeight: 800, color: "var(--ink)" }}>اختيار الحجاج</div>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button onClick={() => setStkSelected(new Set(passengers.map(pp => pp.id)))}
+                            style={{ fontSize: 11.5, fontWeight: 700, padding: "5px 12px", borderRadius: 99, border: "1px solid var(--line)", background: "var(--paper)", cursor: "pointer", fontFamily: "inherit" }}>تحديد الكل</button>
+                          <button onClick={() => setStkSelected(new Set())}
+                            style={{ fontSize: 11.5, fontWeight: 700, padding: "5px 12px", borderRadius: 99, border: "1px solid var(--line)", background: "var(--paper)", cursor: "pointer", fontFamily: "inherit" }}>إلغاء الكل</button>
+                        </div>
+                      </div>
+                      <div style={{ padding: "10px 16px" }}>
+                        <input value={stkSearch} onChange={e => setStkSearch(e.target.value)} placeholder="بحث بالاسم..."
+                          style={{ width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--line)", fontSize: 13, fontFamily: "inherit", background: "var(--paper)", color: "var(--ink)", boxSizing: "border-box" }} />
+                      </div>
+                      <div style={{ flex: 1, overflowY: "auto", padding: "0 16px 16px" }}>
+                        {passengers.filter(pp => !stkSearch || (pp.name_ar || "").includes(stkSearch)).map(pp => {
+                          const checked = stkSelected.has(pp.id);
+                          const lastPrint = printDates[pp.id];
+                          return (
+                            <div key={pp.id} onClick={() => setStkSelected(prev => { const n = new Set(prev); if (n.has(pp.id)) { n.delete(pp.id); } else { n.add(pp.id); } return n; })}
+                              style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 4px", borderBottom: "1px dashed var(--line)", cursor: "pointer" }}>
+                              <div style={{ width: 20, height: 20, borderRadius: 6, border: `2px solid ${checked ? "var(--primary)" : "var(--line)"}`, background: checked ? "var(--primary)" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                                {checked && <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+                              </div>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontSize: 13, fontWeight: 700, color: "var(--ink)" }}>{pp.name_ar}</div>
+                                {lastPrint && <div style={{ fontSize: 10.5, color: "var(--text-muted)", fontWeight: 600, marginTop: 1 }}>آخر طباعة: {lastPrint}</div>}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{ padding: "12px 16px", borderTop: "1px solid var(--line)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>{stkSelected.size} حاج محدد</div>
+                        <button onClick={() => setStkDrawerOpen(false)}
+                          style={{ padding: "8px 20px", borderRadius: 99, border: "none", background: "var(--primary)", color: "#fff", fontFamily: "inherit", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>تأكيد</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* اختيار الحجاج */}
+                <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: "14px 16px", marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", marginBottom: 10 }}>اختيار الحجاج</div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button onClick={() => { setStkFilter("all"); setStkSelected(new Set()); }}
+                      style={{ padding: "6px 14px", borderRadius: 99, border: `1.5px solid ${stkFilter === "all" && stkSelected.size === 0 ? "var(--primary)" : "var(--line)"}`, background: stkFilter === "all" && stkSelected.size === 0 ? "var(--primary)" : "var(--paper)", color: stkFilter === "all" && stkSelected.size === 0 ? "#fff" : "var(--ink)", fontFamily: "inherit", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+                      الكل ({passengers.length})
+                    </button>
+                    <button onClick={() => setStkDrawerOpen(true)}
+                      style={{ padding: "6px 14px", borderRadius: 99, border: `1.5px solid ${stkSelected.size > 0 ? "var(--primary)" : "var(--line)"}`, background: stkSelected.size > 0 ? "var(--primary)" : "var(--paper)", color: stkSelected.size > 0 ? "#fff" : "var(--ink)", fontFamily: "inherit", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+                      {stkSelected.size > 0 ? `اختيار يدوي (${stkSelected.size})` : "اختيار يدوي"}
+                    </button>
+                  </div>
+
+                  <div style={{ marginTop: 10, fontSize: 11.5, fontWeight: 600, color: "var(--text-muted)" }}>
+                    {finalPassengers.length} حاج محدد
+                  </div>
+                </div>
+
+                {/* اختيار نوع الورقة */}
+                <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: "14px 16px", marginBottom: 14 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", marginBottom: 10 }}>نوع الورقة المطبوعة</div>
+                  {[
+                    { key: "sticker",  label: "الاستيكر العريض",    sub: "3 استيكرات للشنط الثلاث" },
+                    { key: "hand_tag", label: "تاج اليد",          sub: "3 شرائط تلتف على المقبض" },
+                    { key: "long_tag", label: "التاج المعلق",      sub: "4 تاجات A6 بثقب للحبل" },
+                  ].map(t => (
+                    <div key={t.key} onClick={() => setStkTypes(prev => ({ ...prev, [t.key]: !prev[t.key as keyof typeof prev] }))}
+                      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 2px", borderBottom: "1px dashed var(--line)", cursor: "pointer" }}>
+                      <div style={{ width: 20, height: 20, borderRadius: 6, border: `2px solid ${stkTypes[t.key as keyof typeof stkTypes] ? "var(--primary)" : "var(--line)"}`, background: stkTypes[t.key as keyof typeof stkTypes] ? "var(--primary)" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all .2s" }}>
+                        {stkTypes[t.key as keyof typeof stkTypes] && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--ink)" }}>{t.label}</div>
+                        <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{t.sub}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* ملخص + زرار الطباعة */}
+                <div style={{ background: "rgba(212,160,23,.06)", border: "1px solid rgba(212,160,23,.35)", borderRadius: 12, padding: "12px 16px", marginBottom: 14 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: "#8a6a10" }}>
+                    إجمالي الأوراق: {finalPassengers.length * [stkTypes.sticker, stkTypes.hand_tag, stkTypes.long_tag].filter(Boolean).length} ورقة A4 لاصقة
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 3 }}>
+                    {finalPassengers.length} حاج × {[stkTypes.sticker && "استيكر عريض", stkTypes.hand_tag && "تاج يد", stkTypes.long_tag && "تاج طولي"].filter(Boolean).join(" + ")} = {finalPassengers.length * [stkTypes.sticker, stkTypes.hand_tag, stkTypes.long_tag].filter(Boolean).length} ورقة
+                  </div>
+                </div>
+
+                <button onClick={doPrint} style={{ width: "100%", padding: "13px 0", borderRadius: 12, border: "none", background: "var(--primary)", color: "#fff", fontFamily: "inherit", fontWeight: 800, fontSize: 15, cursor: "pointer" }}>
+                  طباعة {finalPassengers.length * [stkTypes.sticker, stkTypes.hand_tag, stkTypes.long_tag].filter(Boolean).length} ورقة
+                </button>
+              </>
+            );
+          })()}
+
+          {/* ===== WhatsApp ===== */}
+          {activeReport === "whatsapp" && (
+            <>
+              {/* حالةُ الإرسال — وصفٌ لا ادّعاء.
+                  لا تعرف الواجهةُ أَضُبطت أسرارُ واتساب على الخادم
+                  أم لا، ولا ينبغي أن تعرف: كشفُ حالة إعداد الخادم
+                  للمتصفّح لإضاءة نقطةٍ خضراء إفشاءٌ بلا مقابل.
+                  فتقول أين يجري الإرسال، ولا تزعم أنه جاهز. */}
+              <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px 16px", marginBottom: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ width: 9, height: 9, borderRadius: "50%", background: "var(--text-muted)", flexShrink: 0 }} />
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>إرسال واتساب مُدار عبر الخادم</span>
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 6, lineHeight: 1.8 }}>
+                  لا تُضبَط بيانات واتساب من هنا. إعدادُها على الخادم، ولا يُحفَظ منها شيءٌ في المتصفّح.
+                </div>
+              </div>
+
+              {/* نص الرسالة */}
+              <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px 16px", marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>نص الرسالة</div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8, lineHeight: 2 }}>
+                  {["{الاسم}", "{الباص}", "{الرحلة}", "{الغرفة}", "{منى}", "{عرفة}"].map(v => (
+                    <code key={v} onClick={() => setWaTemplate(t => t + v)} style={{ background: "var(--bg-2)", padding: "2px 7px", borderRadius: 4, marginLeft: 4, fontSize: 10, cursor: "pointer" }}>{v}</code>
+                  ))}
+                </div>
+                <textarea value={waTemplate} onChange={e => { setWaTemplate(e.target.value); localStorage.setItem("wa_template", e.target.value); }}
+                  style={{ width: "100%", minHeight: 150, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--line)", fontSize: 12, fontFamily: "var(--font-body)", resize: "vertical", lineHeight: 1.8, boxSizing: "border-box", direction: "rtl" }} />
+              </div>
+
+              {/* المرفقات */}
+              <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px 16px", marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>المرفقات</div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  {([{ key: "permit" as const, label: "تصريح السفر", field: "hajj_permit_url" }, { key: "ticket" as const, label: "تذكرة الطيران", field: "flight_ticket_url" }]).map(doc => (
+                    <div key={doc.key} onClick={() => setWaSendDocs(p => ({ ...p, [doc.key]: !p[doc.key] }))}
+                      style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: `1.5px solid ${waSendDocs[doc.key] ? "#25D366" : "var(--line)"}`, background: waSendDocs[doc.key] ? "rgba(37,211,102,0.06)" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ width: 16, height: 16, borderRadius: 4, border: `2px solid ${waSendDocs[doc.key] ? "#25D366" : "var(--line)"}`, background: waSendDocs[doc.key] ? "#25D366" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                        {waSendDocs[doc.key] && <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>}
+                      </div>
+                      <span style={{ fontSize: 12 }}>{doc.label}</span>
+                      <span style={{ fontSize: 10, color: "var(--text-muted)", marginRight: "auto" }}>{passengers.filter(p => (p as any)[doc.field]).length} حاج</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* المرسل إليهم */}
+              <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px 16px", marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10 }}>المرسل إليهم</div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                  {(["all", "select"] as const).map(m => (
+                    <div key={m} onClick={() => setWaSelectMode(m)}
+                      style={{ flex: 1, padding: "8px", borderRadius: 8, border: `1.5px solid ${waSelectMode === m ? "var(--em7)" : "var(--line)"}`, background: waSelectMode === m ? "rgba(125,31,60,0.06)" : "transparent", cursor: "pointer", textAlign: "center", fontSize: 12, color: waSelectMode === m ? "var(--em7)" : "var(--text-muted)" }}>
+                      {m === "all" ? `الكل (${passengers.filter(p => p.phone).length} حاج)` : "اختيار معين"}
+                    </div>
+                  ))}
+                </div>
+                {waSelectMode === "select" && (
+                  <div style={{ maxHeight: 200, overflowY: "auto", border: "1px solid var(--line)", borderRadius: 8 }}>
+                    {passengers.filter(p => p.phone).map(p => (
+                      <div key={p.id} onClick={() => setWaSelectedIds(prev => { const n = new Set(prev); if (n.has(p.id)) { n.delete(p.id); } else { n.add(p.id); } return n; })}
+                        style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", borderBottom: "0.5px solid var(--line)", cursor: "pointer", background: waSelectedIds.has(p.id) ? "rgba(125,31,60,0.05)" : "transparent" }}>
+                        <div style={{ width: 15, height: 15, borderRadius: 4, border: `2px solid ${waSelectedIds.has(p.id) ? "var(--em7)" : "var(--line)"}`, background: waSelectedIds.has(p.id) ? "var(--em7)" : "transparent", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          {waSelectedIds.has(p.id) && <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>}
+                        </div>
+                        <span style={{ fontSize: 12, flex: 1 }}>{p.short_ar || p.name_ar}</span>
+                        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{p.phone}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* معاينة */}
+              {passengers[0] && (
+                <div style={{ background: "rgba(37,211,102,0.05)", border: "1px solid rgba(37,211,102,0.2)", borderRadius: 12, padding: "12px 16px", marginBottom: 12 }}>
+                  <div style={{ fontSize: 11, color: "var(--success)", fontWeight: 600, marginBottom: 8 }}>معاينة — {passengers[0].short_ar || passengers[0].name_ar}</div>
+                  <div style={{ fontSize: 12, whiteSpace: "pre-wrap", lineHeight: 1.8, direction: "rtl" }}>
+                    {waTemplate
+                      .replace("{الاسم}", passengers[0].short_ar || passengers[0].name_ar)
+                      .replace("{الباص}", buses.find(b => b.id === passengers[0]?.bus_id)?.name || "—")
+                      .replace("{الرحلة}", flightNameFor(passengers[0]))
+                      .replace("{الغرفة}", rooms.find(r => r.id === passengers[0]?.room_id)?.number || "—")
+                      .replace("{منى}", camps.find(c => c.id === passengers[0]?.camp_mina_id)?.name || "—")
+                      .replace("{عرفة}", camps.find(c => c.id === passengers[0]?.camp_arafa_id)?.name || "—")
+                    }
+                  </div>
+                  {(waSendDocs.permit || waSendDocs.ticket) && (
+                    <div style={{ marginTop: 8, fontSize: 11, color: "var(--success)" }}>
+                      {waSendDocs.permit && <div>📎 تصريح السفر (مرفق منفصل)</div>}
+                      {waSendDocs.ticket && <div>📎 تذكرة الطيران (مرفق منفصل)</div>}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* الإرسالُ التجريبيُّ حُذف — ولم يُستبدَل ببديل.
+                  كان يرسل بياناتِ أوّلِ حاجّ إلى **رقمٍ حرّ** يكتبه
+                  الموظّف. وإبقاؤه يعني فتحَ استثناءٍ في الخادم يقبل
+                  رقماً لا يخصّ حاجّاً، وهو بعينه الالتفافُ الذي
+                  تمنعه هذه المراجعة. والبديلُ الآخر — إرسالُ
+                  «تجربة» إلى حاجٍّ حقيقيّ — ليس تجربة.
+                  والتحقّقُ من الإعداد يقع في اختبار التكامل الحيّ
+                  حين تتوفّر بيانات واتساب. */}
+
+              {/* سببُ المنع يُقال مرّةً في مكانه، لا صفّاً صفّاً بعد
+                  الضغط: الزرُّ معطَّل وفوقه سببُه. */}
+              {waBlocked && (
+                <div style={{ background: "var(--warning-bg, rgba(255,180,60,.12))", border: "1px solid var(--warning, #d79a2b)", color: "var(--warning, #8a5d00)", borderRadius: 12, padding: "11px 15px", marginBottom: 12, fontSize: 12, fontWeight: 700, lineHeight: 1.8 }}>
+                  {waBlockReason}
+                </div>
+              )}
+
+              {/* Send To All */}
+              <button disabled={waSending || waBlocked} onClick={async () => {
+                /* الحارسُ مكرَّرٌ عمداً: التعطيل تجربةُ مستخدم، وهذا
+                   يمنع الفعلَ نفسه. والخادمُ يبقى الحَكَم. */
+                if (waBlocked) { showAlert("warning", waBlockReason!); return; }
+                const sendList = waSelectMode === "all"
+                  ? passengers.filter(p => p.phone)
+                  : passengers.filter(p => p.phone && waSelectedIds.has(p.id));
+                if (!sendList.length) { showAlert("warning", "لا يوجد حجاج محددون أو لديهم رقم هاتف"); return; }
+                if (!confirm(`سيتم إرسال ${sendList.length} رسالة — هل أنت متأكد؟`)) return;
+                setWaSending(true);
+                setWaResults(sendList.map(p => ({ name: p.short_ar || p.name_ar, phone: p.phone, status: "pending" as const })));
+                for (let i = 0; i < sendList.length; i++) {
+                  const p = sendList[i];
+                  try {
+                    const text = waTemplate
+                      .replace("{الاسم}", p.short_ar || p.name_ar)
+                      .replace("{الباص}", buses.find(b => b.id === p.bus_id)?.name || "—")
+                      .replace("{الرحلة}", flightNameFor(p))
+                      .replace("{الغرفة}", rooms.find(r => r.id === p.room_id)?.number || "—")
+                      .replace("{منى}", camps.find(c => c.id === p.camp_mina_id)?.name || "—")
+                      .replace("{عرفة}", camps.find(c => c.id === p.camp_arafa_id)?.name || "—");
+                    const ok = await waSendText(p, text);
+                    if (ok) {
+                      // بعت التصريح لو مختار
+                      if (waSendDocs.permit && p.hajj_permit_url) {
+                        await waSendDoc(p, "hajj_permit");
+                      }
+                      // بعت التذكرة لو مختارة
+                      if (waSendDocs.ticket && p.flight_ticket_url) {
+                        await waSendDoc(p, "flight_ticket");
+                      }
+                      setWaResults(prev => prev.map((r, idx) => idx === i ? { ...r, status: "success" as const } : r));
+                    } else {
+                      setWaResults(prev => prev.map((r, idx) => idx === i ? { ...r, status: "error" as const } : r));
+                    }
+                  } catch {
+                    setWaResults(prev => prev.map((r, idx) => idx === i ? { ...r, status: "error" as const } : r));
+                  }
+                  await new Promise(r => setTimeout(r, 400));
+                }
+                setWaSending(false);
+              }} style={{ width: "100%", padding: "12px 0", borderRadius: 10, background: (waSending || waBlocked) ? "var(--bg-2)" : "#25D366", color: (waSending || waBlocked) ? "var(--text-muted)" : "white", border: "none", fontSize: 13, fontWeight: 700, cursor: (waSending || waBlocked) ? "not-allowed" : "pointer", fontFamily: "var(--font-body)", marginBottom: 12 }}>
+                {waSending ? "جاري الإرسال..." : `📤 Send To All — ${(waSelectMode === "all" ? passengers.filter(p => p.phone) : passengers.filter(p => p.phone && waSelectedIds.has(p.id))).length} حاج`}
+              </button>
+
+              {/* نتائج */}
+              {waResults.length > 0 && (
+                <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden" }}>
+                  <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--line)", fontSize: 12, fontWeight: 600, display: "flex", gap: 14 }}>
+                    <span style={{ color: "#25D366" }}>✔ {waResults.filter(r => r.status === "success").length} نجح</span>
+                    <span style={{ color: "var(--danger)" }}>✗ {waResults.filter(r => r.status === "error").length} فشل</span>
+                    <span style={{ color: "var(--text-muted)" }}>⏳ {waResults.filter(r => r.status === "pending").length} منتظر</span>
+                  </div>
+                  <div style={{ maxHeight: 220, overflowY: "auto" }}>
+                    {waResults.map((r, i) => (
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", borderBottom: "0.5px solid var(--line)" }}>
+                        <span style={{ color: r.status === "success" ? "#25D366" : r.status === "error" ? "var(--danger)" : "var(--text-muted)" }}>
+                          {r.status === "success" ? "✔" : r.status === "error" ? "✗" : "⏳"}
+                        </span>
+                        <span style={{ fontSize: 12, flex: 1 }}>{r.name}</span>
+                        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{r.phone}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {passengers.filter(p => !p.phone).length > 0 && (
+                <div style={{ marginTop: 12, padding: "8px 14px", background: "var(--warning-bg)", borderRadius: 10, fontSize: 11, color: "var(--warning)" }}>
+                  {passengers.filter(p => !p.phone).length} حاج مش عندهم رقم — مش هيتبعتلهم
+                </div>
+              )}
+            </>
+          )}
+
+        </div>
+      )}
+    </div>
+  );
+}
+
+export { ReportsPage };

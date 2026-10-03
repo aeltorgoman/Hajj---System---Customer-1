@@ -1,0 +1,1005 @@
+import { useState, useRef } from "react";
+import { isHajj, mapPassenger, upsertPassenger, byOrder, reorderUpdates, applyReorder } from "../utils/passenger";
+import { supabase } from "../supabase";
+import type { TablesUpdate } from "../types/database";
+import type { Passenger, Bus, Camp, Room, Flight, User } from "../types";
+import { useSeasonWrite } from "../season/useSeasonWrite";
+import { allocWriteError } from "./allocation/useAllocation";
+import { useSeason } from "../season/useSeason";
+import { Avatar } from "./Avatar";
+import { Modal } from "./Modal";
+import { AlertModal, useAlert, ConfirmModal, useConfirm } from "./AlertModal";
+import { inp, btnP, btnS, makeShort, scanDocument, DocumentScanError, uploadDoc, removeDoc, docKey, downloadFile, ROOM_TYPE_CAP, makeHTML, printInPage, useSignedDoc } from "../utils";
+import { useReportBranding } from "../company/CompanyContext";
+
+// ============================================================
+// ثوابت
+// ============================================================
+const ADMIN_TYPES = ["مشرف", "إداري", "مرافق"] as const;
+type AdminType = typeof ADMIN_TYPES[number];
+
+const TYPE_COLORS: Record<AdminType, [string, string]> = {
+  "مشرف":  ["var(--info-bg)",    "var(--info)"],
+  "إداري": ["var(--warning-bg)", "var(--warning)"],
+  "مرافق": ["var(--success-bg)", "var(--primary-dark)"],
+};
+
+/* مستندات الإداري الستّة — مرجع واحد يستعمله المودال وحذفُ الإداري
+   معاً، فلا يفوت التنظيفَ نوعٌ أُضيف إلى الواجهة وحدها. */
+const DOC_TYPES = [
+  { label: "صورة شخصية",   field: "photo_url",         docType: "photo",         accept: "image/*" },
+  { label: "جواز السفر",   field: "passport_url",      docType: "passport_doc",  accept: "image/*,application/pdf" },
+  { label: "البطاقة",      field: "national_id_url",   docType: "idcard",        accept: "image/*,application/pdf" },
+  { label: "العقد",        field: "contract_url",      docType: "contract",      accept: "image/*,application/pdf" },
+  { label: "تذكرة الطيران", field: "flight_ticket_url", docType: "flight_ticket", accept: "image/*,application/pdf" },
+  { label: "تصريح الحاج",  field: "hajj_permit_url",   docType: "hajj_permit",   accept: "image/*,application/pdf" },
+] as const;
+
+const DEFAULT_FORM = {
+  name_ar: "", name_en: "", short_ar: "", short_en: "",
+  passport: "", national_id: "", nat: "قطري",
+  dob: "", expiry: "", id_expiry: "", gender: "ذكر", phone: "",
+  passenger_type: "مشرف" as AdminType,
+};
+
+// ============================================================
+// إحصائيات
+// ============================================================
+function AdminStats({ admins }: { admins: Passenger[] }) {
+  const counts = ADMIN_TYPES.map(t => ({ label: t, val: admins.filter(p => p.passenger_type === t).length }));
+  return (
+    <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+      <div style={{ flex: 1, minWidth: 100, background: "var(--bg-card)", border: "0.5px solid var(--border)", borderRadius: 10, padding: "10px 14px", borderRight: "3px solid var(--primary)" }}>
+        <div style={{ fontSize: 11, color: "var(--text-muted)" }}>إجمالي الإداريين</div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: "var(--primary)" }}>{admins.length}</div>
+      </div>
+      {counts.map(({ label, val }) => {
+        const [bg, clr] = TYPE_COLORS[label as AdminType];
+        return (
+          <div key={label} style={{ flex: 1, minWidth: 100, background: bg, border: `0.5px solid ${clr}33`, borderRadius: 10, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, color: clr }}>{label}</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: clr }}>{val}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ============================================================
+// الصفحة الرئيسية
+// ============================================================
+function AdminsPage({
+  passengers,
+  setPassengers,
+  currentUser,
+}: {
+  passengers: Passenger[];
+  setPassengers: React.Dispatch<React.SetStateAction<Passenger[]>>;
+  currentUser?: User;
+}) {
+  const { alert, showAlert } = useAlert();
+  const { confirmState, confirmAction, handleConfirm, handleCancel } = useConfirm();
+  const { writeOk, writeAllOk, assertWritable, readOnly } = useSeasonWrite(showAlert);
+  const { viewedSeason } = useSeason();
+  const branding = useReportBranding();
+
+  /* التعطيل البصري لمداخل الكتابة — طبقة تجربة لا حماية */
+  const roOff = readOnly ? { opacity: 0.4, pointerEvents: "none" as const } : null;
+
+  // بيانات التعيين
+  const [buses, setBuses]     = useState<Bus[]>([]);
+  const [rooms, setRooms]     = useState<Room[]>([]);
+  const [camps, setCamps]     = useState<Camp[]>([]);
+  const [flights, setFlights] = useState<Flight[]>([]);
+  const [dataLoaded, setDataLoaded] = useState<number | null>(null);
+
+  // مودال الإضافة / التعديل
+  const [showModal, setShowModal]   = useState(false);
+  const [editTarget, setEditTarget] = useState<Passenger | null>(null);
+  const [form, setForm]             = useState({ ...DEFAULT_FORM });
+  const [saving, setSaving]         = useState(false);
+
+  // مسح المستندات
+  const [scanning, setScanning]         = useState(false);
+  const [passportImg, setPassportImg]   = useState<string | null>(null);
+  const [passportFile, setPassportFile] = useState<File | null>(null);
+  const [idImg, setIdImg]               = useState<string | null>(null);
+  const [idFile, setIdFile]             = useState<File | null>(null);
+  const passportInputRef = useRef<HTMLInputElement>(null);
+  const idInputRef       = useRef<HTMLInputElement>(null);
+
+  // مودال التعيين
+  const [assignTarget, setAssignTarget] = useState<Passenger | null>(null);
+  const [assign, setAssign] = useState({ bus_id: "", room_id: "", camp_mina_id: "", camp_arafa_id: "", flight_id: "", return_flight_id: "", wants_flight: false, flight_class: "عادي" });
+
+  // حذف
+  const [deleteTarget, setDeleteTarget] = useState<Passenger | null>(null);
+
+  // المستندات
+  const [docTarget, setDocTarget] = useState<Passenger | null>(null);
+  const [docUploading, setDocUploading] = useState<string | null>(null);
+  const [docViewer, setDocViewer] = useState<{ url: string; label: string } | null>(null);
+  /* س٦: العارض يفتح برابط موقّع لا بالقيمة المخزّنة */
+  const docViewerUrl = useSignedDoc(docViewer?.url);
+
+  /* عقد واحد للتصنيف: `isHajj` لا شرط مكتوب باليد. المكتوب باليد
+     يعامل `passenger_type = null` كإداري، والعقد يعدّه حاجّاً. */
+  const admins = passengers.filter(p => !isHajj(p)).sort(byOrder("sort_order"));
+
+  /* إعادة ترتيب الإداريين — بنفس نمط السحب المستقرّ في الباصات
+     والمخيّمات والغرف. والكتابة مقصورة على الإداريين، فالعمود نفسه
+     يسع تسلسلَين ما دام كل كاتب لا يتجاوز سكّانه: ترتيب الحجاج لا
+     يتزحزح، ولا يتزحزح ترتيب الإداريين بإعادة ترتيب الحجاج. */
+  const [dragId, setDragId] = useState<number | null>(null);
+
+  const reorderAdmins = async (fromId: number, toId: number) => {
+    if (fromId === toId || !assertWritable()) return;
+    const from = admins.findIndex(p => p.id === fromId);
+    const to   = admins.findIndex(p => p.id === toId);
+    if (from === -1 || to === -1) return;
+    const next = [...admins];
+    next.splice(to, 0, ...next.splice(from, 1));
+    setPassengers(prev => applyReorder(prev, "sort_order", next));
+    await writeAllOk(reorderUpdates("sort_order", next), "تعذّر حفظ ترتيب الإداريين");
+  };
+
+  // ============================================================
+  // طباعة الإداريين
+  // ============================================================
+  const printAdmins = () => {
+    const rows = admins.map((p, i) => {
+      const type = p.passenger_type || "إداري";
+      const bus    = buses.find(b => b.id === (p as any).bus_id);
+      const room   = rooms.find(r => r.id === (p as any).room_id);
+      const campM  = camps.find(c => c.id === (p as any).camp_mina_id);
+      const campA  = camps.find(c => c.id === (p as any).camp_arafa_id);
+      const flight = flights.find(f => f.id === (p as any).flight_id);
+      return `<tr style="${i%2===1?"background:#f9f7f4":""}">
+        <td style="text-align:center;padding:5pt 4pt;font-size:9pt;color:#888">${i+1}</td>
+        <td style="padding:5pt 6pt;font-size:10pt">${p.short_ar||p.name_ar}</td>
+        <td style="padding:5pt 6pt;font-size:9pt">${p.name_en||"—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${type}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${p.passport||"—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${bus ? bus.name : "—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${flight ? (flight.airline+" — "+flight.name) : "—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${campM ? campM.name : "—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${campA ? campA.name : "—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${room ? (room.floor+"/"+(room as any).number) : "—"}</td>
+      </tr>`;
+    }).join("");
+    const body = `<table style="width:100%;border-collapse:collapse">
+      <tr>
+        <th style="text-align:center;width:20pt;padding:5pt 4pt;font-size:9pt">م</th>
+        <th style="padding:5pt 6pt;font-size:9pt">الاسم بالعربي</th>
+        <th style="padding:5pt 6pt;font-size:9pt">الاسم بالإنجليزي</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">النوع</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">رقم الجواز</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">الباص</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">الطيران</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">مخيم منى</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">مخيم عرفة</th>
+        <th style="text-align:center;padding:5pt;font-size:9pt">الغرفة</th>
+      </tr>
+      ${rows}
+    </table>`;
+    const html = makeHTML("كشف الإداريين", body, branding, { landscape: true });
+    printInPage(html);
+  };
+
+  // ============================================================
+  // تحميل بيانات التعيين
+  // ============================================================
+  /* الذاكرة مربوطة بالموسم المعروض: كان `dataLoaded` علماً أبدياً،
+     فمن بدّل الموسم بلا مغادرة الصفحة ظلّ يرى غرف الموسم السابق
+     ويُسنِد إليها. */
+  const loadAssignData = async () => {
+    if (dataLoaded === viewedSeason.id) return;
+    const [{ data: b }, { data: r }, { data: c }, { data: f }] = await Promise.all([
+      supabase.from("buses").select("*").eq("season_id", viewedSeason.id).order("created_at"),
+      supabase.from("rooms").select("*").eq("season_id", viewedSeason.id).order("floor").order("number"),
+      supabase.from("camps").select("*").eq("season_id", viewedSeason.id).order("name"),
+      supabase.from("flights").select("*").eq("season_id", viewedSeason.id).order("date"),
+    ]);
+    if (b) setBuses(b as Bus[]);
+    if (r) setRooms(r as Room[]);
+    if (c) setCamps(c as Camp[]);
+    if (f) setFlights(f as Flight[]);
+    setDataLoaded(viewedSeason.id);
+  };
+
+  // ============================================================
+  // مسح جواز
+  // ============================================================
+  /* القراءة تستغرق ثوانٍ، وكانت الصورة تظهر فور اختيار الملف
+     والحقول فارغة — فيقرأ المستخدم المشهد على أنه «انتهى ولم يقرأ».
+     فصار المؤشّر على الصورة نفسها: ضبابٌ وطبقةٌ ودوّار، وهو نمط
+     صفحة الحجاج نفسه لا نمط موازٍ. والخطأ يُعلَن ولا يُبتلع. */
+  const handleScanPassport = async (file: File) => {
+    setScanning(true);
+    const reader = new FileReader();
+    reader.onload = async ev => {
+      setPassportImg(ev.target?.result as string);
+      setPassportFile(file);
+      try {
+        const parsed = await scanDocument(file, "passport");
+        setForm(prev => ({
+          ...prev,
+          name_en:    parsed.name_en    || prev.name_en,
+          short_en:   parsed.name_en    ? makeShort(parsed.name_en)  : prev.short_en,
+          name_ar:    parsed.name_ar    || prev.name_ar,
+          short_ar:   parsed.name_ar    ? makeShort(parsed.name_ar)  : prev.short_ar,
+          passport:   parsed.passport   || prev.passport,
+          national_id:parsed.national_id|| prev.national_id,
+          nat:        parsed.nationality|| prev.nat,
+          dob:        parsed.dob        || prev.dob,
+          expiry:     parsed.expiry     || prev.expiry,
+          gender:     parsed.gender     || prev.gender,
+        }));
+      } catch (e) {
+        console.error("تعذّرت قراءة جواز الإداري", e);
+        showAlert("error", e instanceof DocumentScanError ? e.message : "تعذّرت قراءة الجواز — أدخل البيانات يدوياً");
+      } finally {
+        setScanning(false);
+      }
+    };
+    /* فشل القراءة من القرص لا يترك المؤشّر دائراً */
+    reader.onerror = () => { setScanning(false); showAlert("error", "تعذّرت قراءة الملف"); };
+    reader.readAsDataURL(file);
+  };
+
+  // ============================================================
+  // مسح بطاقة
+  // ============================================================
+  /* ── مسح البطاقة عند **إنشاء** إداري ──
+     هنا البطاقة مصدر إنشاء لا استكمال، فالمطلوب منها بياناتها
+     الأساسية كاملة. ووضع `idcard` في الدالّة المشتركة يُعيد حقلين
+     لا غير — «فقط الرقم والصلاحية» — بينما وضع `auto` يُعيد للبطاقة
+     الاسم والجنسية والميلاد والجنس مع الرقم والصلاحية. فالوضع
+     الصحيح موجود بالفعل، ولا حاجة لتوسيع أي عقد.
+     (وكانت الصفحة فوق ذلك تقرأ `parsed.expiry` — مفتاح الجواز —
+     بدل `id_expiry`، فتخرج الصلاحية فارغة دائماً.)
+     أما استكمال بطاقة إداري قائم فمسار آخر لا يلمس بياناته
+     الأساسية: مودال المستندات أدناه. */
+  const handleScanId = async (file: File) => {
+    setScanning(true);
+    const reader = new FileReader();
+    reader.onload = async ev => {
+      setIdImg(ev.target?.result as string);
+      setIdFile(file);
+      try {
+        const parsed = await scanDocument(file, "auto");
+        if (parsed.doc_type !== "idcard") {
+          showAlert("warning", "المستند لا يبدو بطاقة شخصية — راجع الملف أو استعمل زرّ مسح الجواز");
+          return;
+        }
+        setForm(prev => ({
+          ...prev,
+          name_ar:     parsed.name_ar     || prev.name_ar,
+          short_ar:    parsed.name_ar     ? makeShort(parsed.name_ar) : prev.short_ar,
+          name_en:     parsed.name_en     || prev.name_en,
+          short_en:    parsed.name_en     ? makeShort(parsed.name_en) : prev.short_en,
+          national_id: parsed.national_id || prev.national_id,
+          id_expiry:   parsed.id_expiry   || prev.id_expiry,
+          nat:         parsed.nationality || prev.nat,
+          dob:         parsed.dob         || prev.dob,
+          gender:      parsed.gender      || prev.gender,
+        }));
+      } catch (e) {
+        console.error("تعذّرت قراءة بطاقة الإداري", e);
+        showAlert("error", e instanceof DocumentScanError ? e.message : "تعذّرت قراءة البطاقة — أدخل البيانات يدوياً");
+      } finally {
+        setScanning(false);
+      }
+    };
+    reader.onerror = () => { setScanning(false); showAlert("error", "تعذّرت قراءة الملف"); };
+    reader.readAsDataURL(file);
+  };
+
+  // ============================================================
+  // إعادة ضبط المودال
+  // ============================================================
+  const resetModal = () => {
+    setForm({ ...DEFAULT_FORM });
+    setPassportImg(null); setPassportFile(null);
+    setIdImg(null); setIdFile(null);
+    setScanning(false);
+    setEditTarget(null);
+  };
+
+  const openAdd = () => { resetModal(); setShowModal(true); };
+  const openEdit = (p: Passenger) => {
+    resetModal();
+    setEditTarget(p);
+    setForm({
+      name_ar: p.name_ar || "", name_en: p.name_en || "",
+      short_ar: p.short_ar || "", short_en: p.short_en || "",
+      passport: p.passport || "", national_id: p.national_id || "",
+      nat: p.nat || "قطري", dob: p.dob || "", expiry: p.expiry || "",
+      id_expiry: p.id_expiry || "", gender: p.gender || "ذكر", phone: p.phone || "",
+      passenger_type: (p.passenger_type as AdminType) || "مشرف",
+    });
+    setShowModal(true);
+  };
+
+  // ============================================================
+  // حفظ الإداري
+  // ============================================================
+  const saveAdmin = async () => {
+    if (!assertWritable()) return;
+    if (!form.name_ar.trim() && !form.name_en.trim()) { showAlert("warning", "يرجى إدخال الاسم على الأقل"); return; }
+
+    // منع تسجيل نفس الشخص كحاج وإداري
+    if (!editTarget && (form.passport.trim() || form.national_id.trim())) {
+      const duplicate = passengers.find(p =>
+        (isHajj(p)) &&
+        ((form.passport.trim() && p.passport === form.passport.trim()) ||
+         (form.national_id.trim() && p.national_id === form.national_id.trim()))
+      );
+      if (duplicate) {
+        showAlert("warning", `هذا الشخص مسجّل بالفعل كحاج باسم: ${duplicate.short_ar || duplicate.name_ar}`);
+        return;
+      }
+    }
+
+    // منع تكرار نفس الإداري (بنفس الجواز أو الهوية) — يستثني الإداري الحالي عند التعديل
+    if (form.passport.trim() || form.national_id.trim()) {
+      const duplicateAdmin = admins.find(p =>
+        p.id !== editTarget?.id &&
+        ((form.passport.trim() && p.passport === form.passport.trim()) ||
+         (form.national_id.trim() && p.national_id === form.national_id.trim()))
+      );
+      if (duplicateAdmin) {
+        showAlert("warning", `هذا الشخص مسجّل بالفعل كـ${duplicateAdmin.passenger_type} باسم: ${duplicateAdmin.short_ar || duplicateAdmin.name_ar}`);
+        return;
+      }
+    }
+
+    setSaving(true);
+    /* الجواز والبطاقة المرفوعان من مودال الإنشاء/التعديل يمرّان بنفس
+       ضمانات مودال المستندات: حفظ مُتحقَّق منه، وتنظيف الكائن إن فشل
+       الحفظ، وحذف القديم بعد نجاح الجديد لا قبله. */
+    const commitScannedDocs = async (id: number, prev: Passenger | null): Promise<Record<string, string>> => {
+      const uploaded: Record<string, string> = {};
+      if (passportFile) { const k = await uploadDoc(passportFile, id, "passport_doc"); if (k) uploaded.passport_url = k; }
+      if (idFile)       { const k = await uploadDoc(idFile,       id, "idcard");       if (k) uploaded.national_id_url = k; }
+      const keys = Object.keys(uploaded);
+      if (!keys.length) return {};
+      if (!await writeOk(
+        supabase.from("passengers").update(uploaded as TablesUpdate<"passengers">).eq("id", id),
+        "حُفظت البيانات، وتعذّر حفظ مراجع المستندات",
+      )) {
+        for (const f of keys) await removeDoc(uploaded[f]);
+        return {};
+      }
+      for (const f of keys) {
+        const old = prev ? (prev as Record<string, any>)[f] as string | null : null;
+        if (old && docKey(old) !== docKey(uploaded[f])) await removeDoc(old);
+      }
+      return uploaded;
+    };
+    const short_ar = form.short_ar.trim() || makeShort(form.name_ar);
+    const short_en = form.short_en.trim() || makeShort(form.name_en);
+
+    try {
+      if (editTarget) {
+        const { error } = await supabase.from("passengers")
+          .update({ ...form, short_ar, short_en, updated_by: currentUser?.name || null, updated_at: new Date().toISOString() })
+          .eq("id", editTarget.id);
+        if (error) throw error;
+        const docUpdates = await commitScannedDocs(editTarget.id, editTarget);
+        /* الصفّ يُقرأ من القاعدة بعد الكتابة ويمرّ بـ`mapPassenger`:
+           بناء الكائن يدوياً من `form` يترك الحالة المحلية تخالف
+           القاعدة في كل عمود لم يمرّ بالنموذج. */
+        const { data: row } = await supabase.from("passengers").select("*").eq("id", editTarget.id).single();
+        setPassengers(prev => row
+          ? upsertPassenger(prev, mapPassenger(row))
+          : prev.map(p => p.id === editTarget.id ? { ...p, ...form, short_ar, short_en, ...docUpdates } : p));
+        showAlert("success", "تم تعديل بيانات الإداري");
+      } else {
+        const { data, error } = await supabase.from("passengers")
+          .insert([{ ...form, short_ar, short_en, created_by: currentUser?.name || null }])
+          .select()
+          .single();
+        if (error || !data) throw error;
+        const docUpdates = await commitScannedDocs(data.id, null);
+        /* `mapPassenger` هو العقد الوحيد لتحويل صفّ القاعدة إلى
+           `Passenger`. البناء اليدوي كان يخترع `services` بقيم فارغة
+           — وهي حقول حجّ مشتقّة من أعمدة الصفّ، لا شيء يخصّ الإداري
+           — ويحتاج تحويل نوع يُخفي أن أعمدة الصفّ nullable.
+           و`upsertPassenger` يجعل ترتيب وصول الإدراج المحلي وحدث
+           Realtime غير مؤثّر: لا صفّ مكرّر ولا حالة بائتة. */
+        const newP = mapPassenger({ ...data, ...docUpdates });
+        setPassengers(prev => upsertPassenger(prev, newP));
+        showAlert("success", "تمت إضافة الإداري بنجاح");
+      }
+      setShowModal(false);
+      resetModal();
+    } catch {
+      showAlert("error", "حدث خطأ أثناء الحفظ");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // ============================================================
+  // رفع المستندات
+  // ============================================================
+  /* رفع مستند — والاستبدال حالة منه لا مساراً ثانياً.
+     الترتيب مُلزَم: يُرفع الجديد، ثم يُحفظ مرجعه، ولا يُحذف القديم
+     إلا بعد نجاح الحفظ. فلا توجد لحظة يشير فيها العمود إلى كائن
+     غير موجود، ولا لحظة يضيع فيها المستندان معاً. وإن فشل الحفظ
+     حُذف الكائن الجديد فوراً — الرفع الذي لم يُسجَّل لا يُترك يتيماً. */
+  const handleAdminDocUpload = async (p: Passenger, docType: string, field: string, file: File) => {
+    if (!assertWritable()) return;
+    const prevKey = (p as Record<string, any>)[field] as string | null;
+    setDocUploading(docType);
+    let newKey: string | null = null;
+    try {
+      newKey = await uploadDoc(file, p.id, docType);
+      if (!newKey) { showAlert("error", "تعذّر رفع الملف"); return; }
+      if (!await writeOk(
+        supabase.from("passengers").update({ [field]: newKey } as TablesUpdate<"passengers">).eq("id", p.id),
+        "تعذّر حفظ المستند، ولم يُحفظ شيء",
+      )) {
+        await removeDoc(newKey);
+        newKey = null;
+        return;
+      }
+      let updated = { ...p, [field]: newKey };
+      /* البطاقة لإداري قائم = مستند **استكمال** لا إنشاء: تُحدَّث
+         بياناتها وحدها (الرقم والصلاحية)، ولا يُمَسّ الاسم ولا
+         الميلاد ولا الجنس — فبياناته الأساسية مثبتة سلفاً ولا سبب
+         لأن يستبدلها مسحٌ عارض. (الإنشاء من البطاقة مسار آخر في
+         مودال الإضافة، وهناك تُستخرَج الأساسيات كاملة.)
+         وفشل القراءة لا يُبطل الرفع: الملف حُفظ ومرجعه حُفظ. */
+      if (docType === "idcard") {
+        try {
+          const parsed = await scanDocument(file, "idcard");
+          const card: { national_id?: string; id_expiry?: string } = {};
+          if (parsed.national_id) card.national_id = parsed.national_id;
+          if (parsed.id_expiry)   card.id_expiry   = parsed.id_expiry;
+          if (Object.keys(card).length && await writeOk(
+            supabase.from("passengers").update(card).eq("id", p.id),
+            "حُفظت البطاقة، وتعذّر تحديث بياناتها",
+          )) updated = { ...updated, ...card };
+        } catch (e) {
+          console.error("تعذّرت قراءة بطاقة الإداري بعد الرفع", e);
+        }
+      }
+      setPassengers(prev => prev.map(x => x.id === p.id ? updated : x));
+      setDocTarget(updated);
+      if (prevKey && docKey(prevKey) !== docKey(newKey)) await removeDoc(prevKey);
+    } catch (e) {
+      console.error("تعذّر رفع مستند الإداري", e);
+      if (newKey) await removeDoc(newKey);
+      showAlert("error", "تعذّر رفع المستند");
+    } finally {
+      /* المؤشّر يُطفأ في كل المخارج — لا دوران بلا نهاية بعد اليوم */
+      setDocUploading(null);
+    }
+  };
+
+  /* الحذف: تأكيد، ثم القاعدة، ثم التخزين. والترتيب مقصود — لو فشل
+     حذف الكائن بقي كائن بلا مرجع (يُسجَّل في السجلّ)، وهو أهون من
+     مرجع بلا كائن. */
+  const handleAdminDocDelete = async (p: Passenger, field: string, label: string) => {
+    if (!assertWritable()) return;
+    const key = (p as Record<string, any>)[field] as string | null;
+    if (!key) return;
+    if (!await confirmAction(
+      `سيُحذف «${label}» نهائياً من ملف ${p.short_ar || p.name_ar}.`,
+      { title: "حذف المستند", confirmLabel: "حذف" },
+    )) return;
+    if (!await writeOk(
+      supabase.from("passengers").update({ [field]: null } as TablesUpdate<"passengers">).eq("id", p.id),
+      "تعذّر حذف المستند",
+    )) return;
+    const updated = { ...p, [field]: null };
+    setPassengers(prev => prev.map(x => x.id === p.id ? updated : x));
+    setDocTarget(updated);
+    if (docViewer?.url === key) setDocViewer(null);
+    await removeDoc(key);
+  };
+
+  // ============================================================
+  // حفظ التعيين
+  // ============================================================
+  const saveAssign = async () => {
+    if (!assertWritable()) return;
+    if (!assignTarget) return;
+    const updates: TablesUpdate<"passengers"> = {
+      bus_id:           assign.bus_id           ? Number(assign.bus_id)           : null,
+      room_id:          assign.room_id          ? Number(assign.room_id)          : null,
+      camp_mina_id:     assign.camp_mina_id     ? Number(assign.camp_mina_id)     : null,
+      camp_arafa_id:    assign.camp_arafa_id    ? Number(assign.camp_arafa_id)    : null,
+      flight_id:        assign.flight_id        ? Number(assign.flight_id)        : null,
+      return_flight_id: assign.return_flight_id ? Number(assign.return_flight_id) : null,
+      wants_flight:     assign.wants_flight,
+      updated_by:       currentUser?.name || null,
+      updated_at:       new Date().toISOString(),
+      /* الدرجة تُمحى مع إلغاء الطيران، فلا تبقى «درجة أولى» معلّقة
+         على من لا يسافر — ولا أثر مالي لها: الإداري خارج Finance. */
+      /* الدرجة المحجوزة تتبع المدفوعة — تُشتقّ ولا تُختار. والقاعدة
+         ترفض أي مخالفة، فلا تبقى صفحةُ الإداريين باباً للتجاوز. */
+      flight_class:     assign.wants_flight
+        ? (assignTarget.services?.flight === "درجة أولى" ? "درجة أولى" : "عادي")
+        : null,
+    };
+
+    /* السعة كانت تُحذِّر ثم تمضي بـ«متابعة». وقد صار للغرفة حارسٌ في
+       القاعدة، وللباص والمخيّم مثله — فالوعد بالمتابعة صار وعداً
+       تكسره القاعدة بعد سطر. فالسقف يمنع هنا كما يمنع هناك. */
+    const over: string[] = [];
+    if (updates.room_id && updates.room_id !== assignTarget.room_id) {
+      const r = rooms.find(x => x.id === updates.room_id);
+      const cap = r ? ROOM_TYPE_CAP[r.type] || 0 : 0;
+      if (cap > 0 && occupantsOf("room_id", updates.room_id) >= cap) over.push(`الغرفة ${r?.number} مكتملة (${cap}/${cap})`);
+    }
+    if (updates.bus_id && updates.bus_id !== assignTarget.bus_id) {
+      const b = buses.find(x => x.id === updates.bus_id);
+      const cap = b?.capacity ?? 0;
+      if (occupantsOf("bus_id", updates.bus_id) >= cap) over.push(`الباص ${b?.name} مكتمل (${cap}/${cap})`);
+    }
+    /* مقاعد الرحلة المخصَّصة للحملة — حدٌّ صلب كالغرفة والباص */
+    for (const [field, label] of [["flight_id", "الذهاب"], ["return_flight_id", "الإياب"]] as const) {
+      const id = updates[field];
+      if (!id || id === assignTarget[field]) continue;
+      const fl = flights.find(x => x.id === id);
+      if (!fl) continue;
+      if (fl.capacity == null) { over.push(`رحلة ${label} «${fl.name}» بلا مقاعد محدَّدة للحملة`); continue; }
+      const occ = passengers.filter(p => p[field] === id).length;
+      if (occ >= fl.capacity) over.push(`رحلة ${label} «${fl.name}» مكتملة (${occ}/${fl.capacity})`);
+    }
+    /* «بدون طيران» استبعادٌ تجاريّ صلب — لا تُحجَز له تذكرة بحال */
+    if ((updates.flight_id || updates.return_flight_id) && assignTarget.services?.flight === "بدون") {
+      over.push("طلب «بدون طيران» — لا تُحجَز له تذكرة");
+    }
+    if (over.length) { showAlert("warning", `${over.join(" · ")} — عالِج ذلك أولاً.`); return; }
+
+    /* رسالة القاعدة تُعرض كما هي: «الباص «١» مكتمل» و«المخيّم «٢»
+       مخيّم رجال…» أوضح من «تعذّر حفظ التعيينات». */
+    const { error: assignErr } = await supabase.from("passengers").update(updates).eq("id", assignTarget.id);
+    if (assignErr) {
+      console.error("تعذّر حفظ التعيينات", assignErr);
+      showAlert("error", allocWriteError("تعذّر حفظ التعيينات", assignErr.message));
+      return;
+    }
+    setPassengers(prev => prev.map(p => p.id === assignTarget.id ? { ...p, ...updates } as Passenger : p));
+    showAlert("success", "تم حفظ التعيينات");
+    setAssignTarget(null);
+  };
+
+  // ============================================================
+  // حذف
+  // ============================================================
+  /* حذف الإداري يأخذ معه مستنداته: الصفّ وحده كان يُحذف، فتبقى
+     كائناته في الحاوية بلا صاحب ولا مرجع يدلّ عليها. */
+  const deleteAdmin = async (id: number) => {
+    if (!assertWritable()) return;
+    const target = passengers.find(p => p.id === id);
+    const keys = target
+      ? DOC_TYPES.map(d => (target as Record<string, any>)[d.field] as string | null).filter((k): k is string => !!k)
+      : [];
+    if (!await writeOk(supabase.from("passengers").delete().eq("id", id), "تعذّر حذف الإداري")) return;
+    setPassengers(prev => prev.filter(p => p.id !== id));
+    setDeleteTarget(null);
+    showAlert("success", "تم حذف الإداري");
+    for (const k of keys) await removeDoc(k);
+  };
+
+  // ============================================================
+  // فتح مودال التعيين
+  // ============================================================
+  /* شاغلو المورد — حجاجاً وإداريين معاً، فالسعة لا تعرف التصنيف */
+  const occupantsOf = (key: "room_id" | "bus_id", id: number) =>
+    passengers.filter(p => p[key] === id).length;
+
+  /* مخيّمات الجنس المناسب. و«خاص» لم يعد استثناءً من الفصل: قرار
+     المنتج ألغى ذلك، والقاعدة ترفضه الآن — فعرضُه هنا كان سيقدّم
+     خياراً محكوماً عليه بالفشل. */
+  const campsFor = (pageType: "منى" | "عرفة") =>
+    camps.filter(c => c.page_type === pageType && (!assignTarget || c.gender === assignTarget.gender));
+
+  const openAssign = async (p: Passenger) => {
+    await loadAssignData();
+    setAssign({
+      bus_id:           p.bus_id           ? String(p.bus_id)           : "",
+      room_id:          p.room_id          ? String(p.room_id)          : "",
+      camp_mina_id:     p.camp_mina_id     ? String(p.camp_mina_id)     : "",
+      camp_arafa_id:    p.camp_arafa_id    ? String(p.camp_arafa_id)    : "",
+      flight_id:        p.flight_id        ? String(p.flight_id)        : "",
+      return_flight_id: p.return_flight_id ? String(p.return_flight_id) : "",
+      wants_flight: !!(p.flight_id || p.return_flight_id || (p as any).wants_flight || (p as any).services?.flight === "طيران"),
+      /* الافتراضي «عادي» — الدرجة الأولى استثناء يُختار لا يُفترض */
+      flight_class: p.flight_class === "درجة أولى" ? "درجة أولى" : "عادي",
+    });
+    setAssignTarget(p);
+  };
+
+  // ============================================================
+  // مساعدات عرض التعيينات
+  // ============================================================
+  const busName    = (p: Passenger) => buses.find(b => b.id === p.bus_id)?.name || "—";
+  const roomName   = (p: Passenger) => { const r = rooms.find(r => r.id === p.room_id); return r ? `${r.number}${r.floor ? ` (ط${r.floor})` : ""}` : "—"; };
+  const minaName   = (p: Passenger) => camps.find(c => c.id === p.camp_mina_id)?.name  || "—";
+  const arafaName  = (p: Passenger) => camps.find(c => c.id === p.camp_arafa_id)?.name || "—";
+  const flightName = (p: Passenger) => flights.find(f => f.id === p.flight_id)?.name   || "—";
+  const retName    = (p: Passenger) => flights.find(f => f.id === p.return_flight_id)?.name || "—";
+
+  // ============================================================
+  // Render
+  // ============================================================
+  return (
+    <div style={{ padding: 14, overflowY: "auto", height: "100%" }}>
+      <AlertModal alert={alert} onClose={() => showAlert(null)} />
+      <ConfirmModal state={confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+
+      <AdminStats admins={admins} />
+
+      {/* شريط الأزرار */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        <button disabled={readOnly} onClick={openAdd} style={{ ...roOff, display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 99, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--em7)", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "var(--font-body)" }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          إضافة إداري
+        </button>
+        {admins.length > 0 && (
+          <button onClick={printAdmins} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 99, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--em7)", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "var(--font-body)" }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+            طباعة الإداريين
+          </button>
+        )}
+      </div>
+
+      {/* القائمة */}
+      {admins.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "3rem", color: "var(--text-muted)", fontSize: 13 }}>
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--border)" strokeWidth="1.5" strokeLinecap="round" style={{ marginBottom: 8 }}>
+            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+            <path d="M22 11v6"/><path d="M19 14h6"/>
+          </svg>
+          <div>لا يوجد إداريون بعد</div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {admins.map(p => {
+            const type = (p.passenger_type || "إداري") as AdminType;
+            const [bg, clr] = TYPE_COLORS[type] || ["var(--bg-2)", "var(--text)"];
+            const hasAssign = p.bus_id || p.room_id || p.camp_mina_id || p.camp_arafa_id || p.flight_id || p.return_flight_id;
+            return (
+              <div key={p.id}
+                draggable={!readOnly}
+                onDragStart={() => setDragId(p.id)}
+                onDragOver={e => e.preventDefault()}
+                onDrop={() => { if (dragId) reorderAdmins(dragId, p.id); setDragId(null); }}
+                onDragEnd={() => setDragId(null)}
+                style={{ background: "var(--bg-card)", border: "0.5px solid var(--border)", borderRadius: 12, padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, cursor: readOnly ? "default" : "grab", opacity: dragId === p.id ? 0.5 : 1 }}>
+                <span style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 700, width: 16, textAlign: "center", flexShrink: 0 }}>{admins.findIndex(x => x.id === p.id) + 1}</span>
+                <Avatar gender={p.gender || "ذكر"} size={38} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                    <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{p.short_ar || p.name_ar}</span>
+                    <span style={{ fontSize: 10, padding: "1px 8px", borderRadius: 99, background: bg, color: clr, fontWeight: 600 }}>{type}</span>
+                    {p.passport && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{p.passport}</span>}
+                  </div>
+                  {p.phone && <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{p.phone}</div>}
+                  {hasAssign && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                      {p.bus_id           && <AssignTag label="باص"   val={busName(p)}    color="var(--info)" />}
+                      {p.room_id          && <AssignTag label="غرفة"  val={roomName(p)}   color="var(--primary)" />}
+                      {p.camp_mina_id     && <AssignTag label="منى"   val={minaName(p)}   color="var(--warning)" />}
+                      {p.camp_arafa_id    && <AssignTag label="عرفة"  val={arafaName(p)}  color="var(--success)" />}
+                      {p.flight_id        && <AssignTag label="ذهاب"  val={flightName(p)} color="#8B3A6B" />}
+                      {p.return_flight_id && <AssignTag label="إياب"  val={retName(p)}    color="#5C7C2E" />}
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <button onClick={() => setDocTarget(p)} style={{ ...btnS({ padding: "5px 10px", fontSize: 11 }) }}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" style={{ marginLeft: 4 }}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>مستندات
+                  </button>
+                  <button disabled={readOnly} onClick={() => openAssign(p)} style={{ ...btnP({ padding: "5px 10px", fontSize: 11 }), ...roOff }}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" style={{ marginLeft: 4 }}><path d="M8 6H21"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>تعيين
+                  </button>
+                  <button disabled={readOnly} onClick={() => openEdit(p)} style={{ ...btnS({ padding: "5px 10px", fontSize: 11 }), ...roOff }}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                  </button>
+                  <button disabled={readOnly} onClick={() => setDeleteTarget(p)} style={{ ...roOff, background: "var(--error-bg)", border: "none", color: "var(--error)", padding: "5px 8px", borderRadius: 8, cursor: "pointer" }}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ============================================================ */}
+      {/* مودال الإضافة / التعديل */}
+      {/* ============================================================ */}
+      <Modal show={showModal} onClose={() => { if (!scanning) { setShowModal(false); resetModal(); } }} title={editTarget ? "تعديل بيانات الإداري" : "إضافة إداري"} maxWidth={(passportImg || idImg) ? 820 : 500}>
+        {/* المؤشّر على رأس المودال ومستقلّ عن الصورة عن قصد: كان
+            معلّقاً بظهور المعاينة، والمعاينة لا تظهر إلا بعد أن تنتهي
+            `FileReader` من قراءة الملف — ثوانٍ في صور الهاتف الكبيرة.
+            فكانت أطول لحظة انتظار هي بالضبط اللحظة التي لا مؤشّر
+            فيها. الآن يظهر مع أوّل نقرة ويبقى حتى نجاح أو خطأ. */}
+        {scanning && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, background: "var(--warning-bg)", border: "1px solid var(--warning)", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+            <div style={{ width: 20, height: 20, border: "2.5px solid var(--line)", borderTopColor: "var(--warning)", borderRadius: "50%", animation: "hajjSpin 0.8s linear infinite", flexShrink: 0 }} />
+            <div>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: "var(--warning)" }}>جارٍ قراءة المستند…</div>
+              <div style={{ fontSize: 10.5, color: "var(--text-muted)" }}>قد تستغرق القراءة بضع ثوانٍ — لا تغلق النافذة</div>
+            </div>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+          {/* البيانات */}
+          <div style={{ flex: 1 }}>
+            {/* أزرار المسح */}
+            {!editTarget && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                <label style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px", borderRadius: 8, border: "1.5px dashed var(--border)", cursor: "pointer", fontSize: 12, color: "var(--text-muted)" }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+                  {scanning ? "جاري المسح..." : "مسح جواز السفر"}
+                  <input ref={passportInputRef} type="file" accept="image/*" style={{ display: "none" }} disabled={scanning} onChange={e => { const f = e.target.files?.[0]; if (f) handleScanPassport(f); e.target.value = ""; }} />
+                </label>
+                <label style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px", borderRadius: 8, border: "1.5px dashed var(--border)", cursor: "pointer", fontSize: 12, color: "var(--text-muted)" }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+                  {scanning ? "جاري المسح..." : "مسح البطاقة"}
+                  <input ref={idInputRef} type="file" accept="image/*" style={{ display: "none" }} disabled={scanning} onChange={e => { const f = e.target.files?.[0]; if (f) handleScanId(f); e.target.value = ""; }} />
+                </label>
+              </div>
+            )}
+
+            {/* نوع الإداري */}
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 6 }}>نوع الإداري</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                {ADMIN_TYPES.map(t => {
+                  const [bg, clr] = TYPE_COLORS[t];
+                  const sel = form.passenger_type === t;
+                  return (
+                    <div key={t} onClick={() => setForm(f => ({ ...f, passenger_type: t }))}
+                      style={{ flex: 1, padding: "7px", borderRadius: 8, border: `1.5px solid ${sel ? clr : "var(--border)"}`, background: sel ? bg : "transparent", cursor: "pointer", textAlign: "center", fontSize: 12, color: sel ? clr : "var(--text-muted)", fontWeight: sel ? 700 : 400 }}>
+                      {t}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* الحقول */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+              {([
+                ["الاسم بالعربي *", "name_ar"],
+                ["الاسم بالإنجليزي", "name_en"],
+                ["المختصر عربي", "short_ar"],
+                ["المختصر إنجليزي", "short_en"],
+                ["رقم الجواز", "passport"],
+                ["رقم البطاقة", "national_id"],
+                ["الجنسية", "nat"],
+                ["رقم الهاتف", "phone"],
+                ["تاريخ الميلاد", "dob"],
+                ["انتهاء الجواز", "expiry"],
+                ["انتهاء البطاقة", "id_expiry"],
+              ] as [string, string][]).map(([label, key]) => (
+                <div key={key}>
+                  <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>{label}</div>
+                  <input style={inp} value={(form as any)[key]} onChange={e => setForm(prev => ({ ...prev, [key]: e.target.value }))} />
+                </div>
+              ))}
+              <div>
+                <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>الجنس</div>
+                <select style={inp} value={form.gender} onChange={e => setForm(prev => ({ ...prev, gender: e.target.value }))}>
+                  <option value="ذكر">ذكر</option>
+                  <option value="أنثى">أنثى</option>
+                </select>
+              </div>
+            </div>
+
+            {/* أزرار الحفظ */}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={saveAdmin} disabled={saving || scanning} style={{ ...btnP({ flex: 1, opacity: (saving || scanning) ? 0.6 : 1 }) }}>
+                {saving ? "جاري الحفظ..." : scanning ? "جارٍ القراءة…" : (editTarget ? "حفظ التعديل" : "إضافة")}
+              </button>
+              <button onClick={() => { setShowModal(false); resetModal(); }} style={btnS()}>إلغاء</button>
+            </div>
+          </div>
+
+          {/* صور المستندات */}
+          {(passportImg || idImg) && (
+            <div style={{ width: 300, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
+              {([["صورة الجواز", passportImg], ["صورة البطاقة", idImg]] as [string, string | null][]).map(([label, src]) => src && (
+                <div key={label}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--em7)", marginBottom: 6 }}>{label}</div>
+                  <div style={{ position: "relative", borderRadius: 8, overflow: "hidden" }}>
+                    <img src={src} alt={label} style={{ width: "100%", display: "block", border: "1px solid var(--border)", borderRadius: 8, filter: scanning ? "blur(2px)" : "none", transition: "filter 0.3s" }} />
+                    {scanning && (
+                      <div style={{ position: "absolute", inset: 0, background: "rgba(125,31,60,0.15)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                        <div style={{ width: 36, height: 36, border: "3px solid rgba(255,255,255,0.35)", borderTopColor: "var(--em7)", borderRadius: "50%", animation: "hajjSpin 0.8s linear infinite" }} />
+                        <span style={{ fontSize: 12, color: "var(--em7)", fontWeight: 600, background: "rgba(255,255,255,0.9)", padding: "4px 10px", borderRadius: 99 }}>جاري القراءة...</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* ============================================================ */}
+      {/* مودال التعيين */}
+      {/* ============================================================ */}
+      <Modal show={!!assignTarget} onClose={() => setAssignTarget(null)} title={`تعيين: ${assignTarget?.short_ar || assignTarget?.name_ar || ""}`}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* السعة والإشغال والمتبقّي داخل الخيار نفسه — القائمة كانت
+              عارية، فيُسنَد إلى غرفة مكتملة بلا أن يظهر ذلك أبداً */}
+          <AssignSelect label="الباص"        value={assign.bus_id}           onChange={v => setAssign(a => ({ ...a, bus_id: v }))}
+            options={[{ id: "", label: "— بدون —" }, ...buses.map(b => {
+              const cap = b.capacity || 50, occ = occupantsOf("bus_id", b.id);
+              return { id: String(b.id), label: `${b.name} (${b.type}) — ${occ}/${cap}${occ >= cap ? " مكتمل" : ` · متبقٍّ ${cap - occ}`}` };
+            })]} />
+          <AssignSelect label="غرفة الفندق"  value={assign.room_id}          onChange={v => setAssign(a => ({ ...a, room_id: v }))}
+            options={[{ id: "", label: "— بدون —" }, ...rooms.map(r => {
+              const cap = ROOM_TYPE_CAP[r.type] || 0, occ = occupantsOf("room_id", r.id);
+              const state = cap === 0 ? "" : ` — ${occ}/${cap}${occ >= cap ? " مكتملة" : ` · متبقٍّ ${cap - occ}`}`;
+              return { id: String(r.id), label: `${r.number} — ${r.type}${r.floor ? ` (ط${r.floor})` : ""}${state}` };
+            })]} />
+          {/* المخيّمات مفصولة بالجنس في صفحة المخيّمات، وكانت هنا
+              مفتوحة للجميع — «خاص» وحده يقبل الجنسين */}
+          <AssignSelect label="مخيم منى"     value={assign.camp_mina_id}     onChange={v => setAssign(a => ({ ...a, camp_mina_id: v }))}
+            options={[{ id: "", label: "— بدون —" }, ...campsFor("منى").map(c => ({ id: String(c.id), label: c.name }))]} />
+          <AssignSelect label="مخيم عرفة"    value={assign.camp_arafa_id}    onChange={v => setAssign(a => ({ ...a, camp_arafa_id: v }))}
+            options={[{ id: "", label: "— بدون —" }, ...campsFor("عرفة").map(c => ({ id: String(c.id), label: c.name }))]} />
+          {/* طيران / بدون */}
+          <div>
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 6 }}>الطيران</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {[{ val: false, label: "بدون طيران" }, { val: true, label: "طيران" }].map(opt => (
+                <button key={String(opt.val)} onClick={() => setAssign(a => ({ ...a, wants_flight: opt.val, flight_id: opt.val ? a.flight_id : "", return_flight_id: opt.val ? a.return_flight_id : "" }))}
+                  style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "1.5px solid", borderColor: assign.wants_flight === opt.val ? "var(--primary)" : "var(--line)", background: assign.wants_flight === opt.val ? "var(--primary)" : "var(--paper)", color: assign.wants_flight === opt.val ? "#fff" : "var(--ink)", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "var(--font-body)", transition: "all 0.15s" }}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {assign.wants_flight && (<>
+            <AssignSelect label="رحلة الذهاب"  value={assign.flight_id}        onChange={v => setAssign(a => ({ ...a, flight_id: v }))}
+              options={[{ id: "", label: "— بدون —" }, ...flights.filter(f => f.type === "ذهاب").map(f => ({ id: String(f.id), label: `${f.name} — ${f.airline} (${f.date})` }))]} />
+            <AssignSelect label="رحلة الإياب"  value={assign.return_flight_id} onChange={v => setAssign(a => ({ ...a, return_flight_id: v }))}
+              options={[{ id: "", label: "— بدون —" }, ...flights.filter(f => f.type === "إياب").map(f => ({ id: String(f.id), label: `${f.name} — ${f.airline} (${f.date})` }))]} />
+            {/* الدرجة لا تُختار هنا: قرار المنتج أن الدرجة المحجوزة
+                تتبع الدرجة المدفوعة في `flight` ولا تخالفها، والقاعدة
+                ترفض المخالفة. فالاختيار الحرّ كان باب تجاوزٍ للقاعدة
+                — ويُضبط بتعديل خدمة الطيران نفسها لا بحقلٍ ثانٍ. */}
+            <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              درجة السفر تتبع الدرجة المدفوعة: <b style={{ color: "var(--ink)" }}>{assignTarget?.services?.flight === "درجة أولى" ? "درجة أولى" : "اقتصادية"}</b>
+            </div>
+          </>)}
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button onClick={saveAssign} style={{ ...btnP({ flex: 1 }) }}>حفظ</button>
+            <button onClick={() => setAssignTarget(null)} style={{ ...btnS({ flex: 1 }) }}>إلغاء</button>
+          </div>
+        </div>
+      </Modal>
+
+
+      {/* ============================================================ */}
+      {/* مودال المستندات */}
+      {/* ============================================================ */}
+      <Modal show={!!docTarget} onClose={() => { setDocTarget(null); setDocViewer(null); }} title={`مستندات: ${docTarget?.short_ar || docTarget?.name_ar || ""}`} maxWidth={480}>
+        {docTarget && (
+          <div>
+            <div>
+              {DOC_TYPES.map(({ label, field, docType, accept }) => {
+                const url = (docTarget as Record<string, any>)[field] as string | null;
+                return (
+                <div key={label} style={{ padding: "8px 0", borderBottom: "0.5px solid var(--border)" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ fontSize: 12, color: url ? "var(--text)" : "var(--text-muted)" }}>{label}</span>
+                    {/* مدخل الملف واحد للرفع والاستبدال معاً — نفس الدالّة
+                        تتولّى الحالتين، فالاستبدال ليس مساراً ثانياً */}
+                    <input id={`admin-upload-${docType}`} type="file" accept={accept} style={{ display: "none" }}
+                      onChange={e => { const f = e.target.files?.[0]; if (f) handleAdminDocUpload(docTarget, docType, field, f); e.currentTarget.value = ""; }} />
+                    {docUploading === docType ? (
+                      <span style={{ fontSize: 10, color: "var(--text-muted)" }}>جاري الرفع...</span>
+                    ) : url ? (
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button onClick={() => setDocViewer({ url, label })} style={{ background: "var(--male-bg)", border: "none", padding: "3px 8px", borderRadius: 6, fontSize: 10, cursor: "pointer", color: "var(--info)" }}>
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg> عرض
+                        </button>
+                        <button onClick={() => downloadFile(url)} style={{ background: "var(--success-bg)", border: "none", padding: "3px 8px", borderRadius: 6, fontSize: 10, cursor: "pointer", color: "var(--primary-dark)" }}>⬇</button>
+                        <button onClick={() => document.getElementById(`admin-upload-${docType}`)?.click()} title="استبدال"
+                          style={{ background: "var(--warning-bg)", border: "none", padding: "3px 8px", borderRadius: 6, fontSize: 10, cursor: "pointer", color: "var(--warning)" }}>استبدال</button>
+                        <button onClick={() => handleAdminDocDelete(docTarget, field, label)} style={{ background: "var(--female-bg)", border: "none", padding: "3px 8px", borderRadius: 6, fontSize: 10, cursor: "pointer", color: "var(--danger)" }}>
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>
+                        </button>
+                      </div>
+                    ) : (
+                      <button onClick={() => document.getElementById(`admin-upload-${docType}`)?.click()}
+                        style={{ background: "var(--success-bg)", border: "none", padding: "3px 8px", borderRadius: 6, fontSize: 10, cursor: "pointer", color: "var(--primary-dark)" }}>
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> رفع
+                      </button>
+                    )}
+                  </div>
+                </div>
+                );
+              })}
+            </div>
+            {/* عرض الصورة */}
+          </div>
+        )}
+      </Modal>
+
+      {/* ============================================================ */}
+      {/* عارض المستند — طبقة فوق المودال لا لوحة بجانبه               */}
+      {/* ============================================================ */}
+      {/* اللوحة الجانبية كانت ٢٦٠px داخل مودال عرضه ٤٢٠: الجواز يُقرأ
+          بالكاد والتصريح لا يُقرأ. والعارض في صفحة الحجاج يملأ الشاشة
+          منذ البداية — فهذا هو النمط، لا ابتكار جديد. */}
+      {docViewer && (
+        <div onClick={() => setDocViewer(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ background: "var(--bg-card)", borderRadius: 14, padding: 16, maxWidth: "90vw", maxHeight: "90vh", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 20 }}>
+              <span style={{ fontWeight: 700, color: "var(--text)", fontSize: 14 }}>{docViewer.label}</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => downloadFile(docViewer.url)} style={{ fontSize: 11, padding: "4px 10px", borderRadius: 7, background: "var(--bg-2)", border: "0.5px solid var(--border)", cursor: "pointer", color: "var(--text)", fontFamily: "inherit" }}>تحميل</button>
+                <button onClick={() => setDocViewer(null)} style={{ fontSize: 18, background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", lineHeight: 1 }}>✕</button>
+              </div>
+            </div>
+            {/* العقد والتذكرة والتصريح تصل PDF كثيراً، و`<img>` وحده
+                كان يعرضها مربعاً فارغاً — نفس تمييز صفحة الحجاج */}
+            {docViewer.url.toLowerCase().includes("pdf") ? (
+              <iframe src={docViewerUrl} title={docViewer.label} style={{ width: "80vw", height: "75vh", border: "none", borderRadius: 8 }} />
+            ) : (
+              <img src={docViewerUrl} alt={docViewer.label} style={{ maxWidth: "80vw", maxHeight: "75vh", objectFit: "contain", borderRadius: 8 }} />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================ */}
+      {/* ============================================================ */}
+      {/* مودال تأكيد الحذف */}
+      {/* ============================================================ */}
+      <Modal show={!!deleteTarget} onClose={() => setDeleteTarget(null)} title="تأكيد الحذف">
+        <div style={{ textAlign: "center", padding: "8px 0 16px" }}>
+          <div style={{ fontSize: 13, color: "var(--text)", marginBottom: 16 }}>
+            هل أنت متأكد من حذف <strong>{deleteTarget?.short_ar || deleteTarget?.name_ar}</strong>؟
+          </div>
+          <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+            <button onClick={() => deleteTarget && deleteAdmin(deleteTarget.id)} style={{ ...btnP({ background: "var(--error)", minWidth: 80 }) }}>حذف</button>
+            <button onClick={() => setDeleteTarget(null)} style={{ ...btnS({ minWidth: 80 }) }}>إلغاء</button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ============================================================
+// مكوّنات مساعدة
+// ============================================================
+function AssignTag({ label, val, color }: { label: string; val: string; color: string }) {
+  return (
+    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, background: `${color}18`, color, border: `0.5px solid ${color}44`, display: "inline-flex", gap: 4 }}>
+      <span style={{ opacity: 0.7 }}>{label}:</span> {val}
+    </span>
+  );
+}
+
+function AssignSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (v: string) => void; options: { id: string; label: string }[] }) {
+  return (
+    <div>
+      <label style={{ fontSize: 11, color: "var(--text-muted)", display: "block", marginBottom: 4 }}>{label}</label>
+      <select style={inp} value={value} onChange={e => onChange(e.target.value)}>
+        {options.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+      </select>
+    </div>
+  );
+}
+
+export { AdminsPage };

@@ -1,0 +1,2672 @@
+import { useState, useMemo, useRef, useEffect } from "react";
+import type { Dispatch, SetStateAction } from "react";
+import { mapPassenger, upsertPassenger, isHajj, byOrder, reorderUpdates, applyReorder } from "../utils/passenger";
+import { useSeasonWrite } from "../season/useSeasonWrite";
+import { useSeason } from "../season/useSeason";
+import * as XLSX from "xlsx";
+import { supabase } from "../supabase";
+import type { TablesUpdate } from "../types/database";
+import type { Passenger, User } from "../types";
+import { Avatar } from "./Avatar";
+import { Modal } from "./Modal";
+import { AlertModal, useAlert, ConfirmModal, useConfirm } from "./AlertModal";
+import { StatCard, type StatCardData } from "./StatCard";
+import { useCompanyPortal, useReportBranding } from "../company/CompanyContext";
+import { DocImage } from "./DocImage";
+import { wantsService, type ServiceKey, itemsLabel, makeShort, buildStickersHTML, scanDocument, uploadDoc, removeDoc, DocumentScanError, downloadFile, getStoragePath, useSignedDoc, isExpired, isExpiringSoon, makeHTML, printInPage, freezeHeaderRow, addSummarySheet, timeAgo, inp, btnP, btnS } from "../utils";
+import { hasIssue, isIssueKey, type IssueKey } from "../utils/readiness";
+import { useSeasonPhases } from "./Seasontimeline";
+/* المقارنة بالاسم تسكن مع المودال: كلاهما يخدم نفس السؤال، ونسخة
+   واحدة منها تكفي المسارين */
+import { PermitConfirmModal } from "./PermitConfirmModal";
+import { namesClearlyDiffer, type PermitConfirmState } from "./permitMatch";
+
+const PERMIT_FIELD = "hajj_permit_url";
+
+// تطابق تقريبي للأسماء (مشاركة كلمتين على الأقل) — يُستخدم لاقتراح حجاج مطابقين عند مسح بطاقة شخصية
+function nameMatches(a?: string | null, b?: string | null): boolean {
+  const norm = (s?: string | null) => (s || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const wa = norm(a), wb = norm(b);
+  if (!wa.length || !wb.length) return false;
+  const common = wa.filter(w => wb.includes(w)).length;
+  return common >= Math.min(2, Math.min(wa.length, wb.length));
+}
+
+// مطابقة مشددة: الاسم الأول متطابق + نفس شرط الكلمتين المشتركتين أعلاه — تقلل المرشحين الخاطئين بشكل كبير
+function strongNameMatch(a?: string | null, b?: string | null): boolean {
+  const norm = (s?: string | null) => (s || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const wa = norm(a), wb = norm(b);
+  if (!wa.length || !wb.length) return false;
+  if (wa[0] !== wb[0]) return false;
+  return nameMatches(a, b);
+}
+
+function PassengersStats({ passengers }: { passengers: Passenger[] }) {
+
+  const stats = useMemo(() => {
+    const hajj = passengers.filter(p => isHajj(p));
+    const total = hajj.length;
+    const oneWeekAgo = new Date();
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+    const addedThisWeek = hajj.filter(p => {
+      if (!(p as any).created_at) return false;
+      return new Date((p as any).created_at) >= oneWeekAgo;
+    }).length;
+    const docsComplete = (p: Passenger) => !!(p.photo_url && p.passport_url && p.national_id_url);
+    const docsDone = hajj.filter(docsComplete).length;
+    const docPct = total ? Math.round(docsDone / total * 100) : 0;
+    return { total, docsDone, docPct, addedThisWeek };
+  }, [passengers]);
+
+  const { total, docsDone, docPct, addedThisWeek } = stats;
+
+  const cards: StatCardData[] = [
+    {
+      label: "إجمالي الحجاج",
+      num: total,
+      sub: addedThisWeek > 0 ? `↑ ${addedThisWeek}+ هذا الأسبوع` : "الموسم الحالي",
+      tone: "brand"
+    },
+    {
+      label: "اكتمال مستندات التسجيل",
+      num: `${docPct}٪`,
+      sub: `${docsDone} من ${total} · جواز + بطاقة + صورة`,
+      tone: "success"
+    },
+  ];
+  const PKG_COLORS: Record<string, string> = { "ثنائية": "#7D1F3C", "ثلاثية": "#D4A017", "رباعية": "#2A9D8F", "فردية": "#1565C0", "خاص": "#7E57C2" };
+  const pkgCounts: Record<string, number> = {};
+  passengers.filter(p => isHajj(p)).forEach(p => {
+    const t = p.services?.hotel_type?.trim(); if (t) pkgCounts[t] = (pkgCounts[t] || 0) + 1;
+  });
+  const pkgEntries = Object.entries(pkgCounts).sort((a, b) => b[1] - a[1]);
+  const pkgMax = pkgEntries[0]?.[1] || 1;
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: `repeat(${cards.length}, 1fr) 1.6fr`, gap: 10, padding: "12px 14px", borderBottom: "1px solid var(--line)", flexShrink: 0 }}>
+      {cards.map(c => <StatCard key={c.label} {...c} />)}
+      {/* كارت توزيع الباقات */}
+      <div style={{ background: "var(--paper)", borderRadius: 14, overflow: "hidden", border: "1px solid var(--line)", boxShadow: "0 1px 4px rgba(0,0,0,.06)", display: "flex", flexDirection: "column" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", background: "var(--warning-bg)", borderBottom: "1px solid var(--line)" }}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--warning)" strokeWidth="1.8" strokeLinecap="round">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+          </svg>
+          <span style={{ fontFamily: "var(--font-heading)", fontSize: 13, fontWeight: 800, color: "var(--ink)", flex: 1 }}>توزيع الباقات</span>
+          <span style={{ fontSize: 10.5, color: "var(--muted)", fontWeight: 700 }}>{total} حاج</span>
+        </div>
+        <div style={{ padding: "8px 12px", flex: 1, display: "flex", flexDirection: "column", gap: 5 }}>
+          {pkgEntries.length === 0 ? (
+            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", fontSize: 11 }}>لا توجد باقات بعد</div>
+          ) : pkgEntries.map(([pkg, count]) => {
+            const color = PKG_COLORS[pkg] || "#8a7d68";
+            const w = Math.max(8, Math.round(count / pkgMax * 100));
+            return (
+              <div key={pkg} style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <span style={{ width: 44, fontSize: 11.5, fontWeight: 800, color: "var(--ink)", flexShrink: 0 }}>{pkg}</span>
+                <div style={{ flex: 1, height: 18, background: "var(--ivory)", borderRadius: 5, overflow: "hidden" }}>
+                  <div style={{ width: `${w}%`, height: "100%", background: `linear-gradient(to left, ${color}, ${color}cc)`, borderRadius: 5, display: "flex", alignItems: "center", paddingRight: 7 }}>
+                    <span style={{ fontSize: 10.5, fontWeight: 900, color: "#fff" }}>{count}</span>
+                  </div>
+                </div>
+                <span style={{ width: 30, fontSize: 10.5, color: "var(--muted)", fontWeight: 700, textAlign: "left", flexShrink: 0 }}>{total ? Math.round(count/total*100) : 0}٪</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* عبارات البحث الطبيعيّ → مفتاح النقص. الجدول تسمياتٌ لا منطق:
+   لا شرط هنا، فقط أيّ عبارةٍ تعني أيّ مفتاح. */
+const SEARCH_ISSUE_PHRASES: Record<string, IssueKey> = {
+  "بدون صورة": "missing_photo", "ناقص صورة": "missing_photo",
+  "بدون تليفون": "missing_phone", "بدون هاتف": "missing_phone",
+  "جواز منتهي": "expired_passport", "جواز منتهي الصلاحية": "expired_passport",
+  "جواز قريب": "expiring_passport", "ينتهي قريبا": "expiring_passport", "ينتهي قريباً": "expiring_passport",
+  "بدون رحلة": "missing_flight", "بدون طيران": "missing_flight", "بدون ذهاب": "missing_flight",
+  "بدون عودة": "missing_return_flight", "بدون اياب": "missing_return_flight", "بدون إياب": "missing_return_flight",
+  "بدون باص": "missing_bus", "بدون حافلة": "missing_bus",
+  "بدون فندق": "missing_hotel", "بدون غرفة": "missing_hotel",
+  "بدون تذكرة": "missing_ticket",
+  "بدون تصريح": "missing_permit",
+  "بدون جواز": "missing_passport", "جواز غير مرفوع": "missing_passport",
+  "بدون بطاقة": "missing_id", "بدون هوية": "missing_id",
+};
+
+/* ═══ بطاقةُ عرضِ كل نقص — عرضٌ وفعل، لا شرط ═══
+   الشرط في `readiness.ts` وحده. هنا: بأيّ تبويبٍ يسكن، وبأيّ اسم
+   يُعرَض، و**أين يُحَلّ** — وهذا الأخير هو الفرق الذي كان غائباً:
+   «بدون باص» لا يُحَلّ في ملفّ الحاجّ مهما فتحته، بل في صفحة
+   الباصات. فكان الموظّف يفتح اثنين وعشرين ملفّاً ليكتشف ذلك. */
+type Resolve =
+  | { kind: "profile"; profileTab: "data" | "docs" }
+  | { kind: "page"; page: string; perm: string; action: string };
+
+interface IssueUI {
+  label: string;
+  icon: string;
+  tab: "reg" | "dist" | "travel";
+  /* «حرج» للعطب القائم وحده. كان كل شيء تقريباً كهرمانيّاً، فلم
+     يعد اللون يميّز شيئاً — عشرة تنبيهاتٍ بلونٍ واحد لا أولويّة
+     فيها. */
+  severity: "critical" | "warning" | "normal";
+  resolve: Resolve;
+}
+
+const ISSUE_UI: Record<IssueKey, IssueUI> = {
+  expired_passport: {
+    label: "جوازات منتهية الصلاحية", tab: "reg", severity: "critical",
+    icon: `<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>`,
+    resolve: { kind: "profile", profileTab: "data" },
+  },
+  expiring_passport: {
+    label: "جوازات تنتهي خلال ٦ أشهر", tab: "reg", severity: "warning",
+    icon: `<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>`,
+    resolve: { kind: "profile", profileTab: "data" },
+  },
+  expired_id: {
+    label: "بطاقات منتهية الصلاحية", tab: "reg", severity: "critical",
+    icon: `<rect x="2" y="5" width="20" height="14" rx="2"/><line x1="8" y1="15" x2="16" y2="15"/><line x1="16" y1="9" x2="8" y2="15"/><line x1="8" y1="9" x2="16" y2="15"/>`,
+    resolve: { kind: "profile", profileTab: "data" },
+  },
+  expiring_id: {
+    label: "بطاقات تنتهي خلال ٦ أشهر", tab: "reg", severity: "warning",
+    icon: `<rect x="2" y="5" width="20" height="14" rx="2"/><polyline points="12 9 12 12 14 13.5"/>`,
+    resolve: { kind: "profile", profileTab: "data" },
+  },
+  missing_phone: {
+    label: "حجاج بدون رقم هاتف", tab: "reg", severity: "normal",
+    icon: `<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.15 12 19.79 19.79 0 0 1 1.07 3.4 2 2 0 0 1 3.04 1.22h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.09 8.14a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7a2 2 0 0 1 1.72 2.03z"/>`,
+    resolve: { kind: "profile", profileTab: "data" },
+  },
+  missing_passport: {
+    label: "جوازات لم تُرفع", tab: "reg", severity: "normal",
+    icon: `<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>`,
+    resolve: { kind: "profile", profileTab: "docs" },
+  },
+  missing_id: {
+    label: "بطاقات هوية لم تُرفع", tab: "reg", severity: "normal",
+    icon: `<rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8" cy="11" r="2"/><path d="M14 10h5"/><path d="M14 14h3"/>`,
+    resolve: { kind: "profile", profileTab: "docs" },
+  },
+  missing_photo: {
+    label: "صور شخصية ناقصة", tab: "reg", severity: "normal",
+    icon: `<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>`,
+    resolve: { kind: "profile", profileTab: "docs" },
+  },
+  missing_hotel: {
+    label: "حجاج بدون غرفة فندق", tab: "dist", severity: "normal",
+    icon: `<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>`,
+    resolve: { kind: "page", page: "hotel", perm: "manage_hotel", action: "الذهاب لتوزيع الغرف" },
+  },
+  missing_bus: {
+    label: "حجاج بدون باص", tab: "dist", severity: "normal",
+    icon: `<rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/>`,
+    resolve: { kind: "page", page: "buses", perm: "manage_buses", action: "الذهاب لتوزيع الباصات" },
+  },
+  missing_mina: {
+    label: "حجاج بدون مخيم منى", tab: "dist", severity: "normal",
+    icon: `<path d="m8 3 4 8 5-5 5 15H2L8 3z"/>`,
+    resolve: { kind: "page", page: "mina", perm: "manage_camps", action: "الذهاب لتوزيع منى" },
+  },
+  missing_arafah: {
+    label: "حجاج بدون مخيم عرفة", tab: "dist", severity: "normal",
+    icon: `<path d="M3.5 21 14 3"/><path d="M20.5 21 10 3"/><path d="M15.5 21 12 15l-3.5 6"/><path d="M2 21h20"/>`,
+    resolve: { kind: "page", page: "arafa", perm: "manage_camps", action: "الذهاب لتوزيع عرفة" },
+  },
+  /* الطيران بندان: الذهاب والعودة. فمن حُجزت له رحلة الذهاب بلا
+     عودة يظهر في «رحلة العودة غير موزعة» — وكان يُعدّ مكتملاً. */
+  missing_flight: {
+    label: "رحلة الذهاب غير موزعة", tab: "dist", severity: "normal",
+    icon: `<path d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/>`,
+    resolve: { kind: "page", page: "flights", perm: "manage_flights", action: "الذهاب للرحلات" },
+  },
+  missing_return_flight: {
+    label: "رحلة العودة غير موزعة", tab: "dist", severity: "normal",
+    icon: `<path d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/>`,
+    resolve: { kind: "page", page: "flights", perm: "manage_flights", action: "الذهاب للرحلات" },
+  },
+  missing_ticket: {
+    label: "حجاج بدون تذكرة طيران", tab: "travel", severity: "normal",
+    icon: `<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>`,
+    resolve: { kind: "profile", profileTab: "docs" },
+  },
+  missing_permit: {
+    label: "حجاج بدون تصريح حج", tab: "travel", severity: "normal",
+    icon: `<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><polyline points="9 15 11 17 15 13"/>`,
+    resolve: { kind: "profile", profileTab: "docs" },
+  },
+};
+
+/* «أرقام مكرّرة» بندُ غرفة العمليات وحده — شرطٌ بين الحجّاج لا
+   شرطُ حاجٍّ واحد، فلا مكان له في وحدة الجاهزية. */
+const DUP_PHONES_UI = {
+  label: "أرقام هواتف مكررة",
+  icon: `<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>`,
+  tab: "reg" as const,
+  severity: "normal" as const,
+};
+
+/* لافتةُ الصلاحية: أيّ وثيقةٍ منتهية أو مقتربة، بتسميتها الصحيحة.
+   كانت الشيفرة تقرأ `id_expiry` مباشرةً وتكتب «الجواز منتهي» متى
+   انتهى أيّهما — فيرى الموظّف حمرةً لا يجدها في أي تنبيه، وباسمٍ
+   قد لا يكون اسمها. الآن الشرط من `hasIssue` والاسمُ من الواقع. */
+function expiryNotice(p: Passenger): { tone: "expired" | "soon"; text: string } | null {
+  const pExp = hasIssue("expired_passport", p), iExp = hasIssue("expired_id", p);
+  if (pExp || iExp) {
+    return { tone: "expired", text: pExp && iExp ? "الجواز والبطاقة منتهيان" : pExp ? "الجواز منتهي" : "البطاقة منتهية" };
+  }
+  const pSoon = hasIssue("expiring_passport", p), iSoon = hasIssue("expiring_id", p);
+  if (pSoon || iSoon) {
+    const what = pSoon && iSoon ? "الجواز والبطاقة" : pSoon ? "الجواز" : "البطاقة";
+    return { tone: "soon", text: `صلاحية ${what} تنتهي خلال أقل من ٦ شهور` };
+  }
+  return null;
+}
+
+/* وجهةُ إدارة كل خدمة. غرفة العمليات تسلك هذا الطريق نفسه منذ
+   #110 — الحدث `hajj_goto_page` والصلاحية القائمة — فلا طريق ثانٍ.
+   الملفّ يبقى **عرضاً**: الضغط ينقل إلى مكان الإسناد، ولا يُسنِد. */
+const SERVICE_DEST: Record<ServiceKey, { page: string; perm: string; label: string }> = {
+  bus:        { page: "buses",   perm: "manage_buses",   label: "الباصات" },
+  hotel_type: { page: "hotel",   perm: "manage_hotel",   label: "الفندق" },
+  camp_mina:  { page: "mina",    perm: "manage_camps",   label: "مخيمات منى" },
+  camp_arafa: { page: "arafa",   perm: "manage_camps",   label: "مخيمات عرفة" },
+  flight:     { page: "flights", perm: "manage_flights", label: "الرحلات" },
+};
+
+const opsFilterLabel = (f: Exclude<OpsFilter, null>) =>
+  f === "dup_phones" ? DUP_PHONES_UI.label : ISSUE_UI[f].label;
+
+/* التبويب الذي يقابل مرحلة الموسم الجارية — «التجهيز» و«السفر»
+   يقعان معاً في تبويب «السفر». إشارةُ اتّجاه لا حجب: كل التبويبات
+   تبقى مفتوحة، فالموظّف قد يجهّز عمل مرحلةٍ قادمة أو يعود لسابقة. */
+const PHASE_TAB: Record<string, "reg" | "dist" | "travel"> = {
+  reg: "reg", dist: "dist", prep: "travel", travel: "travel",
+};
+
+/* فلتر غرفة العمليات: مفتاح نقصٍ مشترك، أو «أرقام مكرّرة» — وهذا
+   الأخير شرطٌ بين الحجّاج لا شرطُ حاجٍّ واحد، فلا مكان له في وحدة
+   الجاهزية ويبقى محليّاً. */
+type OpsFilter = IssueKey | "dup_phones" | null;
+
+/* الأرقام المكرّرة: **مجموعة معرّفات** لا عدّاد أرقام. كان الشارة
+   تعدّ الأرقامَ المكرّرة والفلترُ يعرض الحجّاجَ حاملي تلك الأرقام،
+   فثلاثةُ حجّاج على رقمٍ واحد كانت تُقرأ «١» ثم تفتح على ثلاثة.
+   والمجموعة الواحدة تخدم العدّ والقائمة معاً فلا يفترقان. */
+function duplicatePhoneIds(hajj: Passenger[]): Set<number> {
+  const byPhone = new Map<string, number[]>();
+  for (const p of hajj) {
+    const phone = (p.phone || "").trim();
+    if (!phone) continue;
+    const list = byPhone.get(phone);
+    if (list) list.push(p.id); else byPhone.set(phone, [p.id]);
+  }
+  const ids = new Set<number>();
+  for (const list of byPhone.values()) if (list.length > 1) list.forEach(id => ids.add(id));
+  return ids;
+}
+
+function PassengersPage({ passengers, setPassengers, currentUser, globalShowManual, onGlobalManualClose }: { passengers: Passenger[]; setPassengers: Dispatch<SetStateAction<Passenger[]>>; currentUser?: User; globalShowManual?: boolean; onGlobalManualClose?: () => void }) {
+  const reportBranding = useReportBranding();
+  const companyPortal = useCompanyPortal();
+  const { alert: alertState, showAlert } = useAlert();
+  const { confirmState, confirmAction, handleConfirm, handleCancel } = useConfirm();
+
+  /* النمط الموحّد لعمليات الكتابة — التعريف في utils/write.ts،
+     ومعرفة الموسم مركّبة فوقه في season/useSeasonWrite.ts */
+  const { writeOk, writeAllOk, assertWritable, readOnly } = useSeasonWrite(showAlert);
+  const { viewedSeason } = useSeason();
+
+  /* التعطيل البصري لمداخل الكتابة في موسم للعرض فقط. طبقة تجربة
+     لا حماية: الحماية في useSeasonWrite وفي محفّز القاعدة. تُطبَّق
+     بـ pointerEvents لأن نصف هذه المداخل <div onClick> لا <button>
+     فلا ينفع فيها disabled. */
+  const roOff = readOnly ? { opacity: 0.4, pointerEvents: "none" as const } : null;
+
+  const [search, setSearch] = useState("");
+  const [viewMode, setViewMode] = useState<"list" | "table">("table");
+  const [selected, setSelected] = useState<Passenger | null>(null);
+  const [editing, setEditing] = useState<Passenger | null>(null);
+  /* `null` = لم يختر الموظّف بعد، فيُشتقّ من المرحلة. اشتقاقٌ لا
+     أثرٌ جانبيّ: لا setState داخل effect ولا وميضُ تبويبٍ خاطئ. */
+  const [opsTabPick, setOpsTabPick] = useState<"reg" | "dist" | "travel" | null>(null);
+  const [opsFilter, setOpsFilter] = useState<OpsFilter>(null);
+  const [profileTab, setProfileTab] = useState<"data" | "svc" | "docs" | "family">("data");
+  const [metaBuses, setMetaBuses] = useState<any[]>([]);
+  const [metaRooms, setMetaRooms] = useState<any[]>([]);
+  const [metaCamps, setMetaCamps] = useState<any[]>([]);
+  const [metaFlights, setMetaFlights] = useState<any[]>([]);
+
+  useEffect(() => {
+    /* `type` عمودٌ مطلوب لا زينة: سطرُ الإسناد يعرض **تصنيف الكيان
+       المُسنَد** (باص ٤ · عادي · غرفة ١٢٠١ · ثنائية)، وهو الذي
+       يُظهر التفاوت بين ما طُلب وما أُسنِد. وبغيره يصل `undefined`
+       فيسكت السطر عن التصنيف بلا خطأ يُرى. */
+    supabase.from("buses").select("id,name,type").eq("season_id", viewedSeason.id).then(({ data }: { data: any[] | null }) => { if (data) setMetaBuses(data); });
+    supabase.from("rooms").select("id,number,type").eq("season_id", viewedSeason.id).then(({ data }: { data: any[] | null }) => { if (data) setMetaRooms(data); });
+    supabase.from("camps").select("id,name,page_type,type").eq("season_id", viewedSeason.id).then(({ data }: { data: any[] | null }) => { if (data) setMetaCamps(data); });
+    supabase.from("flights").select("id,name,type").eq("season_id", viewedSeason.id).then(({ data }: { data: any[] | null }) => { if (data) setMetaFlights(data); });
+  }, [viewedSeason.id]);
+
+  // استقبال scan من Dashboard
+  useEffect(() => {
+    const file = (window as any).__hajj_pending_scan_file__;
+    if (file) {
+      (window as any).__hajj_pending_scan_file__ = null;
+      runUnifiedScan(file);
+    }
+  }, []);
+
+  /* استقبال التنقّل من كارت «يحتاج انتباهك»: يصل **مفتاح النقص**
+     لا نصّه العربيّ، فيدخل فلتر غرفة العمليات نفسه — تعريفٌ واحد
+     للشرط بدل استنباطه من تسمية مترجَمة. */
+  useEffect(() => {
+    const w = window as { __hajj_pending_issue__?: IssueKey };
+    const issue = w.__hajj_pending_issue__;
+    if (issue && isIssueKey(issue)) {
+      w.__hajj_pending_issue__ = undefined;
+      setOpsFilter(issue);
+    }
+  }, []);
+
+  // فتح مودال الإضافة اليدوية من الداشبورد
+  useEffect(() => {
+    if (globalShowManual) {
+      resetManualModal();
+      setShowManual(true);
+      onGlobalManualClose?.();
+    }
+  }, [globalShowManual]);
+  
+
+  const COLS = [
+    { key: "name_ar", label: "الاسم بالعربي" },
+    { key: "passport", label: "رقم الجواز" },
+    { key: "nat", label: "الجنسية" },
+    { key: "expiry", label: "انتهاء الجواز" },
+    { key: "phone", label: "التليفون" },
+    { key: "bus", label: "الباص", get: (p: Passenger) => p.services?.bus },
+    { key: "flight", label: "الطيران", get: (p: Passenger) => p.services?.flight },
+    { key: "hotel_type", label: "نوع الغرفة", get: (p: Passenger) => p.services?.hotel_type },
+    { key: "camp_mina", label: "منى", get: (p: Passenger) => p.services?.camp_mina },
+    { key: "camp_arafa", label: "عرفة", get: (p: Passenger) => p.services?.camp_arafa },
+  ] as { key: string; label: string; get?: (p: Passenger) => string }[];
+
+  /* الإسناد الفعليّ كسطرٍ ثانويّ داخل خليّة الخدمة المطلوبة —
+     لا أعمدةٌ خمسة جديدة. الخدمة المطلوبة تبقى القيمة الأولى
+     (وهي ما يهمّ في التسجيل)، والإسناد يظهر تحتها في التوزيع.
+     ولا شيء يُخترع: إن لم يوجد إسناد فلا سطر — والنقص شأنُ غرفة
+     العمليات لا شأنُ كل خليّةٍ في الجدول.
+
+     ويحمل السطر **تصنيف الكيان المُسنَد نفسه** حين يخزّنه الكيان:
+     `Bus.type` و`Room.type` و`Camp.type` أعمدةٌ قائمة مستقلّة عن
+     `services`. فيُقرأ «VIP ← باص ٤ · عادي» فيُرى التفاوت بين ما
+     طُلب وما أُسنِد بلا محرّك مطابقةٍ ولا تنبيه. والتصنيف **لا
+     يُشتقّ من طلب الحاجّ أبداً**: لو اشتُقّ لصار السطران يقولان
+     الشيء نفسه مرّتين، ولاستحال أن يظهر تفاوتٌ أصلاً. */
+  const allocationOf = (p: Passenger, key: string): string => {
+    const one = (list: any[], id: number | null | undefined, get: (m: any) => string) => {
+      if (id == null) return "";
+      const m = list.find((x: any) => x.id === id);
+      return m ? get(m) : "";
+    };
+    /* التصنيف يُضاف إن وُجد على الكيان، ويُسكَت عنه إن غاب */
+    const withType = (label: string, type: unknown) => {
+      const t = String(type ?? "").trim();
+      return t ? `${label} · ${t}` : label;
+    };
+    switch (key) {
+      case "bus":        return one(metaBuses, p.bus_id, m => withType(`باص ${m.name}`, m.type));
+      case "hotel_type": return one(metaRooms, p.room_id, m => withType(`غرفة ${m.number}`, m.type));
+      case "camp_mina":  return one(metaCamps, p.camp_mina_id, m => withType(m.name, m.type));
+      case "camp_arafa": return one(metaCamps, p.camp_arafa_id, m => withType(m.name, m.type));
+      /* الرحلة لا تحمل تصنيفاً يقابل «عادي/درجة أولى»: `Flight.type`
+         اتّجاهٌ (ذهاب/إياب) لا درجة. فالاسم وحده — ولا يُخترع. */
+      case "flight": {
+        const out = one(metaFlights, p.flight_id, m => m.name);
+        const ret = one(metaFlights, p.return_flight_id, m => m.name);
+        return out && ret ? (out === ret ? out : `${out} · ${ret}`) : out || ret;
+      }
+      default: return "";
+    }
+  };
+
+  const EXPORT_COLS = [
+    ...COLS.slice(0, COLS.findIndex(c => c.key === "hotel_type") + 1),
+    { key: "hotel_view", label: "إطلالة الغرفة", get: (p: Passenger) => p.services?.hotel_view },
+    ...COLS.slice(COLS.findIndex(c => c.key === "hotel_type") + 1),
+  ] as { key: string; label: string; get?: (p: Passenger) => string }[];
+
+  const getVal = (p: Passenger, key: string, getter?: (p: Passenger) => string) => {
+    if (getter) return getter(p) || "";
+    return (p as any)[key] || "";
+  };
+
+  // فلتر متعدد
+  const [filters, setFilters] = useState<Record<string, string>>(() => {
+    const pkg = sessionStorage.getItem("__hajj_pkg_filter__");
+    if (pkg) { sessionStorage.removeItem("__hajj_pkg_filter__"); return { hotel_type: pkg } as Record<string, string>; }
+    return {} as Record<string, string>;
+  });
+  const setFilter = (key: string, val: string) => setFilters(prev => val ? { ...prev, [key]: val } : Object.fromEntries(Object.entries(prev).filter(([k]) => k !== key)));
+
+  /* خيارات الفلاتر مولدة ديناميكياً من البيانات الفعلية */
+  const optsFrom = (get: (p: Passenger) => string | undefined | null, withNone = false) => {
+    const vals = [...new Set(passengers.filter(p => isHajj(p)).map(get).map(v => (v || "").trim()).filter(Boolean))].filter(v => v !== "بدون") as string[];
+    return withNone ? [...vals, "بدون"] : vals;
+  };
+  /* «بدون» تُعرض للطيران وحده — كانت تُضاف إلى الباص ومنى وعرفة
+     أيضاً، فتَعِد بفلترٍ لا يقابله خيارٌ في أي شاشة إدخال. */
+  const QUICK_FILTERS = [
+    { key: "gender", label: "الجنس", opts: optsFrom(p => p.gender) },
+    { key: "bus", label: "الباص", opts: optsFrom(p => p.services?.bus) },
+    { key: "flight", label: "الطيران", opts: optsFrom(p => p.services?.flight, true) },
+    { key: "hotel_type", label: "نوع الغرفة", opts: optsFrom(p => p.services?.hotel_type) },
+    { key: "hotel_view", label: "الإطلالة", opts: optsFrom(p => p.services?.hotel_view) },
+    { key: "camp_mina", label: "منى", opts: optsFrom(p => p.services?.camp_mina) },
+    { key: "camp_arafa", label: "عرفة", opts: optsFrom(p => p.services?.camp_arafa) },
+    { key: "nat", label: "الجنسية", opts: optsFrom(p => p.nat) },
+  ];
+
+  /* مصدرٌ واحد للأرقام المكرّرة: منه تُحسب الشارة ومنه تُبنى
+     القائمة، على نطاق الحجّاج وحدهم في الحالتين. */
+  /* فرقٌ يهمّ الموظّف: موسمٌ لم يبدأ تسجيله، أو فلترٌ لم يطابق
+     أحداً — والثاني له مخرج. */
+  const anyFilterActive = !!search || !!opsFilter || Object.keys(filters).length > 0;
+  const clearAllFilters = () => { setSearch(""); setOpsFilter(null); setFilters({}); };
+
+  const dupPhoneIds = useMemo(() => duplicatePhoneIds(passengers.filter(p => isHajj(p))), [passengers]);
+
+  /* مرحلة الموسم من مصدرها القائم — إشارةُ اتّجاه لغرفة العمليات
+     لا حجب. (الداشبورد وحده يُخفي المستقبل.) */
+  const { phases, currentIdx } = useSeasonPhases(passengers);
+  const phaseTab = PHASE_TAB[phases[currentIdx].id];
+  const opsTab = opsTabPick ?? phaseTab;
+
+  /* طابور العمل: البند المفلتَر إن كان يُحَلّ داخل الملفّ. أما
+     التوزيعات فتُحَلّ في صفحاتها، فلا «التالي/السابق» لها. */
+  const queueIssue: Exclude<OpsFilter, null> | null =
+    opsFilter && (opsFilter === "dup_phones" || ISSUE_UI[opsFilter].resolve.kind === "profile") ? opsFilter : null;
+
+  /* يفتح الملفّ على التبويب الذي يُحَلّ فيه النقص: بيانات للهاتف
+     وصلاحية الجواز، ومستندات للمرفوعات. */
+  const openPilgrim = (p: Passenger) => {
+    setSelected(p);
+    if (queueIssue) {
+      const r = queueIssue === "dup_phones"
+        ? ({ kind: "profile", profileTab: "data" } as const)
+        : ISSUE_UI[queueIssue].resolve;
+      if (r.kind === "profile") setProfileTab(r.profileTab);
+    }
+  };
+
+  const filtered = useMemo(() => passengers
+    .filter(p => {
+      if (!isHajj(p)) return false;
+      if (search) {
+        const q = search.trim().toLowerCase();
+
+        // الاسم بالعربي والإنجليزي
+        const nameMatch = `${p.name_ar} ${p.name_en} ${p.short_ar || ""} ${p.short_en || ""}`.toLowerCase().includes(q);
+
+        // رقم الجواز أو البطاقة أو التليفون
+        const docMatch = `${p.passport || ""} ${p.national_id || ""} ${p.phone || ""}`.toLowerCase().includes(q);
+
+        // الجنسية
+        const natMatch = (p.nat || "").toLowerCase().includes(q);
+
+        // الجنس
+        const genderMatch = (p.gender || "").toLowerCase().includes(q);
+
+        // VIP
+        const vipMatch = (q === "vip") && p.services?.bus === "VIP";
+
+        // درجة أولى
+        const firstMatch = ["درجة أولى", "اولى", "أولى", "first"].includes(q) && p.services?.flight === "درجة أولى";
+
+        // الباص — اسم الخدمة + اسم الباص الحقيقي
+        const busName = metaBuses.find((b: any) => b.id === (p as any).bus_id)?.name || "";
+        const busMatch = (p.services?.bus || "").toLowerCase().includes(q) || busName.toLowerCase().includes(q);
+
+        // الطيران — اسم الخدمة + رقم الرحلة الحقيقي
+        const flightName = metaFlights.find((f: any) => f.id === (p as any).flight_id)?.name || "";
+        const returnFlightName = metaFlights.find((f: any) => f.id === (p as any).return_flight_id)?.name || "";
+        const flightMatch = (p.services?.flight || "").toLowerCase().includes(q) || flightName.toLowerCase().includes(q) || returnFlightName.toLowerCase().includes(q);
+
+        // الغرفة — رقم الغرفة الحقيقي
+        const roomNumber = String(metaRooms.find((r: any) => r.id === (p as any).room_id)?.number || "");
+        const roomMatch = roomNumber.includes(q);
+
+        // المخيمات — اسم الخيمة الحقيقي
+        const minaName = metaCamps.find((c: any) => c.id === (p as any).camp_mina_id)?.name || "";
+        const arafaName = metaCamps.find((c: any) => c.id === (p as any).camp_arafa_id)?.name || "";
+        const campMatch = `${p.services?.camp_mina || ""} ${p.services?.camp_arafa || ""} ${minaName} ${arafaName}`.toLowerCase().includes(q);
+
+        // نوع الغرفة والإطلالة
+        const hotelMatch = `${p.services?.hotel_type || ""} ${p.services?.hotel_view || ""}`.toLowerCase().includes(q);
+
+        if (!nameMatch && !docMatch && !natMatch && !genderMatch && !vipMatch && !firstMatch && !busMatch && !flightMatch && !campMatch && !hotelMatch && !roomMatch) {
+          // Smart Search — كلمات طبيعية
+          const smartMatch = (() => {
+            /* العبارات وظيفةُ بحثٍ للمستخدم فتبقى — لكنها لم تعد
+               تحمل تعريف الشرط: كل عبارة تُترجَم إلى `IssueKey`
+               والحكمُ من `hasIssue` وحدها. لهذا صار «بدون باص»
+               يحترم استثناء «بدون» كما تفعل بقيّة الشاشات. */
+            const issue = SEARCH_ISSUE_PHRASES[q];
+            return issue ? hasIssue(issue, p) : false;
+          })();
+          if (!smartMatch) return false;
+        }
+      }
+      for (const [key, val] of Object.entries(filters)) {
+        if (!val) continue;
+        const pval = key === "bus" ? p.services?.bus :
+                     key === "flight" ? p.services?.flight :
+                     key === "hotel_type" ? p.services?.hotel_type :
+                     key === "hotel_view" ? p.services?.hotel_view :
+                     key === "camp_mina" ? p.services?.camp_mina :
+                     key === "camp_arafa" ? p.services?.camp_arafa :
+                     (p as any)[key];
+        if (pval !== val) return false;
+      }
+      return true;
+    })
+    .filter(p => {
+      if (!opsFilter) return true;
+      if (opsFilter === "dup_phones") return dupPhoneIds.has(p.id);
+      /* بندٌ إخباريّ («تم تسجيل N اليوم») ليس نقصاً ولا يفلتر —
+         كما كان قبل التوحيد. */
+      if (!isIssueKey(opsFilter)) return true;
+      return hasIssue(opsFilter, p);
+    })
+    .sort(byOrder("sort_order")),
+  [passengers, search, filters, metaBuses, metaFlights, metaRooms, metaCamps, opsFilter, dupPhoneIds]);
+
+  // ===== طباعة كشف الحجاج الحالي (بعد البحث/الفلاتر) =====
+  const printList = () => {
+    const headers = EXPORT_COLS.map(c => `<th style="padding:4pt 6pt;background:${reportBranding.primaryColor};color:#fff;text-align:right;font-size:8pt">${c.label}</th>`).join("");
+    const rows = filtered.map((p, i) =>
+      `<tr style="background:${i % 2 === 0 ? "#fff" : "#f9f6f2"}">
+        <td style="text-align:center;padding:4pt 5pt;border:0.5pt solid #ddd;font-size:8pt">${i + 1}</td>
+        ${EXPORT_COLS.map(col => `<td style="padding:4pt 5pt;border:0.5pt solid #ddd;font-size:8pt;white-space:normal">${getVal(p, col.key, col.get)}</td>`).join("")}
+      </tr>`
+    ).join("");
+    const body = `<table style="width:100%;border-collapse:collapse;table-layout:fixed">
+      <thead><tr><th style="text-align:center;padding:4pt 5pt;background:${reportBranding.primaryColor};color:#fff;width:20pt;font-size:8pt">م</th>${headers}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+    /* الأعمدةُ ثابتةٌ هنا عن قصد — كشفٌ تشغيليّ، لا كشفُ التقارير
+       القابلُ للتهيئة. والمستندان يبقيان مختلفَين، ويشتركان في
+       القشرة وحدها: الموسمُ وعدُّ النتائج ونطاقُ الفرز. */
+    const scope: string[] = [];
+    if (search.trim()) scope.push(`بحث: ${search.trim()}`);
+    Object.entries(filters).forEach(([k, v]) => { if (v) scope.push(`${k}: ${v}`); });
+    if (opsFilter) scope.push(opsFilterLabel(opsFilter));
+    const html = makeHTML("كشف الحجاج", body, reportBranding, {
+      landscape: true,
+      chrome: {
+        season: viewedSeason,
+        resultCount: { label: "عدد النتائج", value: filtered.length },
+        scope: scope.length ? scope.join(" · ") : null,
+      },
+    });
+    printInPage(html);
+  };
+
+  // ===== تصدير كشف الحجاج الحالي إكسيل (بعد البحث/الفلاتر) =====
+  const exportExcel = () => {
+    const headers = ["م", ...EXPORT_COLS.map(c => c.label)];
+    const rows = filtered.map((p, i) => [i + 1, ...EXPORT_COLS.map(col => getVal(p, col.key, col.get) || "—")]);
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    ws["!cols"] = [{ wch: 4 }, ...EXPORT_COLS.map(() => ({ wch: 18 }))];
+    freezeHeaderRow(ws);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "الحجاج");
+    addSummarySheet(wb, XLSX, "كشف الحجاج", reportBranding.companyName, [
+      ["إجمالي عدد الحجاج", filtered.length],
+      ["عدد الرجال", filtered.filter(p => p.gender === "ذكر").length],
+      ["عدد النساء", filtered.filter(p => p.gender === "أنثى").length],
+    ]);
+    XLSX.writeFile(wb, "كشف_الحجاج.xlsx");
+  };
+
+  const [docUploading, setDocUploading] = useState<string | null>(null);
+  const [docViewer, setDocViewer] = useState<{ url: string; label: string } | null>(null);
+  /* س٦: العارض يفتح برابط موقّع لا بالقيمة المخزّنة */
+  const docViewerUrl = useSignedDoc(docViewer?.url);
+  const [showManual, setShowManual] = useState(false);
+  const DEFAULT_MANUAL_FORM = { name_ar: "", name_en: "", short_ar: "", short_en: "", passport: "", national_id: "", nat: "قطري", dob: "", expiry: "", id_expiry: "", gender: "ذكر", phone: "" };
+  const DEFAULT_MANUAL_SERVICES = { bus: "عادي", flight: "عادي", hotel_type: "ثنائية", hotel_view: "غير مطلة", camp_mina: "عادي", camp_arafa: "عادي" };
+  const [manualForm, setManualForm] = useState(DEFAULT_MANUAL_FORM);
+  const [manualServices, setManualServices] = useState(DEFAULT_MANUAL_SERVICES);
+  const [manualSaving, setManualSaving] = useState(false);
+  const [manualPassportImg, setManualPassportImg] = useState<string | null>(null);
+  const [manualPassportFile, setManualPassportFile] = useState<File | null>(null);
+  const [manualIdImg, setManualIdImg] = useState<string | null>(null);
+  const [manualIdFile, setManualIdFile] = useState<File | null>(null);
+  const [manualScanning, setManualScanning] = useState(false);
+  const [autoScanning, setAutoScanning] = useState(false);
+  const [docMatchCandidates, setDocMatchCandidates] = useState<Passenger[] | null>(null);
+  const [pendingDocScan, setPendingDocScan] = useState<{ file: File; dataUrl: string; parsed: any; docKind: "idcard" | "hajj_permit" | "passport" } | null>(null);
+  const [compareCandidate, setCompareCandidate] = useState<Passenger | null>(null);
+
+  const resetManualModal = () => {
+    setManualPassportImg(null); setManualPassportFile(null);
+    setManualIdImg(null); setManualIdFile(null);
+    setManualForm(DEFAULT_MANUAL_FORM);
+    setManualServices(DEFAULT_MANUAL_SERVICES);
+  };
+
+  // مسح موحّد: يتعرف على نوع المستند (جواز / بطاقة / تصريح حج) ويتصرف تلقائيًا
+  const runUnifiedScan = async (file: File) => {
+    setAutoScanning(true);
+    const reader = new FileReader();
+    reader.onload = async ev => {
+      const dataUrl = ev.target?.result as string;
+      try {
+        const parsed = await scanDocument(file, "auto");
+        if (parsed.doc_type === "hajj_permit") {
+          /* تصريح حج — يدخل مودال التأكيد الموحّد نفسه الذي يدخله
+             القادم من ملف الحاجّ. وترتيب المطابقة كما كان بلا تغيير:
+             تطابق تامّ بالهوية، فالجواز عند غيابها أو تعذّرها. الاسم
+             ليس مفتاح مطابقة هنا ولا هناك — تحذيرٌ فقط. */
+          const permitId = (parsed.national_id || "").trim();
+          const permitPassport = (parsed.passport_number || "").trim();
+          let match: Passenger | undefined;
+          let matchedBy: "national_id" | "passport" | null = null;
+          if (permitId) {
+            match = passengers.find(p => (p.national_id || "").trim() === permitId);
+            if (match) matchedBy = "national_id";
+          }
+          if (!match && permitPassport) {
+            match = passengers.find(p => (p.passport || "").trim() === permitPassport);
+            if (match) matchedBy = "passport";
+          }
+          const fullName = (parsed.full_name || "").trim();
+          setPermitConfirm({
+            file, field: PERMIT_FIELD,
+            passenger: match ?? null,
+            matchedBy,
+            nameMismatch: !!(match && fullName && namesClearlyDiffer(fullName, match)),
+            parsed: { national_id: permitId, passport_number: permitPassport, full_name: fullName },
+          });
+          if (!match) {
+            showAlert("warning", permitId || permitPassport
+              ? "قُرئ رقم من التصريح لكنه لا يطابق أي حاجّ — اختر الحاجّ يدوياً ثم أكّد."
+              : "تعذّر قراءة رقم هوية أو جواز من التصريح — اختر الحاجّ يدوياً ثم أكّد.");
+          }
+        } else if (parsed.doc_type === "idcard") {
+          // بطاقة شخصية — دايمًا تأكيد قبل الربط أو فتح الإضافة (تجنب الدبلكيت)
+          const idNum = parsed.national_id || "";
+          const nameAr = parsed.name_ar || "";
+          const nameEn = parsed.name_en || "";
+          if (idNum) {
+            const exactId = passengers.find(p => p.national_id === idNum);
+            if (exactId && (exactId as any).national_id_url) {
+              showAlert("warning", `هذه البطاقة مسجَّلة بالفعل في ملف ${exactId.short_ar || exactId.name_ar}`);
+              setAutoScanning(false);
+              return;
+            }
+          }
+          let candidates: Passenger[] = [];
+          if (idNum) candidates = passengers.filter(p => p.national_id === idNum);
+          if (candidates.length === 0 && (nameAr || nameEn)) {
+            candidates = passengers.filter(p =>
+              (!parsed.gender || p.gender === parsed.gender) &&
+              ((nameAr && (strongNameMatch(p.name_ar, nameAr) || strongNameMatch(p.short_ar, nameAr))) ||
+              (nameEn && (strongNameMatch(p.name_en, nameEn) || strongNameMatch(p.short_en, nameEn))))
+            );
+          }
+          setPendingDocScan({ file, dataUrl, parsed, docKind: "idcard" });
+          setDocMatchCandidates(candidates);
+        } else {
+          // جواز سفر — تحقق أولًا من تكرار رقم الجواز نفسه، ثم من وجود حاج مطابق قبل فتح الإضافة
+          const passportNum = parsed.passport || "";
+          const idNum = parsed.national_id || "";
+          const nameAr = parsed.name_ar || "";
+          const nameEn = parsed.name_en || "";
+          if (passportNum) {
+            const exactPassport = passengers.find(p => p.passport === passportNum);
+            if (exactPassport) {
+              showAlert("warning", `هذا الجواز مسجَّل بالفعل في ملف ${exactPassport.short_ar || exactPassport.name_ar}`);
+              setAutoScanning(false);
+              return;
+            }
+          }
+          let candidates: Passenger[] = [];
+          if (idNum) candidates = passengers.filter(p => p.national_id === idNum);
+          if (candidates.length === 0 && (nameAr || nameEn)) {
+            candidates = passengers.filter(p =>
+              (!parsed.gender || p.gender === parsed.gender) &&
+              ((nameAr && (strongNameMatch(p.name_ar, nameAr) || strongNameMatch(p.short_ar, nameAr))) ||
+              (nameEn && (strongNameMatch(p.name_en, nameEn) || strongNameMatch(p.short_en, nameEn))))
+            );
+          }
+          if (candidates.length > 0) {
+            setPendingDocScan({ file, dataUrl, parsed, docKind: "passport" });
+            setDocMatchCandidates(candidates);
+          } else {
+            resetManualModal();
+            setManualPassportImg(dataUrl); setManualPassportFile(file);
+            setManualForm(prev => ({
+              ...prev,
+              name_en: parsed.name_en || prev.name_en,
+              short_en: parsed.name_en ? makeShort(parsed.name_en) : prev.short_en,
+              name_ar: parsed.name_ar || prev.name_ar,
+              short_ar: parsed.name_ar ? makeShort(parsed.name_ar) : prev.short_ar,
+              passport: parsed.passport || prev.passport,
+              national_id: parsed.national_id || prev.national_id,
+              nat: parsed.nationality || prev.nat,
+              dob: parsed.dob || prev.dob,
+              expiry: parsed.expiry || prev.expiry,
+              gender: parsed.gender || prev.gender,
+            }));
+            setShowManual(true);
+          }
+        }
+      } catch {
+        // فشل القراءة — افتح مودال الإضافة اليدوي فاضي
+        resetManualModal();
+        setShowManual(true);
+      }
+      setAutoScanning(false);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  /* ربط الصورة بحاج موجود بالفعل — للجواز والبطاقة وحدهما.
+     ⚠️ تصريح الحج خرج من هنا: كان يرفع فور الضغط على «هذا هو» بلا
+     عرض بيانات ولا تنظيف عند فشل الحفظ. صار يمرّ بـ`commitPermit`
+     مثل القادم من ملف الحاجّ تماماً. */
+  const linkDocToExisting = async (passenger: Passenger) => {
+    if (!pendingDocScan) return;
+    const { file, parsed, docKind } = pendingDocScan;
+    setAutoScanning(true);
+    if (docKind === "idcard") {
+      const url = await uploadDoc(file, passenger.id, "idcard");
+      if (url) {
+        const updates: any = { national_id_url: url };
+        if (!passenger.national_id && parsed.national_id) updates.national_id = parsed.national_id;
+        if (!(passenger as any).id_expiry && parsed.id_expiry) updates.id_expiry = parsed.id_expiry;
+        if (!passenger.dob && parsed.dob) updates.dob = parsed.dob;
+        if (!await writeOk(supabase.from("passengers").update(updates).eq("id", passenger.id), "تعذّر حفظ البطاقة الشخصية، لم يُحفظ أي تغيير")) {
+          await discardUnsavedDocs(passenger, updates);
+          setAutoScanning(false); return;
+        }
+        const updated = { ...passenger, ...updates } as Passenger;
+        setPassengers(prev => prev.map(x => x.id === passenger.id ? updated : x));
+        await purgeSupersededDocs(passenger, updates);
+        showAlert("success", `تم ربط البطاقة الشخصية بملف ${passenger.short_ar || passenger.name_ar} بنجاح`);
+      } else {
+        showAlert("error", "فشل رفع الملف، يرجى المحاولة مرة أخرى");
+      }
+    } else {
+      // passport — حفظ الصورة وإضافة البيانات التكميلية الفاضية فقط
+      const url = await uploadDoc(file, passenger.id, "passport_doc");
+      if (url) {
+        const updates: any = { passport_url: url };
+        if (!passenger.passport && parsed.passport) updates.passport = parsed.passport;
+        if (!passenger.national_id && parsed.national_id) updates.national_id = parsed.national_id;
+        if (!(passenger as any).expiry && parsed.expiry) updates.expiry = parsed.expiry;
+        if (!passenger.dob && parsed.dob) updates.dob = parsed.dob;
+        if (!passenger.gender && parsed.gender) updates.gender = parsed.gender;
+        if (!passenger.name_en && parsed.name_en) {
+          updates.name_en = parsed.name_en;
+          updates.short_en = makeShort(parsed.name_en);
+        }
+        if (!await writeOk(supabase.from("passengers").update(updates).eq("id", passenger.id), "تعذّر حفظ صورة جواز السفر، لم يُحفظ أي تغيير")) {
+          await discardUnsavedDocs(passenger, updates);
+          setAutoScanning(false); return;
+        }
+        const updated = { ...passenger, ...updates } as Passenger;
+        setPassengers(prev => prev.map(x => x.id === passenger.id ? updated : x));
+        await purgeSupersededDocs(passenger, updates);
+        showAlert("success", `تم حفظ صورة جواز السفر وتحديث بيانات ملف ${passenger.short_ar || passenger.name_ar} بنجاح`);
+      } else {
+        showAlert("error", "فشل رفع الملف، يرجى المحاولة مرة أخرى");
+      }
+    }
+    setAutoScanning(false);
+    setDocMatchCandidates(null); setPendingDocScan(null);
+    setCompareCandidate(null);
+  };
+
+  // الحاج جديد — افتح مودال الإضافة مع البيانات المستخرجة (بطاقة أو جواز)
+  const proceedDocAsNew = () => {
+    if (!pendingDocScan || pendingDocScan.docKind === "hajj_permit") return;
+    const { dataUrl, file, parsed, docKind } = pendingDocScan;
+    resetManualModal();
+    if (docKind === "idcard") {
+      setManualIdImg(dataUrl); setManualIdFile(file);
+      setManualForm(prev => ({
+        ...prev,
+        national_id: parsed.national_id || prev.national_id,
+        id_expiry: parsed.id_expiry || prev.id_expiry,
+        name_ar: parsed.name_ar || prev.name_ar,
+        short_ar: parsed.name_ar ? makeShort(parsed.name_ar) : prev.short_ar,
+        name_en: parsed.name_en || prev.name_en,
+        short_en: parsed.name_en ? makeShort(parsed.name_en) : prev.short_en,
+        nat: parsed.nationality || prev.nat,
+        dob: parsed.dob || prev.dob,
+        gender: parsed.gender || prev.gender,
+      }));
+    } else {
+      setManualPassportImg(dataUrl); setManualPassportFile(file);
+      setManualForm(prev => ({
+        ...prev,
+        name_en: parsed.name_en || prev.name_en,
+        short_en: parsed.name_en ? makeShort(parsed.name_en) : prev.short_en,
+        name_ar: parsed.name_ar || prev.name_ar,
+        short_ar: parsed.name_ar ? makeShort(parsed.name_ar) : prev.short_ar,
+        passport: parsed.passport || prev.passport,
+        national_id: parsed.national_id || prev.national_id,
+        nat: parsed.nationality || prev.nat,
+        dob: parsed.dob || prev.dob,
+        expiry: parsed.expiry || prev.expiry,
+        gender: parsed.gender || prev.gender,
+      }));
+    }
+    setShowManual(true);
+    setDocMatchCandidates(null); setPendingDocScan(null);
+    setCompareCandidate(null);
+  };
+
+  const cancelDocScan = () => {
+    setDocMatchCandidates(null); setPendingDocScan(null);
+    setCompareCandidate(null);
+  };
+
+  const handleManualSave = async () => {
+    if (!manualForm.name_ar && !manualForm.name_en) { showAlert("warning", "يرجى إدخال الاسم على الأقل"); return; }
+    const dupP = manualForm.passport && passengers.some((p: Passenger) => p.passport === manualForm.passport);
+    const dupN = manualForm.national_id && passengers.some((p: Passenger) => p.national_id === manualForm.national_id);
+    if (dupP) { showAlert("warning", "رقم جواز السفر هذا مسجَّل بالفعل لحاج آخر"); return; }
+    if (dupN) { showAlert("warning", "رقم البطاقة الشخصية هذا مسجَّل بالفعل لحاج آخر"); return; }
+    if (!assertWritable()) return;
+    setManualSaving(true);
+    const short_ar = makeShort(manualForm.name_ar);
+    const short_en = makeShort(manualForm.name_en);
+    const { data, error } = await supabase.from("passengers").insert([{ ...manualForm, short_ar, short_en, bus: manualServices.bus, flight: manualServices.flight, hotel_type: manualServices.hotel_type, hotel_view: manualServices.hotel_view, camp_mina: manualServices.camp_mina, camp_arafa: manualServices.camp_arafa, created_by: currentUser?.name || null }]).select();
+    if (error) {
+      console.error("Manual save error:", error);
+      showAlert("error", "فشل حفظ البيانات، يرجى المحاولة مرة أخرى");
+      setManualSaving(false);
+      return;
+    }
+    if (data && data[0]) {
+      const newId = data[0].id;
+      /* الصف القادم من القاعدة هو المصدر الوحيد لشكل الحاج.
+         يبدأ بصف الإدراج، ويُستبدل بصف التحديث إن رُفعت مستندات،
+         ثم يُحوَّل بـ mapPassenger — نفس المُحوِّل الذي يستخدمه
+         الجلب الأولي وأحداث Realtime */
+      let row = data[0];
+      const docUpdates: { passport_url?: string; national_id_url?: string } = {};
+      /* مفاتيحُ ما رُفع فعلاً في هذه المحاولة وحدها — لا أكثر: إن فشل
+         حفظُ مراجعها بقيت كائناتٍ لا يعرفها أحد، فتُحذف هي بعينها.
+         ورفعٌ فاشل لا يُسجَّل، فلا يُحذف ما لم يُرفع. */
+      const uploadedKeys: string[] = [];
+      if (manualPassportFile) {
+        const url = await uploadDoc(manualPassportFile, newId, "passport_doc");
+        if (url) { docUpdates.passport_url = url; uploadedKeys.push(url); }
+      }
+      if (manualIdFile) {
+        const url = await uploadDoc(manualIdFile, newId, "idcard");
+        if (url) { docUpdates.national_id_url = url; uploadedKeys.push(url); }
+      }
+      if (Object.keys(docUpdates).length > 0) {
+        const { data: updatedRows, error: docErr } = await supabase
+          .from("passengers").update(docUpdates).eq("id", newId).select().single();
+        if (docErr) {
+          /* الحاجُّ حُفظ ومراجعُ مستنداته لم تُحفظ: الصفُّ يبقى (العملُ
+             لا يُلغى لأجل ملفّ)، والكائناتُ المرفوعة تُحذف فلا يتراكم
+             في الحاوية ما لا يشير إليه عمود. والرسالةُ هي هي: يُعاد
+             الرفعُ من صفحة الحاجّ. */
+          /* وفشلُ التنظيف نفسه لا يُبتلع: تحذيرُ «لم تُحفظ المستندات»
+             يصف القاعدة لا الحاوية، فيبقى الكائنُ يتيماً بلا أثرٍ في
+             الواجهة. ولا إعادةَ محاولةٍ تلقائية — `removeDoc` سجّلت
+             المفتاح، والتنظيفُ قرارُ مسؤولٍ لا حلقةٌ صامتة. */
+          let cleanupFailed = false;
+          for (const key of uploadedKeys) {
+            if (!await removeDoc(key)) cleanupFailed = true;
+          }
+          showAlert("warning", "تم حفظ الحاج لكن تعذّر حفظ المستندات، يرجى رفعها من صفحة الحاج");
+          if (cleanupFailed) {
+            showAlert("warning", "تعذّر حذف الملف المرفوع — أبلغ المسؤول التقني.");
+          }
+        } else if (updatedRows) {
+          row = updatedRows;
+        }
+      }
+      /* upsert لا يتأثر بترتيب الوصول: إن كان حدث Realtime قد سبقنا
+         وأضاف الحاج، يُستبدل بدل أن يتكرّر */
+      setPassengers(prev => upsertPassenger(prev, mapPassenger(row)));
+      setShowManual(false);
+      resetManualModal();
+      // لو جاي من الداشبورد عن طريق سكان، ارجع للداشبورد
+      if ((window as any).__hajj_scan_return_dash__) {
+        (window as any).__hajj_scan_return_dash__ = null;
+        // نبعث event للـ App عشان يرجع للداشبورد
+        window.dispatchEvent(new CustomEvent("hajj_return_dash"));
+      }
+    }
+    setManualSaving(false);
+  };
+
+  /* تصريح الحج — لا رفع قبل التأكيد، فالحالة تحمل **الملف** لا رابطاً:
+     الرفع يقع بعد أن يرى المستخدم المطابقة ويوافق عليها.
+     ويشترك فيها المساران: ملف الحاجّ وزر المسح العام. */
+  const [permitConfirm, setPermitConfirm] = useState<PermitConfirmState | null>(null);
+  const [permitSaving, setPermitSaving] = useState(false);
+
+  /* ⚠️ الرفع وحفظ القاعدة والتنظيف في مكان واحد لا اثنين: كان لكل
+     مسار روتين ربط خاصّ به، وواحدٌ منهما بلا تنظيف. */
+  const commitPermit = async () => {
+    if (!permitConfirm?.passenger) return;
+    const { file, field, passenger: target } = permitConfirm;
+    setPermitSaving(true);
+    try {
+      const url = await uploadDoc(file, target.id, "hajj_permit");
+      if (!url) { showAlert("error", "فشل رفع الملف، يرجى المحاولة مرة أخرى"); return; }
+
+      const ok = await writeOk(
+        supabase.from("passengers").update({ [field]: url } as TablesUpdate<"passengers">).eq("id", target.id),
+        "تعذّر حفظ المستند، لم يُحفظ أي تغيير");
+      if (!ok) {
+        /* الرفع نجح والقاعدة لا — لا يُترك كائن بلا مرجع: يُحذف،
+           وتعذّر الحذف يُسجَّل ويُعلَن */
+        const cleaned = await removeDoc(url);
+        if (!cleaned) showAlert("warning", "تعذّر أيضاً حذف الملف المرفوع — أبلغ المسؤول التقني.");
+        return;
+      }
+
+      const updated = { ...target, [field]: url };
+      setPassengers(prev => prev.map(x => x.id === target.id ? updated : x));
+      if (selected?.id === target.id) setSelected(updated);
+      /* التصريحُ السابق — إن كان — يذهب بعد نجاح الحفظ وحده */
+      await purgeSupersededDocs(target, { [field]: url } as Partial<Passenger>);
+      showAlert("success", `تم حفظ تصريح الحج في ملف ${target.short_ar || target.name_ar}`);
+      setPermitConfirm(null);
+    } finally {
+      setPermitSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    const h = async (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // مودالات العرض — تُغلق فوراً
+      if (docViewer) { setDocViewer(null); return; }
+      // مودالات الإدخال — تطلب تأكيداً لتفادي فقد البيانات
+      if (permitConfirm) {
+        const ok = await confirmAction("هل تريد إلغاء تأكيد التصريح؟", { title: "إغلاق النموذج" });
+        if (ok) setPermitConfirm(null);
+        return;
+      }
+      if (pendingDocScan) {
+        const ok = await confirmAction("هل تريد إغلاق نتيجة المسح؟ ستفقد البيانات الممسوحة.", { title: "إغلاق النموذج" });
+        if (ok) setPendingDocScan(null);
+        return;
+      }
+      if (showManual) {
+        const ok = await confirmAction("هل تريد الإغلاق؟ ستفقد البيانات المدخلة.", { title: "إغلاق النموذج" });
+        if (ok) setShowManual(false);
+        return;
+      }
+      if (editing) {
+        const ok = await confirmAction("هل تريد الإغلاق؟ ستفقد التعديلات غير المحفوظة.", { title: "إغلاق النموذج" });
+        if (ok) setEditing(null);
+        return;
+      }
+      if (selected) { setSelected(null); return; }
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [selected, editing, docViewer, showManual, pendingDocScan, permitConfirm]);
+  const [showVerify, setShowVerify] = useState(false);
+  const [verifyData, setVerifyData] = useState<{ passportUrl: string; idUrl: string; passenger: any; updates: any; isQatari: boolean; idMismatch: boolean; } | null>(null);
+
+  /* ⚠️ الغلاف موجود لسبب واقعي: `runDocUpload` تنتظر وعوداً قد
+     يُرفض أحدها (فشل تحليل، انقطاع شبكة)، ورفضٌ غير ملتقَط كان يترك
+     الواجهة على «جاري الرفع» إلى الأبد. فـ`finally` تُفرغ الحالة
+     مهما كان المسار. */
+  const handleDocUpload = async (p: Passenger, docType: string, field: string, file: File) => {
+    setDocUploading(docType);
+    try {
+      await runDocUpload(p, docType, field, file);
+    } catch (err) {
+      console.error("تعذّر رفع المستند", { docType, err });
+      showAlert("error", "تعذّر إتمام العملية، حاول مرة أخرى.");
+    } finally {
+      setDocUploading(null);
+    }
+  };
+
+  const runDocUpload = async (p: Passenger, docType: string, field: string, file: File) => {
+    if (docType === "passport_doc") {
+      /* ⚠️ التحليلُ قبل الرفع — نفسُ ترتيب `hajj_permit` أدناه وللسبب
+         نفسه. كانا متوازيين في `Promise.all`، فإذا فشل التحليل رُفض
+         الوعدُ كلُّه وقفز التنفيذُ إلى `catch` الخارجيّ — والكائنُ
+         الذي نجح رفعُه يبقى في الحاوية بلا مرجعٍ ولا تعويض.
+         والتسلسلُ يُلغي النافذة بدل أن يعوّض عنها: ما لم يُقرأ
+         المستند لا يُرفع أصلاً. والكلفةُ جولةُ شبكةٍ واحدة. */
+      const parsed = await scanDocument(file, "passport");
+      const url = await uploadDoc(file, p.id, docType);
+      const updates: any = {};
+      if (url) updates.passport_url = url;
+      if (parsed.name_en) { updates.name_en = parsed.name_en; updates.short_en = makeShort(parsed.name_en); }
+      if (parsed.name_ar) { updates.name_ar = parsed.name_ar; updates.short_ar = makeShort(parsed.name_ar); }
+      if (parsed.passport) updates.passport = parsed.passport;
+      if (parsed.nationality) updates.nat = parsed.nationality;
+      if (parsed.dob) updates.dob = parsed.dob;
+      if (parsed.expiry) updates.expiry = parsed.expiry;
+      if (parsed.gender) updates.gender = parsed.gender;
+      setDocUploading(null);
+      // لو في بطاقة موجودة → عرض مودال التحقق
+      if (p.national_id_url) {
+        setVerifyData({ passportUrl: url || p.passport_url || "", idUrl: p.national_id_url, passenger: p, updates, isQatari: p.nat === "قطري", idMismatch: false });
+        setShowVerify(true);
+      } else {
+        await saveDocUpdates(p, updates);
+      }
+    } else if (docType === "idcard") {
+      /* التحليلُ قبل الرفع — كما في الجواز أعلاه */
+      const parsed = await scanDocument(file, "idcard");
+      const url = await uploadDoc(file, p.id, docType);
+      const updates: any = {};
+      if (url) updates.national_id_url = url;
+      if (parsed.national_id) updates.national_id = parsed.national_id;
+      if (parsed.id_expiry) updates.id_expiry = parsed.id_expiry;
+      setDocUploading(null);
+      // لو في جواز موجود → عرض مودال التحقق
+      if (p.passport_url) {
+        const isQatari = p.nat === "قطري";
+        const idMismatch = isQatari && parsed.national_id && p.national_id && parsed.national_id !== p.national_id;
+        setVerifyData({ passportUrl: p.passport_url || "", idUrl: url || p.national_id_url || "", passenger: p, updates, isQatari, idMismatch: !!idMismatch });
+        setShowVerify(true);
+      } else {
+        await saveDocUpdates(p, updates);
+      }
+    } else if (docType === "hajj_permit") {
+      /* ═══ تصريح الحج ═══
+         التحليل أولاً، والرفع بعد تأكيد المستخدم وحده. فلا يدخل
+         التخزينَ ملفٌ لم يُقرَّ ربطه بحاجّ، ولا يبقى كائن يتيم إذا
+         فشل التحليل أو ألغى المستخدم. */
+      try {
+        const parsed = await scanDocument(file, "hajj_permit");
+        const nid = (parsed.national_id || "").trim();
+        const pass = (parsed.passport_number || "").trim();
+        const fullName = (parsed.full_name || "").trim();
+
+        /* ترتيب المطابقة المعتمد: الهوية أولاً، فالجواز عند غيابها أو
+           عند تعذّر المطابقة بها. والاسم **ليس مفتاح مطابقة** — هو
+           عامل تأكيد وتحذير وحده. */
+        let matched: Passenger | undefined;
+        let matchedBy: "national_id" | "passport" | null = null;
+        if (nid) {
+          matched = passengers.find(x => (x.national_id || "").trim() === nid);
+          if (matched) matchedBy = "national_id";
+        }
+        if (!matched && pass) {
+          matched = passengers.find(x => (x.passport || "").trim() === pass);
+          if (matched) matchedBy = "passport";
+        }
+
+        setPermitConfirm({
+          file, field,
+          passenger: matched ?? null,
+          matchedBy,
+          nameMismatch: !!(matched && fullName && namesClearlyDiffer(fullName, matched)),
+          parsed: { national_id: nid, passport_number: pass, full_name: fullName },
+        });
+
+        if (!matched) {
+          showAlert("warning", nid || pass
+            ? "قُرئ رقم من التصريح لكنه لا يطابق أي حاجّ — اختر الحاجّ يدوياً ثم أكّد."
+            : "تعذّر قراءة رقم هوية أو جواز من التصريح — اختر الحاجّ يدوياً ثم أكّد.");
+        }
+      } catch (err) {
+        console.error("تعذّر تحليل تصريح الحج", err);
+        showAlert("error", err instanceof DocumentScanError
+          ? err.message
+          : "تعذّر تحليل تصريح الحج، حاول مرة أخرى.");
+      }
+    } else {
+      const url = await uploadDoc(file, p.id, docType);
+      if (url) {
+        const updates = { [field]: url } as Partial<Passenger>;
+        if (!await writeOk(supabase.from("passengers").update(updates as TablesUpdate<"passengers">).eq("id", p.id), "تعذّر حفظ المستند، لم يُحفظ أي تغيير")) {
+          await discardUnsavedDocs(p, updates);
+          setDocUploading(null); return;
+        }
+        const updated = { ...p, [field]: url };
+        setPassengers(prev => prev.map(x => x.id === p.id ? updated : x));
+        setSelected(updated);
+        await purgeSupersededDocs(p, updates);
+      }
+      setDocUploading(null);
+    }
+  };
+
+  /* ═══ دورةُ حياة المستند المستبدَل ═══
+     `uploadDoc` تبني مفتاحاً جديداً بكلّ رفع (`_${Date.now()}`)، فلا
+     يُستبدل كائنٌ بكائن أبداً: الجديد يُضاف والقديم يبقى بلا مرجع.
+     وكانت مسارات هذه الصفحة ترفع وتحفظ ولا تحذف القديم، فيتراكم في
+     الحاوية ما لا تعرفه القاعدة.
+
+     والترتيب مُلزَم — وهو نفسه المعتمد في `AdminsPage`:
+       يُرفع الجديد ← يُحفظ مرجعه ← **ثم** يُحذف القديم.
+     فلا لحظةَ يشير فيها العمود إلى كائن غير موجود، ولا لحظةَ يضيع
+     فيها المستندان معاً.
+
+     والمقارنةُ بالمفتاح لا بالقيمة الخام: العمود قد يحمل رابطاً
+     عامّاً قديماً (ق٤)، و`getStoragePath` تردّ الاثنين إلى مفتاح. */
+  const DOC_FIELDS = ["passport_url", "national_id_url", "photo_url",
+                      "contract_url", "flight_ticket_url", "hajj_permit_url"] as const;
+
+  /** حقولُ المستندات التي يغيّرها هذا التحديث — بمفتاحَي قبلُ وبعد. */
+  const changedDocKeys = (before: Passenger, updates: Partial<Passenger>) => {
+    const keyOf = (v: unknown) => getStoragePath(typeof v === "string" ? v : "");
+    return DOC_FIELDS.flatMap((f) => {
+      if (!(f in updates)) return [];
+      const oldKey = keyOf((before as unknown as Record<string, unknown>)[f]);
+      const newKey = keyOf((updates as unknown as Record<string, unknown>)[f]);
+      /* لا تغيير في المفتاح ⇒ لا كائن يُحذف */
+      return oldKey === newKey ? [] : [{ oldKey, newKey }];
+    });
+  };
+
+  /** بعد نجاح الحفظ: يُحذف الكائن القديم وحده. وفشلُ حذفه لا ينقض
+      استبدالاً نجح — يُسجَّل مفتاحه (في `removeDoc`) ويُعلَن تحذيراً. */
+  const purgeSupersededDocs = async (before: Passenger, updates: Partial<Passenger>) => {
+    for (const { oldKey } of changedDocKeys(before, updates)) {
+      if (!oldKey) continue;
+      if (!await removeDoc(oldKey)) {
+        showAlert("warning", "حُفظ المستند الجديد، وتعذّر حذف القديم من التخزين — أبلغ المسؤول التقني.");
+      }
+    }
+  };
+
+  /** مفاتيحُ مستندات الحاجّ كما يشير إليها صفُّه الآن — تُقرأ **قبل**
+      الحذف، فبعده لا يبقى في القاعدة ما يدلُّ عليها. والمجموعةُ تُزيل
+      التكرار: عمودان يحملان المفتاحَ نفسه لا يُحذف مرّتين. */
+  const ownedDocKeys = (p: Passenger) => {
+    const row = p as unknown as Record<string, unknown>;
+    return [...new Set(DOC_FIELDS
+      .map((f) => getStoragePath(typeof row[f] === "string" ? row[f] as string : ""))
+      .filter(Boolean))];
+  };
+
+  /** جردُ مجلّد الحاجّ `{id}/` وحده — لا الحاوية. يُرجع المفاتيح، أو
+      `null` إن تعذّر السرد.
+
+      ولمَ لا تكفي الأعمدةُ الستّة؟ لأنّ ما قبل #199 كان يستبدل المستند
+      ولا يحذف القديم، فتحت المجلّد كائناتٌ لا يشير إليها عمود. وهي
+      بعد زوال الصفّ لا تُدرَك أبداً: إقفالُ الموسم يمرّ على الحجّاج،
+      ولا حاجَّ بعدُ ولا `season_id`. فالجردُ هنا أو لا جردَ أبداً.
+
+      والصفحةُ كبيرةٌ تكفي مجلّدَ حاجّ بمراحل، والترقيمُ احتياطٌ لا أكثر
+      — نفسُ النمط المعتمد في `season-admin`. */
+  const DOC_PAGE = 1000;
+  const listPassengerFolder = async (id: number): Promise<string[] | null> => {
+    const found: string[] = [];
+    for (let offset = 0; ; offset += DOC_PAGE) {
+      const { data: page, error } = await supabase.storage
+        .from("passengers-docs").list(String(id), { limit: DOC_PAGE, offset });
+      if (error) {
+        console.error("تعذّر سرد مجلّد مستندات الحاجّ — أُلغي الحذف", { passengerId: id, error });
+        return null;
+      }
+      const entries = (page ?? []) as { name: string; id: string | null }[];
+      for (const e of entries) {
+        /* `id === null` مجلّدٌ لا كائن — لا يُحذف بالاسم */
+        if (e.id !== null && e.name) found.push(`${id}/${e.name}`);
+      }
+      if (entries.length < DOC_PAGE) return found;
+    }
+  };
+
+  /** جردُ الحذف: اتّحادُ ما يشير إليه الصفُّ وما يقع فعلاً تحت مجلّده.
+      و`null` تعني «الجردُ ناقص» — ولا حذفَ على جردٍ ناقص. */
+  const deletionInventory = async (p: Passenger): Promise<string[] | null> => {
+    const listed = await listPassengerFolder(p.id);
+    if (listed === null) return null;
+    return [...new Set([...ownedDocKeys(p), ...listed])];
+  };
+
+  /** بعد نجاح حذف الصفّ: تُحذف مستنداتُه المعروفةُ بأعيانها — بالمفتاح
+      لا بالمجلّد، فلا يُمسّ ما لم يُشِر إليه عمود. وفشلُ الحذف لا يُعيد
+      الحاجّ: السجلُّ حُذف ولا يُنقض، و`removeDoc` تُسجّل كلَّ مفتاحٍ
+      تعذّر حذفُه، ويُعلَن تحذيرٌ غيرُ حاجب. */
+  const purgeOwnedDocs = async (keys: string[]) => {
+    let failed = false;
+    for (const key of keys) {
+      if (!await removeDoc(key)) failed = true;
+    }
+    if (failed) {
+      showAlert("warning", "حُذف الحاج من السجلّ، وتعذّر حذف بعض ملفاته من التخزين — أبلغ المسؤول التقني.");
+    }
+  };
+
+  /** حُفظ الرفعُ ولم يُحفظ مرجعُه (فشلٌ أو تراجع): يُحذف **الجديد**
+      وحده، ويبقى القديم ومرجعُه في القاعدة كما كانا. */
+  const discardUnsavedDocs = async (before: Passenger, updates: Partial<Passenger>) => {
+    for (const { newKey } of changedDocKeys(before, updates)) {
+      if (!newKey) continue;
+      if (!await removeDoc(newKey)) {
+        showAlert("warning", "تعذّر حذف الملف المرفوع — أبلغ المسؤول التقني.");
+      }
+    }
+  };
+
+  const saveDocUpdates = async (p: Passenger, updates: Partial<Passenger>) => {
+    if (!await writeOk(supabase.from("passengers").update(updates as TablesUpdate<"passengers">).eq("id", p.id), "تعذّر حفظ بيانات المستند، لم يُحفظ أي تغيير")) {
+      /* القاعدة لم تُحفظ: الرفعُ الجديد لا يُترك يتيماً، والقديم لا يُمسّ */
+      await discardUnsavedDocs(p, updates);
+      return;
+    }
+    const updated = { ...p, ...updates };
+    setPassengers(prev => prev.map(x => x.id === p.id ? updated : x));
+    setSelected(updated);
+    await purgeSupersededDocs(p, updates);
+  };
+
+  const confirmVerify = async () => {
+    if (!verifyData) return;
+    await saveDocUpdates(verifyData.passenger, verifyData.updates);
+    setShowVerify(false); setVerifyData(null);
+  };
+
+  /* التراجع عن مودال التحقّق = حفظٌ لم يقع: الرفعُ الجديد يُحذف */
+  const discardVerify = async () => {
+    if (verifyData) await discardUnsavedDocs(verifyData.passenger, verifyData.updates);
+    setShowVerify(false); setVerifyData(null);
+  };
+
+  const handleDocDelete = async (p: Passenger, field: string, url: string) => {
+    if (!assertWritable()) return;
+    const ok = await confirmAction("هتمسح المستند ده؟", { title: "حذف مستند" });
+    if (!ok) return;
+    /* ⚠️ الترتيب مقصود، وكان معكوساً: كان الكائن يُحذف **قبل** تصفير
+       العمود، فإن فشل التحديث بقي العمود يشير إلى ملفٍّ لم يبقَ له
+       وجود — والمستخدم يرى مستنداً لا يُفتح. فالسجلُّ أوّلاً: ما تشير
+       إليه القاعدة موجودٌ دائماً، وأسوأُ ما يبقى كائنٌ يتيم يُسجَّل
+       مفتاحه. وهو نفس اتجاه `purgeSupersededDocs`: القاعدة تحكم،
+       والتخزين يتبع. */
+    const path = getStoragePath(url);
+    if (!await writeOk(supabase.from("passengers").update({ [field]: null } as TablesUpdate<"passengers">).eq("id", p.id), "تعذّر حذف المستند، لم يُحفظ أي تغيير")) return;
+    const updated = { ...p, [field]: null };
+    setPassengers(prev => prev.map(x => x.id === p.id ? updated : x));
+    setSelected(updated);
+    /* الحذفُ من السجلّ وقع ولا يُنقض: فشلُ حذف الملف تحذيرٌ لا تراجع،
+       و`removeDoc` تُسجّل المفتاح بالضبط لمن يُنظّف الحاوية لاحقاً. */
+    if (path && !await removeDoc(path)) {
+      showAlert("warning", "حُذف المستند من سجلّ الحاج، وتعذّر حذف ملفه من التخزين — أبلغ المسؤول التقني.");
+    }
+  };
+  const [showLinkFamily, setShowLinkFamily] = useState(false);
+  const [linkSearch, setLinkSearch] = useState("");
+
+  const handleLinkFamily = async (p1: Passenger, p2: Passenger) => {
+    const familyId = p1.family_id || p2.family_id || `fam_${Date.now()}`;
+    if (!await writeAllOk([
+      supabase.from("passengers").update({ family_id: familyId }).eq("id", p1.id),
+      supabase.from("passengers").update({ family_id: familyId }).eq("id", p2.id),
+    ], "تعذّر الربط العائلي، يرجى المحاولة مرة أخرى")) return;
+    const updated1 = { ...p1, family_id: familyId };
+    const updated2 = { ...p2, family_id: familyId };
+    setPassengers(prev => prev.map(p => p.id === p1.id ? updated1 : p.id === p2.id ? updated2 : p));
+    setSelected(updated1);
+    setShowLinkFamily(false); setLinkSearch("");
+  };
+
+  const handleUnlinkFamily = async (p: Passenger) => {
+    const ok = await confirmAction("هتفك الارتباط العائلي لهذا الحاج؟", { title: "فك الارتباط العائلي", danger: false });
+    if (!ok) return;
+    if (!await writeOk(supabase.from("passengers").update({ family_id: null }).eq("id", p.id), "تعذّر فك الارتباط العائلي، لم يُحفظ أي تغيير")) return;
+    const updated = { ...p, family_id: null };
+    setPassengers(prev => prev.map(x => x.id === p.id ? updated : x));
+    setSelected(updated);
+  };
+
+  const getFamilyMembers = (p: Passenger) => p.family_id ? passengers.filter(x => x.family_id === p.family_id && x.id !== p.id) : [];
+
+  /* ═══ حذفُ الحاجّ لا يمحو تاريخَه الماليّ ═══
+     كان المفتاحُ الأجنبيُّ `on delete cascade`، وهذا الزرُّ بلا أيِّ
+     فحصٍ ماليّ — فنقرةٌ واحدةٌ تمحو الدفعاتِ وإيصالاتِها. وقد صار
+     المفتاحُ `restrict`، فالحذفُ المباشرُ يُرفَض من القاعدةِ نفسِها.
+
+     والمسارُ الآن: نقرأ ما له من دفعاتٍ **قبل** السؤال، ونُسمّي العددَ
+     والإجماليَّ وعددَ الإيصالات، ثُمّ نمضي بدالّةٍ واحدةٍ تحذف سطورَ
+     التوزيعِ وصفَّ الحاجّ — وتُبقي صفوفَ الإيصالِ وأرقامَها وإجمالياتِها
+     التاريخيّةَ كما هي. ولا يُعاد حسابُ إجماليِّ إيصالِ مجموعةٍ نقص
+     أحدُ أنصبتِه: هو ما استُلم فعلاً. */
+  const requestDeleteP = async (p: Passenger) => {
+    const who = p.name_ar || p.name_en || "هذا الحاج";
+    const { data, error } = await supabase
+      .from("payments").select("amount, receipt_id").eq("passenger_id", p.id);
+    if (error) { showAlert("error", "تعذّر التحقّق من السجل المالي — لم يُحذف شيء"); return; }
+
+    /* الجردُ يقع الآن، قبل أيِّ حذف: بعد زوال الصفّ لا مرجعَ ولا موسم.
+       وهو قراءةٌ محضة — لا يُستعمل إلا إن نجح الحذف. وإن تعذّر، لا
+       يمضي الحذفُ أصلاً: حاجٌّ باقٍ خيرٌ من ملفاتٍ لا يُدركها أحد. */
+    const docKeys = await deletionInventory(p);
+    if (docKeys === null) {
+      showAlert("error", "تعذّر حصر مستندات الحاج من التخزين — لم يُحذف الحاج ولا أيُّ ملفّ، يرجى إعادة المحاولة.");
+      return;
+    }
+    const rows = data ?? [];
+    const total = rows.reduce((s2, r) => s2 + Number(r.amount), 0);
+    const receiptCount = new Set(rows.filter(r => r.receipt_id != null).map(r => r.receipt_id)).size;
+
+    if (rows.length === 0) {
+      const ok = await confirmAction(`سيُحذف «${who}» نهائياً مع بياناته. هل تتابع؟`, { title: "حذف حاج" });
+      if (!ok) return;
+      if (!await writeOk(supabase.from("passengers").delete().eq("id", p.id), "تعذّر حذف الحاج، لم يُحذف من قاعدة البيانات")) return;
+      setPassengers(prev => prev.filter(x => x.id !== p.id));
+      setSelected(null);
+      await purgeOwnedDocs(docKeys);
+      return;
+    }
+
+    const ok = await confirmAction(
+      `لهذا الحاج ${rows.length} دفعة بإجمالي ${total.toLocaleString("ar-QA")} ر.ق`
+      + (receiptCount ? ` و${receiptCount} إيصال صادر` : "")
+      + `.\n\nإزالته تحذف أنصبته من الدفعات، وتُبقي الإيصالات وأرقامها ومبالغها التاريخية محفوظة وقابلة للطباعة.\n\nهل تتابع إزالة «${who}»؟`,
+      { title: "إزالة حاج له سجل مالي", confirmLabel: "نعم، أزِل الحاج" }
+    );
+    if (!ok) return;
+
+    const { error: rpcError } = await supabase.rpc("remove_passenger_with_history", { p_passenger_id: p.id });
+    if (rpcError) { showAlert("error", rpcError.message || "تعذّرت إزالة الحاج، لم يتغيّر شيء"); return; }
+    setPassengers(prev => prev.filter(x => x.id !== p.id));
+    setSelected(null);
+    showAlert("success", `تم إزالة «${who}» — الإيصالات وأرقامها محفوظة`);
+    /* الدالّةُ حذفت الصفَّ وأنصبتَه وأبقت الإيصالات — والمستنداتُ
+       ليست إيصالاً، فلا سببَ لبقائها بعد زوال من تخصّه. */
+    await purgeOwnedDocs(docKeys);
+  };
+
+  /* ═══ إعادة ترتيب الحجاج — مسار واحد ═══
+     كانت ثلاث خوارزميات تفعل الشيء نفسه بثلاث طرق: واحدة تبدّل
+     قيمتين، وواحدة ترقّم بفجوات عشرة، وواحدة ترقّم ١،٢،٣. والأخطر
+     أن اثنتين منها تحسبان المواضع من **ترتيب المصفوفة** لا من
+     `sort_order`؛ والمصفوفة لا يُعاد فرزها بعد أي حفظ — تُحدَّث
+     قيمها في مواضعها — فتصير مواضعها بائتة بعد أول إعادة ترتيب.
+     ولم يظهر ذلك قبل س-١ لأن أغلب الصفوف كانت على القيمة صفر
+     فترتيب المصفوفة يوافق ترتيب القيم صدفةً؛ وحين صارت لكل صفّ
+     قيمة متمايزة انكشف الفارق.
+
+     فصار للجميع مدخل واحد: يفرز صراحةً، ويرقّم بفجوات عشرة، ويكتب
+     دفعةً واحدة، ومقصورٌ على الحجاج فلا يتزحزح إداريّ. */
+  const moveWithin = (ordered: Passenger[], id: number, targetIdx: number): Passenger[] | null => {
+    const from = ordered.findIndex(x => x.id === id);
+    if (from === -1) return null;
+    const to = Math.max(0, Math.min(targetIdx, ordered.length - 1));
+    if (from === to) return null;
+    const next = [...ordered];
+    next.splice(to, 0, ...next.splice(from, 1));
+    return next;
+  };
+
+  const reorderHajj = async (arrange: (ordered: Passenger[]) => Passenger[] | null) => {
+    const ordered = passengers.filter(x => isHajj(x)).sort(byOrder("sort_order"));
+    const next = arrange(ordered);
+    if (!next) return;
+    if (!await writeAllOk(reorderUpdates("sort_order", next), "تعذّر حفظ الترتيب الجديد، لم يتغيّر شيء")) return;
+    setPassengers(prev => applyReorder(prev, "sort_order", next));
+  };
+
+  /* الرقم الظاهر **موضعٌ** لا قيمة خام، فحدوده حدود القائمة:
+     ١ ≤ الموضع ≤ عدد الحجاج. وأسهم حقل الرقم كانت تزيده بلا سقف
+     فيظهر ٢٦ في قائمة من ٢٥ — ثم يستقرّ الحاجّ آخرها عند الحفظ،
+     فيرى المستخدم رقماً لا يطابق موضعه. */
+  const hajjCount = passengers.filter(x => isHajj(x)).length;
+  const clampPos = (n: number) => Math.max(1, Math.min(n, hajjCount));
+
+  const moveP_order = (p: Passenger, direction: "up" | "down") =>
+    reorderHajj(ordered => {
+      const i = ordered.findIndex(x => x.id === p.id);
+      return i === -1 ? null : moveWithin(ordered, p.id, direction === "up" ? i - 1 : i + 1);
+    });
+
+  // ===== Drag & Drop =====
+  const [draggingId, setDraggingId] = useState<number | null>(null);
+  const [dragOverId, setDragOverId] = useState<number | null>(null);
+  const dragFromId = useRef<number | null>(null);
+  const dragToId = useRef<number | null>(null);
+
+  const handleDragStart = (pId: number) => { dragFromId.current = pId; setDraggingId(pId); };
+  const handleDragOver = (e: React.DragEvent, pId: number) => { e.preventDefault(); dragToId.current = pId; setDragOverId(pId); };
+  const handleDragEnd = () => { setDraggingId(null); setDragOverId(null); dragFromId.current = null; dragToId.current = null; };
+
+  const handleDrop = async () => {
+    const fromId = dragFromId.current;
+    const toId = dragToId.current;
+    setDraggingId(null); setDragOverId(null);
+    dragFromId.current = null; dragToId.current = null;
+    if (!fromId || !toId || fromId === toId) return;
+    await reorderHajj(ordered => moveWithin(ordered, fromId, ordered.findIndex(x => x.id === toId)));
+  };
+
+  // ===== رتب حسب العائلة =====
+  const sortByFamily = async () => {
+    const sorted = passengers.filter(p => isHajj(p)).sort(byOrder("sort_order"));
+    const result: Passenger[] = [];
+    const visited = new Set<number>();
+    for (const p of sorted) {
+      if (visited.has(p.id)) continue;
+      visited.add(p.id);
+      result.push(p);
+      if (p.family_id) {
+        const family = sorted.filter(x => x.family_id === p.family_id && x.id !== p.id && !visited.has(x.id));
+        family.forEach(f => { visited.add(f.id); result.push(f); });
+      }
+    }
+    if (!await writeAllOk(reorderUpdates("sort_order", result), "تعذّر حفظ الترتيب الجديد، لم يتغيّر شيء")) return;
+    setPassengers(prev => applyReorder(prev, "sort_order", result));
+  };
+
+  // ===== تغيير الرقم يدوياً =====
+  const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
+  const [editingOrderVal, setEditingOrderVal] = useState("");
+
+  /* الرقم الذي يكتبه المستخدم **موضعٌ في القائمة** لا قيمة خام:
+     من المركز ٨ إلى ٢ يعني نقله إلى الثاني وإزاحة من بعده. */
+  const applyOrderChange = async (p: Passenger, newNum: number) => {
+    setEditingOrderId(null);
+    if (!newNum || newNum < 1) return;
+    await reorderHajj(ordered => moveWithin(ordered, p.id, newNum - 1));
+  };
+  const saveEdit = async (p: Passenger) => {
+    if (!assertWritable()) return;
+    const updated_at = new Date().toISOString();
+    const updated_by = currentUser?.name || null;
+    const { error } = await supabase.from("passengers").update({
+      name_ar: p.name_ar, name_en: p.name_en, short_ar: p.short_ar, short_en: p.short_en,
+      passport: p.passport, national_id: p.national_id, nat: p.nat,
+      dob: p.dob, expiry: p.expiry, gender: p.gender, phone: p.phone,
+      bus: p.services?.bus, flight: p.services?.flight, hotel_type: p.services?.hotel_type, hotel_view: p.services?.hotel_view,
+      camp_mina: p.services?.camp_mina, camp_arafa: p.services?.camp_arafa,
+      updated_by, updated_at
+    }).eq("id", p.id);
+    if (error) { showAlert("error", "حدث خطأ أثناء حفظ التعديلات، يرجى المحاولة مرة أخرى"); return; }
+    const updatedP = { ...p, updated_by, updated_at };
+    setPassengers(prev => prev.map(x => x.id === p.id ? updatedP : x));
+    setEditing(null); setSelected(updatedP);
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "flex-start", fontSize: 13, zoom: 0.9 }}>
+      {autoScanning && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 400 }}>
+          <div style={{ background: "var(--paper)", borderRadius: 14, padding: "24px 32px", display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 36, height: 36, border: "3px solid rgba(125,31,60,0.2)", borderTop: "3px solid var(--em7)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            <span style={{ fontSize: 13, fontWeight: 600, color: "var(--em7)" }}>جاري قراءة المستند...</span>
+          </div>
+        </div>
+      )}
+      <AlertModal alert={alertState} onClose={() => showAlert(null)} />
+      <ConfirmModal state={confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
+      {docMatchCandidates !== null && pendingDocScan && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 350, padding: 16 }}>
+          <div style={{ background: "var(--paper)", borderRadius: 14, padding: 18, maxWidth: 380, width: "100%", maxHeight: "80vh", overflowY: "auto" }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "var(--ink)", marginBottom: 4 }}>
+              {pendingDocScan.docKind === "hajj_permit" ? "تأكيد تصريح الحج" : pendingDocScan.docKind === "passport" ? "تأكيد جواز السفر" : "تأكيد البطاقة الشخصية"}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 12 }}>
+              {docMatchCandidates.length > 0
+                ? (pendingDocScan.docKind === "hajj_permit" ? "تم العثور على حاج مطابق بنفس الاسم أو الرقم — هل هذا هو؟" : "تم العثور على حجاج بنفس الاسم أو الرقم — هل أحدهم هو المقصود؟")
+                : (pendingDocScan.docKind === "hajj_permit" ? "لم يتم العثور على حاج مطابق لهذا التصريح" : "لا يوجد حاج بنفس الاسم في القائمة")}
+            </div>
+            {pendingDocScan.docKind !== "hajj_permit" && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4 }}>الصورة الممسوحة:</div>
+                <img src={pendingDocScan.dataUrl} style={{ width: "100%", maxHeight: 140, objectFit: "contain", borderRadius: 8, border: "1px solid var(--line)", background: "var(--bg-2)" }} />
+              </div>
+            )}
+            {docMatchCandidates.map(p => {
+              const existingDoc = pendingDocScan.docKind === "passport" ? (p as any).national_id_url : (p as any).passport_url;
+              return (
+              <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--line)", marginBottom: 6, background: "var(--bg-2)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {existingDoc ? (
+                    <button onClick={() => setCompareCandidate(p)} title="عرض الصور بحجم أكبر للمقارنة" style={{ width: 40, height: 40, padding: 0, border: "1px solid var(--line)", borderRadius: 6, overflow: "hidden", cursor: "pointer", flexShrink: 0, background: "none" }}>
+                      <DocImage value={existingDoc} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                    </button>
+                  ) : (
+                    <Avatar name={p.name_ar} gender={p.gender} size={36} />
+                  )}
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "var(--ink)" }}>{p.short_ar || p.name_ar}</div>
+                    <div style={{ fontSize: 10, color: "var(--text-muted)" }}>{p.nat} {p.passport ? `· ${p.passport}` : ""}</div>
+                  </div>
+                </div>
+                <button onClick={() => linkDocToExisting(p)} style={{ ...btnP(), fontSize: 11, padding: "5px 10px", flexShrink: 0 }}>هذا هو</button>
+              </div>
+              );
+            })}
+            {pendingDocScan.docKind !== "hajj_permit" && (
+              <button onClick={proceedDocAsNew} style={{ ...btnS(), width: "100%", marginTop: 6, fontWeight: 600 }}>لا، هذا حاج جديد ← فتح نموذج الإضافة</button>
+            )}
+            <button onClick={cancelDocScan} style={{ width: "100%", marginTop: 8, background: "none", border: "none", color: "var(--text-muted)", fontSize: 11, cursor: "pointer", padding: "4px 0" }}>{pendingDocScan.docKind === "hajj_permit" ? "إلغاء / تجاهل" : "إلغاء"}</button>
+          </div>
+        </div>
+      )}
+      {compareCandidate && pendingDocScan && (() => {
+        const existingDoc = pendingDocScan.docKind === "passport" ? (compareCandidate as any).national_id_url : (compareCandidate as any).passport_url;
+        const existingLabel = pendingDocScan.docKind === "passport" ? "البطاقة الشخصية المحفوظة" : "جواز السفر المحفوظ";
+        const scannedLabel = pendingDocScan.docKind === "passport" ? "صورة الجواز الممسوحة" : "صورة البطاقة الممسوحة";
+        return (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 360, padding: 16 }}>
+            <div style={{ background: "var(--paper)", borderRadius: 14, padding: 18, maxWidth: 720, width: "100%", maxHeight: "90vh", overflowY: "auto" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "var(--ink)", marginBottom: 4 }}>مقارنة الصور — {compareCandidate.short_ar || compareCandidate.name_ar}</div>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 12 }}>تأكد من تطابق الصورتين قبل الربط بملف هذا الحاج</div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--em7)", marginBottom: 6, textAlign: "center" }}>{scannedLabel}</div>
+                  <img src={pendingDocScan.dataUrl} style={{ width: "100%", maxHeight: 360, objectFit: "contain", borderRadius: 8, border: "1px solid var(--line)", background: "var(--bg-2)" }} />
+                </div>
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--em7)", marginBottom: 6, textAlign: "center" }}>{existingLabel}</div>
+                  {existingDoc ? (
+                    <DocImage value={existingDoc} style={{ width: "100%", maxHeight: 360, objectFit: "contain", borderRadius: 8, border: "1px solid var(--line)", background: "var(--bg-2)" }} />
+                  ) : (
+                    <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 8, border: "1px dashed var(--line)", background: "var(--bg-2)", fontSize: 12, color: "var(--text-muted)" }}>لا توجد صورة محفوظة لهذا الحاج</div>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                <button onClick={() => linkDocToExisting(compareCandidate)} style={{ ...btnP(), flex: 1 }}>تأكيد، هذا هو</button>
+                <button onClick={() => setCompareCandidate(null)} style={btnS()}>رجوع</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+      <div style={{ flex: 1, display: "flex", alignItems: "flex-start" }}>
+
+        {/* ══ المحتوى الرئيسي ══ */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <PassengersStats passengers={passengers} />
+
+        <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--line)", flexShrink: 0, background: "var(--paper)" }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            {/* البحث */}
+            <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 99, padding: "7px 14px", transition: "var(--transition)" }}
+              onFocus={e => { (e.currentTarget as HTMLElement).style.borderColor = "var(--g5)"; (e.currentTarget as HTMLElement).style.boxShadow = "0 0 0 3px rgba(200,162,75,.12)"; }}
+              onBlur={e => { (e.currentTarget as HTMLElement).style.borderColor = "var(--line)"; (e.currentTarget as HTMLElement).style.boxShadow = "none"; }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+              <input value={search} onChange={e => setSearch(e.target.value)} style={{ border: "none", background: "transparent", fontSize: 13, flex: 1, outline: "none", fontFamily: "var(--font-body)", color: "var(--ink)" }} placeholder="ابحث بالاسم، الجواز، الجنسية، رقم الرحلة، VIP، رقم الغرفة..." />
+              {search && <span onClick={() => setSearch("")} style={{ cursor: "pointer", color: "var(--muted)", fontSize: 16, lineHeight: 1 }}>✕</span>}
+            </div>
+            {/* مسح موحّد — جواز/بطاقة/تصريح حج، بيتعرف على النوع ويتصرف تلقائيًا */}
+            <div onClick={() => document.getElementById("scan-input-btn")?.click()} title="مسح جواز / بطاقة / تصريح حج" style={{ height: 34, padding: "0 10px", borderRadius: 99, display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)", border: "1px solid var(--em7)", color: "var(--em7)", cursor: "pointer", fontSize: 11, fontWeight: 700, transition: "var(--transition)", flexShrink: 0 }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
+              مسح
+            </div>
+            {/* PDF كان يمرّ أصلاً (accept تلميح لا حاجز) والمسار مُختبَر —
+                إظهاره في منتقي الملفات فقط، بلا منطق جديد */}
+            <input id="scan-input-btn" type="file" accept="image/*,application/pdf" style={{ display: "none" }} onChange={async e => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              runUnifiedScan(file);
+              e.target.value = "";
+            }} />
+            {/* إضافة يدوي */}
+            <div onClick={() => { resetManualModal(); setShowManual(true); }} title="إضافة يدوي" style={{ ...roOff, height: 34, padding: "0 10px", borderRadius: 99, display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--muted)", cursor: "pointer", fontSize: 11, fontWeight: 600, transition: "var(--transition)", flexShrink: 0 }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M16 3l5 5L8 21H3v-5z"/></svg>
+              يدوي
+            </div>
+            {/* رتب حسب العائلة */}
+            <div onClick={sortByFamily} title="رتب حسب العائلة" style={{ height: 34, padding: "0 10px", borderRadius: 99, display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--muted)", cursor: "pointer", fontSize: 11, fontWeight: 600, transition: "var(--transition)", flexShrink: 0 }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--em7)"; e.currentTarget.style.color = "var(--em7)"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line)"; e.currentTarget.style.color = "var(--muted)"; }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+              أسر
+            </div>
+            {/* تصدير إكسيل */}
+            <div onClick={exportExcel} title="تصدير إكسيل" style={{ height: 34, padding: "0 10px", borderRadius: 99, display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--muted)", cursor: "pointer", fontSize: 11, fontWeight: 600, transition: "var(--transition)", flexShrink: 0 }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--em7)"; e.currentTarget.style.color = "var(--em7)"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line)"; e.currentTarget.style.color = "var(--muted)"; }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="19"/><line x1="15" y1="13" x2="9" y2="19"/></svg>
+              إكسيل
+            </div>
+            {/* طباعة */}
+            <div onClick={printList} title="طباعة" style={{ height: 34, padding: "0 10px", borderRadius: 99, display: "inline-flex", alignItems: "center", gap: 5, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--muted)", cursor: "pointer", fontSize: 11, fontWeight: 600, transition: "var(--transition)", flexShrink: 0 }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--em7)"; e.currentTarget.style.color = "var(--em7)"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line)"; e.currentTarget.style.color = "var(--muted)"; }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+              طباعة
+            </div>
+            {/* list/table toggle */}
+            <div style={{ display: "flex", border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden", flexShrink: 0 }}>
+              <div onClick={() => setViewMode("list")} style={{ padding: "8px 10px", cursor: "pointer", background: viewMode === "list" ? "var(--em7)" : "var(--paper)", color: viewMode === "list" ? "var(--g3)" : "var(--muted)", transition: "var(--transition)" }}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+              </div>
+              <div onClick={() => setViewMode("table")} style={{ padding: "8px 10px", cursor: "pointer", background: viewMode === "table" ? "var(--em7)" : "var(--paper)", color: viewMode === "table" ? "var(--g3)" : "var(--muted)", transition: "var(--transition)", borderRight: "1px solid var(--line)" }}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>
+              </div>
+            </div>
+          </div>
+          {/* فلاتر سريعة */}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+            {QUICK_FILTERS.map(({ key, label, opts }) => (
+              <select key={key} value={filters[key] || ""} onChange={e => setFilter(key, e.target.value)}
+                style={{ fontSize: 11, padding: "4px 8px", borderRadius: 99, border: `1.5px solid ${filters[key] ? "var(--em7)" : "var(--line)"}`, background: filters[key] ? "rgba(125,31,60,0.06)" : "var(--paper)", color: filters[key] ? "var(--em7)" : "var(--muted)", fontFamily: "var(--font-body)", cursor: "pointer", outline: "none" }}>
+                <option value="">{label}</option>
+                {opts.map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            ))}
+            {/* غرفة العمليات تختفي عند فتح ملفّ حاجّ، فيبقى الجدول
+                مفلتراً بلا تفسير. الشريحة هنا تقول السبب وتلغيه —
+                وتلغيه وحده، فلا تمسّ البحث ولا القوائم. */}
+            {opsFilter && (
+              <button onClick={() => setOpsFilter(null)}
+                style={{ fontSize: 11, padding: "4px 10px", borderRadius: 99, border: "1.5px solid var(--em7)", background: "rgba(125,31,60,0.06)", color: "var(--em7)", cursor: "pointer", fontFamily: "var(--font-body)", fontWeight: 700 }}>
+                {opsFilterLabel(opsFilter)} ✕
+              </button>
+            )}
+            {Object.keys(filters).length > 0 && (
+              <button onClick={() => setFilters({})} style={{ fontSize: 11, padding: "4px 10px", borderRadius: 99, border: "1px solid var(--danger)", background: "var(--fb)", color: "var(--ff)", cursor: "pointer", fontFamily: "var(--font-body)" }}>مسح الفلاتر ✕</button>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>{filtered.length} من {passengers.filter(p => isHajj(p)).length} حاج</div>
+
+        </div>
+        <div style={{ flex: 1, overflow: "auto" }}>
+          {viewMode === "list" ? (
+            <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 16, margin: "12px 14px", overflow: "hidden" }}>
+              {filtered.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "2.5rem 1rem", color: "var(--muted)", fontSize: 12.5 }}>
+                  {anyFilterActive ? (
+                    <>
+                      <div style={{ fontWeight: 800, color: "var(--ink)", marginBottom: 4 }}>لا توجد نتائج مطابقة</div>
+                      <div style={{ fontSize: 11, marginBottom: 10 }}>لا حاجّ يطابق البحث والفلاتر الحالية</div>
+                      <button onClick={clearAllFilters} style={{ padding: "6px 14px", borderRadius: 99, border: "1px solid var(--em7)", background: "var(--paper)", color: "var(--em7)", cursor: "pointer", fontFamily: "var(--font-body)", fontSize: 11, fontWeight: 800 }}>مسح البحث والفلاتر</button>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ fontWeight: 800, color: "var(--ink)", marginBottom: 4 }}>لا حجّاج في هذا الموسم بعد</div>
+                      <div style={{ fontSize: 11 }}>ابدأ بمسح جواز أو بالإضافة اليدوية</div>
+                    </>
+                  )}
+                </div>
+              ) : filtered.map((p, idx) => (
+                <div key={p.id}
+                  draggable
+                  onDragStart={() => handleDragStart(p.id)}
+                  onDragOver={e => handleDragOver(e, p.id)}
+                  onDrop={handleDrop}
+                  onDragEnd={handleDragEnd}
+                  onClick={() => openPilgrim(p)}
+                  style={{ display: "flex", alignItems: "center", gap: 11, padding: "11px 18px", borderBottom: "1px solid var(--line)", cursor: "grab", transition: "background .14s", background: draggingId === p.id ? "rgba(125,31,60,0.06)" : dragOverId === p.id ? "rgba(125,31,60,0.03)" : selected?.id === p.id ? "var(--ivory)" : "transparent", border: dragOverId === p.id ? "1px solid var(--em7)" : "none", opacity: draggingId === p.id ? 0.5 : 1 }}
+                  onMouseEnter={e => { if (selected?.id !== p.id && draggingId !== p.id) e.currentTarget.style.background = "var(--ivory)"; }}
+                  onMouseLeave={e => { if (selected?.id !== p.id && draggingId !== p.id) e.currentTarget.style.background = "transparent"; }}>
+                  {/* أيقونة السحب */}
+                  <span style={{ color: "var(--muted)", flexShrink: 0, cursor: "grab" }}>
+                    <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor"><circle cx="3" cy="2" r="1.2"/><circle cx="7" cy="2" r="1.2"/><circle cx="3" cy="7" r="1.2"/><circle cx="7" cy="7" r="1.2"/><circle cx="3" cy="12" r="1.2"/><circle cx="7" cy="12" r="1.2"/></svg>
+                  </span>
+                  {/* رقم تسلسلي قابل للتعديل */}
+                  {editingOrderId === p.id ? (
+                    <input
+                      autoFocus
+                      type="number"
+                      min={1}
+                      max={hajjCount}
+                      value={editingOrderVal}
+                      onChange={e => setEditingOrderVal(e.target.value === "" ? "" : String(clampPos(Number(e.target.value))))}
+                      onBlur={() => applyOrderChange(p, parseInt(editingOrderVal))}
+                      onKeyDown={e => { if (e.key === "Enter") applyOrderChange(p, parseInt(editingOrderVal)); if (e.key === "Escape") setEditingOrderId(null); e.stopPropagation(); }}
+                      onClick={e => e.stopPropagation()}
+                      style={{ width: 36, fontSize: 11, textAlign: "center", border: "1.5px solid var(--em7)", borderRadius: 6, padding: "2px 4px", outline: "none", flexShrink: 0 }}
+                    />
+                  ) : (
+                    <div onClick={e => { e.stopPropagation(); setEditingOrderId(p.id); setEditingOrderVal(String(passengers.filter(x => isHajj(x)).sort(byOrder("sort_order")).findIndex(x => x.id === p.id) + 1)); }} style={{ ...roOff, width: 28, height: 22, textAlign: "center", fontSize: 11, color: "var(--muted)", flexShrink: 0, borderRadius: 6, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+                      onMouseEnter={e => { e.currentTarget.style.background = "var(--ivory2)"; e.currentTarget.style.color = "var(--em7)"; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--muted)"; }}>
+                      {idx + 1}
+                    </div>
+                  )}
+                  {/* الأفاتار */}
+                  <div style={{ borderRadius: "50%", flexShrink: 0, border: selected?.id === p.id ? "2px solid var(--g5)" : "2px solid transparent", lineHeight: 0 }}>
+                    <Avatar name={p.name_ar} gender={p.gender} size={36} />
+                  </div>
+                  {/* الاسم والبيانات */}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--ink)", display: "flex", alignItems: "center", gap: 5 }}>
+                      {p.short_ar || p.name_ar}
+                      {(() => {
+                        /* الشارة تسمّي الوثيقة: «منتهي» وحدها كانت
+                           تُقرأ جوازاً دائماً وقد تكون البطاقة. */
+                        const n = expiryNotice(p);
+                        if (!n) return null;
+                        const exp = n.tone === "expired";
+                        return <span title={n.text} style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: exp ? "var(--danger-bg)" : "var(--warning-bg)", color: exp ? "var(--danger)" : "var(--warning)" }}>{n.text}</span>;
+                      })()}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 1 }}>{p.nat} · {p.passport}{p.phone ? ` · ${p.phone}` : ""}</div>
+                  </div>
+                  {/* الشيبس */}
+                  <div style={{ display: "flex", gap: 4, flexShrink: 0, flexWrap: "wrap", maxWidth: 200, justifyContent: "flex-end" }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: p.gender === "أنثى" ? "var(--fb)" : "var(--mb)", color: p.gender === "أنثى" ? "var(--ff)" : "var(--mf)" }}>{p.gender === "أنثى" ? "أنثى" : "ذكر"}</span>
+                    {p.services?.bus === "VIP" && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "rgba(200,162,75,.12)", color: "var(--g6)", border: "1px solid rgba(200,162,75,.25)" }}>VIP</span>}
+                    {p.services?.flight === "درجة أولى" && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "var(--info-bg)", color: "var(--info)" }}>أولى</span>}
+                    {p.family_id && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "rgba(125,31,60,.08)", color: "var(--em7)" }}>أسرة</span>}
+                    {(p as any).bus_id != null && metaBuses.find(b => b.id === (p as any).bus_id) && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 99, background: "var(--info-bg)", color: "var(--info)", fontWeight: 600 }}>باص {metaBuses.find(b => b.id === (p as any).bus_id)?.name}</span>}
+                    {(p as any).room_id != null && metaRooms.find(r => r.id === (p as any).room_id) && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 99, background: "var(--fb)", color: "var(--ff)", fontWeight: 600 }}>غ {metaRooms.find(r => r.id === (p as any).room_id)?.number}</span>}
+                    {(p as any).camp_mina_id != null && metaCamps.find(c => c.id === (p as any).camp_mina_id) && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 99, background: "var(--success-bg)", color: "var(--success)", fontWeight: 600 }}>منى {metaCamps.find(c => c.id === (p as any).camp_mina_id)?.name}</span>}
+                    {(p as any).camp_arafa_id != null && metaCamps.find(c => c.id === (p as any).camp_arafa_id) && <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 99, background: "var(--warning-bg)", color: "var(--warning)", fontWeight: 600 }}>عرفة {metaCamps.find(c => c.id === (p as any).camp_arafa_id)?.name}</span>}
+                  </div>
+                  {/* الأزرار */}
+                  <div style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+                    {/* ترتيب ↑↓ */}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                      <div onClick={e => { e.stopPropagation(); moveP_order(p, "up"); }} style={{ width: 22, height: 14, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "var(--muted)", transition: "var(--transition)" }}
+                        onMouseEnter={e => { e.currentTarget.style.background = "var(--ivory2)"; e.currentTarget.style.color = "var(--em7)"; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--muted)"; }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="18 15 12 9 6 15"/></svg>
+                      </div>
+                      <div onClick={e => { e.stopPropagation(); moveP_order(p, "down"); }} style={{ width: 22, height: 14, borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "var(--muted)", transition: "var(--transition)" }}
+                        onMouseEnter={e => { e.currentTarget.style.background = "var(--ivory2)"; e.currentTarget.style.color = "var(--em7)"; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--muted)"; }}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+                      </div>
+                    </div>
+                    <div onClick={e => { e.stopPropagation(); setEditing(p); }} style={{ ...roOff, width: 28, height: 28, borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "var(--muted)", transition: "var(--transition)" }}
+                      onMouseEnter={e => { e.currentTarget.style.background = "var(--ivory2)"; e.currentTarget.style.color = "var(--em7)"; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--muted)"; }}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                    </div>
+                    <div onClick={async e => { e.stopPropagation(); void requestDeleteP(p); }} style={{ ...roOff, width: 28, height: 28, borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "var(--muted)", transition: "var(--transition)" }}
+                      onMouseEnter={e => { e.currentTarget.style.background = "var(--fb)"; e.currentTarget.style.color = "var(--ff)"; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--muted)"; }}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <table style={{ borderCollapse: "separate", borderSpacing: 0, fontSize: 11, minWidth: "max-content", width: "100%", borderRadius: 14, overflow: "hidden" }}>
+              <thead style={{ position: "sticky", top: 0, zIndex: 2 }}>
+                <tr style={{ background: "linear-gradient(180deg, var(--primary), var(--primary-dark))", color: "var(--text-inverse)" }}>
+                  <th style={{ padding: "10px 10px", textAlign: "center", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap" }}>م</th>
+                  <th style={{ padding: "9px 10px", textAlign: "center", fontWeight: 800, fontSize: 11, width: 36 }}>حالة</th>
+                  {COLS.map(col => <th key={col.key} style={{ padding: "9px 12px", whiteSpace: "nowrap", textAlign: "right", fontSize: 11, fontWeight: 800 }}>{col.label}</th>)}
+                  <th style={{ padding: "10px 10px", textAlign: "center", fontWeight: 800, fontSize: 11 }}>إجراءات</th>
+                </tr>
+              </thead>
+              <tbody>
+                {/* الجدول كان يعرض جسماً فارغاً بلا كلمة: لا يعرف
+                    الموظّف أفلترٌ ضيّق أم موسمٌ خالٍ. */}
+                {filtered.length === 0 && (
+                  <tr><td colSpan={COLS.length + 3} style={{ padding: 0, border: "0.5px solid var(--border)" }}>
+                    <div style={{ textAlign: "center", padding: "2.5rem 1rem", color: "var(--muted)", fontSize: 12.5 }}>
+                      {anyFilterActive ? (
+                        <>
+                          <div style={{ fontWeight: 800, color: "var(--ink)", marginBottom: 4 }}>لا توجد نتائج مطابقة</div>
+                          <div style={{ fontSize: 11, marginBottom: 10 }}>لا حاجّ يطابق البحث والفلاتر الحالية</div>
+                          <button onClick={clearAllFilters} style={{ padding: "6px 14px", borderRadius: 99, border: "1px solid var(--em7)", background: "var(--paper)", color: "var(--em7)", cursor: "pointer", fontFamily: "var(--font-body)", fontSize: 11, fontWeight: 800 }}>مسح البحث والفلاتر</button>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ fontWeight: 800, color: "var(--ink)", marginBottom: 4 }}>لا حجّاج في هذا الموسم بعد</div>
+                          <div style={{ fontSize: 11 }}>ابدأ بمسح جواز أو بالإضافة اليدوية</div>
+                        </>
+                      )}
+                    </div>
+                  </td></tr>
+                )}
+                {filtered.map((p, i) => (
+                  <tr key={p.id}
+                    draggable
+                    onDragStart={e => { e.dataTransfer.setData("pid", String(p.id)); (e.currentTarget as HTMLTableRowElement).style.opacity = "0.4"; }}
+                    onDragEnd={e => { (e.currentTarget as HTMLTableRowElement).style.opacity = "1"; }}
+                    onDragOver={e => { e.preventDefault(); (e.currentTarget as HTMLTableRowElement).style.background = "var(--male-bg)"; }}
+                    onDragLeave={e => { (e.currentTarget as HTMLTableRowElement).style.background = ""; }}
+                    onDrop={async e => {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLTableRowElement).style.background = "";
+                      const fromId = Number(e.dataTransfer.getData("pid"));
+                      const toId = p.id;
+                      if (fromId === toId) return;
+                      await reorderHajj(ordered => moveWithin(ordered, fromId, ordered.findIndex(x => x.id === toId)));
+                    }}
+                    onClick={() => openPilgrim(p)}
+                    style={{ cursor: "grab", background: selected?.id === p.id ? "var(--success-bg)" : i % 2 === 0 ? "var(--paper)" : "var(--ivory)", borderBottom: "1px solid var(--line)", transition: "background .12s" }}
+                    onMouseEnter={e => { if (selected?.id !== p.id) (e.currentTarget as HTMLTableRowElement).style.background = "color-mix(in srgb, var(--accent) 8%, var(--paper))"; }}
+                    onMouseLeave={e => { if (selected?.id !== p.id) (e.currentTarget as HTMLTableRowElement).style.background = i % 2 === 0 ? "var(--paper)" : "var(--ivory)"; }}>
+                    <td style={{ padding: "6px 8px", border: "0.5px solid var(--border)", textAlign: "center", color: "var(--muted)", userSelect: "none" }}>
+                      {editingOrderId === p.id ? (
+                        <input
+                          autoFocus
+                          type="number"
+                          min={1}
+                          max={hajjCount}
+                          value={editingOrderVal}
+                          onChange={e => setEditingOrderVal(e.target.value === "" ? "" : String(clampPos(Number(e.target.value))))}
+                          onBlur={async () => {
+                            const newOrder = parseInt(editingOrderVal);
+                            if (!isNaN(newOrder) && newOrder > 0) await applyOrderChange(p, newOrder);
+                            setEditingOrderId(null);
+                            setEditingOrderVal("");
+                          }}
+                          onKeyDown={e => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); if (e.key === "Escape") { setEditingOrderId(null); setEditingOrderVal(""); } }}
+                          onClick={e => e.stopPropagation()}
+                          style={{ width: 36, textAlign: "center", border: "1px solid var(--em7)", borderRadius: 4, fontSize: 11, padding: "1px 2px", outline: "none", fontFamily: "var(--font-body)" }}
+                        />
+                      ) : (
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 3 }}>
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2" strokeLinecap="round" style={{ flexShrink: 0 }}>
+                            <circle cx="9" cy="5" r="1" fill="currentColor"/><circle cx="15" cy="5" r="1" fill="currentColor"/>
+                            <circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/>
+                            <circle cx="9" cy="19" r="1" fill="currentColor"/><circle cx="15" cy="19" r="1" fill="currentColor"/>
+                          </svg>
+                          <span
+                            style={{ fontSize: 10, cursor: "text", minWidth: 14 }}
+                            onDoubleClick={e => { e.stopPropagation(); setEditingOrderId(p.id); setEditingOrderVal(String(i + 1)); }}
+                            title="اضغط مرتين لتعديل الترتيب"
+                          >{i + 1}</span>
+                        </div>
+                      )}
+                    </td>
+                    {/* ══ مؤشر الحالة ══ */}
+                    {(() => {
+                      /* الشروط من `readiness` كغرفة العمليات — التسميةُ
+                         هنا مختصرةٌ لأنها تسكن في تلميحِ صفٍّ لا في قائمة. */
+                      const issues: string[] = [];
+                      if (hasIssue("expired_passport", p)) issues.push("جواز منتهي الصلاحية");
+                      if (hasIssue("expiring_passport", p)) issues.push("جواز يقترب من الانتهاء");
+                      if (hasIssue("missing_photo", p)) issues.push("بدون صورة شخصية");
+                      if (hasIssue("missing_passport", p)) issues.push("جواز لم يُرفع");
+                      if (hasIssue("missing_phone", p)) issues.push("بدون رقم هاتف");
+
+                      const color = hasIssue("expired_passport", p) ? "#DC2626" :
+                                    hasIssue("expiring_passport", p) ? "#D97706" :
+                                    issues.length > 0 ? "#EAB308" : "#22C55E";
+                      const title = issues.length > 0 ? issues.join(" · ") : "جاهز";
+
+                      return (
+                        <td style={{ padding: "5px 8px", border: "0.5px solid var(--line)", textAlign: "center", width: 36 }}>
+                          <div
+                            title={title}
+                            onClick={e => { e.stopPropagation(); openPilgrim(p); }}
+                            style={{ width: 12, height: 12, borderRadius: "50%", background: color, margin: "0 auto", cursor: "pointer", boxShadow: `0 0 0 2px ${color}30`, transition: "transform .15s" }}
+                            onMouseEnter={e => (e.currentTarget as HTMLDivElement).style.transform = "scale(1.3)"}
+                            onMouseLeave={e => (e.currentTarget as HTMLDivElement).style.transform = "scale(1)"}
+                          />
+                        </td>
+                      );
+                    })()}
+                    {COLS.map(col => (
+                      <td key={col.key} style={{ padding: "7px 12px", borderBottom: "1px solid var(--line)", borderLeft: "0.5px solid var(--line)", whiteSpace: "nowrap", fontSize: 12, color: col.key === "name_ar" ? "var(--primary)" : "var(--ink)", fontWeight: col.key === "name_ar" ? 900 : 700 }}>
+                        {/* باجات ملونة للباص والطيران */}
+                        {(col.key === "bus" || col.key === "flight") ? (() => {
+                          const val = getVal(p, col.key, col.get);
+                          if (!val) return <span style={{ color: "var(--muted)", fontSize: 11 }}>—</span>;
+                          const isVIP = val === "VIP";
+                          const isFirst = val === "درجة أولى";
+                          const bg = isVIP ? "var(--warning-bg)" : isFirst ? "var(--male-bg)" : "var(--bg-2)";
+                          const color = isVIP ? "var(--warning)" : isFirst ? "var(--info)" : "var(--muted)";
+                          return <span style={{ display: "inline-block", padding: "2px 8px", borderRadius: 99, fontSize: 10, fontWeight: 600, background: bg, color }}>{val}</span>;
+                        })() : col.key === "expiry" ? (() => {
+                          const val = getVal(p, col.key, col.get);
+                          if (!val) return <span style={{ color: "var(--muted)" }}>—</span>;
+                          const color = isExpired(val) ? "var(--danger)" : isExpiringSoon(val) ? "var(--warning)" : "var(--success)";
+                          return <span style={{ color, fontWeight: 600 }}>{val}</span>;
+                        })() : getVal(p, col.key, col.get)}
+                        {(() => {
+                          const alloc = allocationOf(p, col.key);
+                          return alloc
+                            ? <div style={{ fontSize: 9.5, color: "var(--muted)", fontWeight: 700, marginTop: 1 }}>{alloc}</div>
+                            : null;
+                        })()}
+                        {col.key === "name_ar" && p.name_en && (
+                          <div style={{ fontSize: 10, color: "var(--muted)", fontWeight: 400, marginTop: 1, direction: "ltr", textAlign: "right" }}>{p.short_en || p.name_en}</div>
+                        )}
+                        {col.key === "name_ar" && (() => {
+                          /* الأيقونة نفسها، لكن `title` يقول أيّ وثيقة */
+                          const n = expiryNotice(p);
+                          if (!n) return null;
+                          return n.tone === "expired"
+                            ? <span title={n.text} style={{ marginRight: 4, color: "var(--danger)" }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span>
+                            : <span title={n.text} style={{ marginRight: 4, color: "var(--warning)" }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>;
+                        })()}
+                      </td>
+                    ))}
+                    <td style={{ padding: "5px 10px", borderBottom: "1px solid var(--line)", borderLeft: "0.5px solid var(--line)", textAlign: "center" }}>
+                      <div style={{ display: "flex", gap: 5, justifyContent: "center" }}>
+                        <button disabled={readOnly} onClick={e => { e.stopPropagation(); setEditing(p); }} title="تعديل"
+                          style={{ ...roOff, width: 30, height: 30, borderRadius: 9, border: "none", background: "#BBDEFB", cursor: "pointer", color: "#0D47A1", display: "flex", alignItems: "center", justifyContent: "center", transition: "all .15s" }}
+                          onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "#0D47A1"; b.style.color = "#fff"; b.style.transform = "scale(1.08)"; }}
+                          onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "#BBDEFB"; b.style.color = "#0D47A1"; b.style.transform = "scale(1)"; }}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                            <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                          </svg>
+                        </button>
+                        <button onClick={async e => { e.stopPropagation(); void requestDeleteP(p); }} title="حذف"
+                          style={{ ...roOff, width: 30, height: 30, borderRadius: 9, border: "none", background: "#FFCDD2", cursor: "pointer", color: "#B71C1C", display: "flex", alignItems: "center", justifyContent: "center", transition: "all .15s" }}
+                          onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "#B71C1C"; b.style.color = "#fff"; b.style.transform = "scale(1.08)"; }}
+                          onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.background = "#FFCDD2"; b.style.color = "#B71C1C"; b.style.transform = "scale(1)"; }}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+        </div>
+
+        {/* ══ مركز العمليات — جانبي بالطول ══ */}
+        {(() => {
+          const hajj = passengers.filter(p => isHajj(p));
+          /* العدُّ من `hasIssue` — وهي نفسها التي يفلتر بها
+             `opsFilter`. فما تقوله الشارة هو ما تفتح عليه. */
+          const rows = (Object.keys(ISSUE_UI) as IssueKey[])
+            .map(issue => ({ key: issue as Exclude<OpsFilter, null>, ui: ISSUE_UI[issue], count: hajj.filter(p => hasIssue(issue, p)).length }))
+            .filter(r => r.count > 0);
+          if (dupPhoneIds.size > 0) {
+            rows.push({ key: "dup_phones", ui: { ...DUP_PHONES_UI, resolve: { kind: "profile", profileTab: "data" } }, count: dupPhoneIds.size });
+          }
+          const byTab = (t: "reg" | "dist" | "travel") => rows.filter(r => r.ui.tab === t);
+          const items = byTab(opsTab);
+          const SEVERITY = {
+            critical: { color: "var(--danger)",  bg: "var(--danger-bg)" },
+            warning:  { color: "var(--warning)", bg: "var(--warning-bg)" },
+            normal:   { color: "var(--primary)", bg: "var(--ivory2)" },
+          };
+
+          return (
+            <div style={{ width: selected ? 0 : 280, flexShrink: 0, display: "flex", flexDirection: "column", background: "var(--paper)", overflow: "hidden", transition: "width .2s ease", position: "sticky", top: 0, height: "100vh", order: -1, borderLeft: "1px solid var(--line)" }}>
+              {/* هيدر */}
+              <div style={{ background: "linear-gradient(135deg, var(--primary), var(--primary-light))", padding: "12px 14px", flexShrink: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: rows.length > 0 ? "#fca5a5" : "#86efac", animation: "blink 2s infinite" }} />
+                  <span style={{ fontSize: 13, fontWeight: 900, color: "var(--text-inverse)", flex: 1 }}>غرفة العمليات</span>
+                </div>
+                {/* الجملة تصف التبويب المعروض وحده. كانت تجمع كل
+                    التبويبات فتَعِد بعملٍ لا يراه الموظّف أمامه. */}
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,.65)", marginBottom: 8 }}>
+                  {items.length > 0 ? `${itemsLabel(items.length)} في هذا التبويب` : "لا مهام في هذا التبويب ✓"}
+                </div>
+                <div style={{ display: "flex", gap: 4 }}>
+                  {([["reg", "التسجيل"], ["dist", "التوزيع"], ["travel", "السفر"]] as const).map(([tab, label]) => {
+                    const on = opsTab === tab;
+                    const n = byTab(tab).length;
+                    /* نقطةٌ ذهبية على تبويب المرحلة الجارية — توجيهٌ
+                       لا حجب: التبويبات الثلاثة تبقى مفتوحة. */
+                    const isPhase = tab === phaseTab;
+                    return (
+                      <button key={tab} onClick={() => { setOpsTabPick(tab); setOpsFilter(null); }}
+                        title={isPhase ? "مرحلة الموسم الحالية" : undefined}
+                        style={{ flex: 1, padding: "5px 0", borderRadius: 7, border: `1px solid ${on ? "transparent" : "rgba(255,255,255,.2)"}`, background: on ? "rgba(255,255,255,.9)" : "transparent", color: on ? "var(--primary)" : "rgba(255,255,255,.7)", fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "var(--font-body)", transition: "all .15s", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                        {isPhase && <span style={{ width: 5, height: 5, borderRadius: "50%", background: on ? "var(--accent-dark)" : "var(--accent)", flexShrink: 0 }} />}
+                        {label}
+                        {n > 0 && <span style={{ fontSize: 9, fontWeight: 900, opacity: on ? .75 : .6 }}>{n}</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {/* القائمة */}
+              <div style={{ flex: 1, overflowY: "auto", padding: 8 }}>
+                {items.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: "24px 16px", color: "var(--muted)", fontSize: 11 }}>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--success)" strokeWidth="1.5" strokeLinecap="round" style={{ marginBottom: 8 }}><polyline points="20 6 9 17 4 12"/></svg>
+                    <div>لا توجد مهام في هذا التبويب</div>
+                  </div>
+                ) : items.map(item => {
+                  const cfg = SEVERITY[item.ui.severity];
+                  const on = opsFilter === item.key;
+                  const page = item.ui.resolve.kind === "page" ? item.ui.resolve : null;
+                  /* لا نُرسل الموظّف إلى صفحةٍ لا يملكها */
+                  const mayGo = page ? !!currentUser?.permissions?.[page.perm] : false;
+                  return (
+                    <div key={item.key}
+                      style={{ borderRadius: 9, marginBottom: 3, border: `1px solid ${on ? cfg.color + "40" : "transparent"}`, background: on ? cfg.bg : "transparent", transition: "all .15s" }}>
+                      <div onClick={() => setOpsFilter(on ? null : item.key)}
+                        style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 9, cursor: "pointer" }}
+                        onMouseEnter={e => { if (!on) (e.currentTarget.parentElement as HTMLDivElement).style.background = "var(--ivory)"; }}
+                        onMouseLeave={e => { if (!on) (e.currentTarget.parentElement as HTMLDivElement).style.background = "transparent"; }}>
+                        <div style={{ width: 28, height: 28, borderRadius: 8, background: cfg.bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={cfg.color} strokeWidth="1.8" strokeLinecap="round" dangerouslySetInnerHTML={{ __html: item.ui.icon }} />
+                        </div>
+                        {/* العنوان والعدد وحدهما: «لم يتم التوزيع بعد»
+                            تحت «حجاج بدون باص» تكرارٌ يطيل الكارت. */}
+                        <div style={{ flex: 1, minWidth: 0, fontSize: 11, fontWeight: 700, color: "var(--ink)", lineHeight: 1.3 }}>{item.ui.label}</div>
+                        <div style={{ fontSize: 16, fontWeight: 900, color: cfg.color, flexShrink: 0, lineHeight: 1 }}>{item.count}</div>
+                      </div>
+                      {/* التوزيعات لا تُحَلّ في ملفّ الحاجّ: زرٌّ صريح
+                          إلى مكان الحلّ، يظهر عند اختيار البند. */}
+                      {/* مملوءٌ لا مفرَّغ: الحدُّ الشفيف على أرضيّة البند
+                          المختار كان يذوب فيها فلا يُقرأ زرّاً. واللون
+                          لونُ البند نفسه فلا يزاحمه. */}
+                      {on && page && (
+                        <button
+                          onClick={() => { if (mayGo) window.dispatchEvent(new CustomEvent("hajj_goto_page", { detail: page.page })); }}
+                          disabled={!mayGo}
+                          title={mayGo ? undefined : "لا تملك صلاحية هذه الصفحة"}
+                          onMouseEnter={e => { if (mayGo) e.currentTarget.style.filter = "brightness(1.12)"; }}
+                          onMouseLeave={e => { e.currentTarget.style.filter = "none"; }}
+                          style={{
+                            width: "calc(100% - 20px)", margin: "0 10px 8px", padding: "7px 10px",
+                            borderRadius: 8, border: "none",
+                            background: mayGo ? cfg.color : "var(--ivory2)",
+                            color: mayGo ? "var(--text-inverse)" : "var(--muted)",
+                            boxShadow: mayGo ? "0 1px 3px rgba(0,0,0,.18)" : "none",
+                            cursor: mayGo ? "pointer" : "not-allowed",
+                            fontFamily: "var(--font-body)", fontSize: 10.5, fontWeight: 900,
+                            display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                            transition: "filter .14s",
+                          }}>
+                          {page.action}
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                            <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {/* فوتر */}
+              {opsFilter && (
+                <div style={{ padding: "8px 14px", borderTop: "1px solid var(--line)", flexShrink: 0 }}>
+                  <button onClick={() => setOpsFilter(null)} style={{ width: "100%", padding: "6px", borderRadius: 8, border: "1px solid var(--line)", background: "var(--ivory)", cursor: "pointer", fontFamily: "var(--font-body)", fontSize: 10, fontWeight: 700, color: "var(--muted)" }}>إلغاء الفلتر وعرض الكل</button>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+      {selected && !editing && (
+        <div style={{ width: 280, overflowY: "auto", padding: 12, flexShrink: 0, position: "sticky", top: 0, height: "100vh", order: -1, borderLeft: "1px solid var(--line)", background: "var(--paper)" }}>
+          {/* ═══ شريط طابور العمل ═══
+              غرفة العمليات تنطوي عند فتح الملفّ (والمساحة مقصودة)،
+              فيبقى من المهمّة سطرٌ واحد: أيّ بندٍ نعالج، وأين نحن
+              منه، وكيف ننتقل. والعضوية **حيّة**: `filtered` تُشتقّ
+              من حالة الحجّاج بمسند `readiness` نفسه، فمن رُفعت صورته
+              يخرج من الطابور فوراً بلا لقطةٍ محفوظة ولا جدول. */}
+          {queueIssue && (() => {
+            const queue = filtered;
+            const idx = queue.findIndex(x => x.id === selected.id);
+            const order = byOrder("sort_order");
+            /* حين يخرج الحاجّ الحاليّ من الطابور (حُلّ نقصه) يبقى
+               ملفّه مفتوحاً — لا يُنتزع من تحت يد الموظّف — و«التالي»
+               يقصد أوّل من يليه في ترتيب القائمة بين الباقين. */
+            const nextP = idx >= 0 ? queue[idx + 1] : queue.find(x => order(x, selected) > 0);
+            const prevList = idx >= 0 ? queue.slice(0, idx) : queue.filter(x => order(x, selected) < 0);
+            const prevP = prevList[prevList.length - 1];
+            const stillHas = queueIssue === "dup_phones" ? dupPhoneIds.has(selected.id) : hasIssue(queueIssue, selected);
+            const btn = (on: boolean) => ({
+              padding: "3px 9px", borderRadius: 7, border: "1px solid var(--line)",
+              background: on ? "var(--paper)" : "transparent", color: on ? "var(--primary)" : "var(--muted)",
+              cursor: on ? "pointer" : "not-allowed", opacity: on ? 1 : .45,
+              fontFamily: "var(--font-body)", fontSize: 10, fontWeight: 800,
+            });
+            return (
+              <div style={{ margin: "-12px -12px 10px", padding: "7px 12px", background: "var(--ivory)", borderBottom: "1px solid var(--line)", display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 10, fontWeight: 800, color: "var(--ink)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{opsFilterLabel(queueIssue)}</span>
+                {/* «تم» تُقال حين يُحَلّ النقص فعلاً. أما الخروج من
+                    القائمة ببحثٍ أو فلترٍ آخر فليس حلّاً — ولا يُقال
+                    عنه إنه تمّ. */}
+                <span style={{ fontSize: 10, fontWeight: 800, color: idx >= 0 ? "var(--muted)" : stillHas ? "var(--warning)" : "var(--success)", whiteSpace: "nowrap" }}>
+                  {idx >= 0 ? `${idx + 1} من ${queue.length}` : stillHas ? `خارج الفلتر · بقي ${queue.length}` : `✔ تم · بقي ${queue.length}`}
+                </span>
+                <button disabled={!prevP} onClick={() => prevP && openPilgrim(prevP)} style={btn(!!prevP)}>السابق</button>
+                <button disabled={!nextP} onClick={() => nextP && openPilgrim(nextP)} style={btn(!!nextP)}>التالي</button>
+                <button onClick={() => { setOpsFilter(null); setSelected(null); }} style={{ ...btn(true), border: "1px solid var(--em7)", color: "var(--em7)" }}>إنهاء</button>
+              </div>
+            );
+          })()}
+          {(() => {
+            const docsArr = [(selected as any).photo_url, (selected as any).passport_url, (selected as any).national_id_url, (selected as any).contract_url, (selected as any).flight_ticket_url, (selected as any).hajj_permit_url];
+            const docsDone = docsArr.filter(Boolean).length;
+            const docsPct = Math.round(docsDone / docsArr.length * 100);
+            return (
+              <div style={{ margin: "-12px -12px 10px", background: "linear-gradient(160deg, #3D0F1E 0%, #7D1F3C 60%, #9A2F4E 100%)", padding: "16px 14px 0", color: "var(--text-inverse)", position: "relative" }}>
+                <button onClick={() => setSelected(null)} style={{ position: "absolute", top: 10, left: 10, width: 26, height: 26, borderRadius: 8, background: "rgba(255,255,255,.12)", border: "none", cursor: "pointer", color: "var(--text-inverse)", fontSize: 14 }}>✕</button>
+                <div onClick={() => setSelected(null)} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,.65)", marginBottom: 7, cursor: "pointer" }}>
+                  <span>غرفة العمليات</span>
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+                  <span style={{ color: "#F3D98B" }}>ملف الحاج</span>
+                </div>
+                <div style={{ fontSize: 17, fontWeight: 900, lineHeight: 1.35, paddingLeft: 30, fontFamily: "Cairo, sans-serif" }}>{selected.name_ar}</div>
+                <div style={{ fontSize: 9.5, opacity: .55, letterSpacing: ".05em", marginTop: 2 }}>{selected.name_en}</div>
+                <div style={{ display: "flex", gap: 5, marginTop: 9, flexWrap: "wrap" }}>
+                  {selected.nat && <span style={{ fontSize: 9.5, fontWeight: 800, padding: "3px 10px", borderRadius: 99, background: "rgba(212,160,23,.28)", border: "1px solid rgba(212,160,23,.5)", color: "#F3D98B" }}>{selected.nat}</span>}
+                  {selected.gender && <span style={{ fontSize: 9.5, fontWeight: 800, padding: "3px 10px", borderRadius: 99, background: "rgba(255,255,255,.13)", border: "1px solid rgba(255,255,255,.2)" }}>{selected.gender}</span>}
+                  {selected.passport && <span style={{ fontSize: 9.5, fontWeight: 800, padding: "3px 10px", borderRadius: 99, background: "rgba(255,255,255,.13)", border: "1px solid rgba(255,255,255,.2)" }}>جواز {selected.passport}</span>}
+                </div>
+                <div style={{ background: "rgba(0,0,0,.3)", margin: "9px -14px 0", padding: "8px 14px 10px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 800, marginBottom: 5 }}>
+                    {/* كان يقول «اكتمال الملف ٦٧٪» وهو يعدّ المرفوعات
+                        وحدها — ومنها التذكرة والتصريح، وهما وثيقتا
+                        مرحلةٍ متأخّرة. فحاجٌّ مكتمل التسجيل يُقرأ
+                        نصفَ ملفّ. الجاهزية التشغيلية لها مكانها:
+                        الداشبورد وغرفة العمليات. هنا تغطيةُ مستندات
+                        تقول اسمها وعددها. */}
+                    <span style={{ color: "rgba(255,255,255,.8)" }}>المستندات</span>
+                    <span style={{ color: "#F3D98B" }} dir="ltr">{docsDone} / {docsArr.length}</span>
+                  </div>
+                  <div style={{ height: 6, background: "rgba(255,255,255,.15)", borderRadius: 99, overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${docsPct}%`, borderRadius: 99, background: "linear-gradient(to left, #F3D98B, #D4A017)" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", margin: "0 -14px", background: "rgba(0,0,0,.18)" }}>
+                  {([["data", "البيانات"], ["svc", "الخدمات"], ["docs", "المستندات"], ["family", "الأقارب"]] as const).map(([t, l]) => (
+                    <button key={t} onClick={() => setProfileTab(t)} style={{ flex: 1, padding: "9px 2px", border: "none", cursor: "pointer", fontSize: 10.5, fontWeight: 800, fontFamily: "var(--font-body)", background: profileTab === t ? "var(--paper)" : "transparent", color: profileTab === t ? "var(--primary)" : "rgba(255,255,255,.75)", borderRadius: profileTab === t ? "8px 8px 0 0" : 0 }}>{l}</button>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+          {(() => {
+            /* لافتةٌ واحدة تسمّي الوثيقة المنتهية بعينها، وتجمعهما
+               حين ينتهيان معاً بدل لافتتين. */
+            const n = expiryNotice(selected);
+            if (!n) return null;
+            const exp = n.tone === "expired";
+            return (
+              <div style={{ background: exp ? "var(--female-bg)" : "var(--warning-bg)", border: `1.5px solid ${exp ? "#c0392b" : "var(--warning)"}`, borderRadius: 8, padding: "8px 10px", marginBottom: 10, fontSize: 11, color: exp ? "var(--danger)" : "var(--warning)", fontWeight: 700, textAlign: "center" }}>
+                {exp
+                  ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                  : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>}
+                {" "}{n.text}
+              </div>
+            );
+          })()}
+          {profileTab === "data" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }}>
+              {/* كان الفارغ يُحذف من الشبكة، فلا يفرّق الموظّف بين
+                  «لا هاتف له» و«الحقل غير معروض» — وغرفة العمليات
+                  تسوقه إلى هنا تحديداً ليملأ هاتفاً لا يراه. الحقول
+                  الأساسية تظهر دائماً، والفارغ يقول إنه فارغ. */}
+              {([
+                ["الجواز", selected.passport, false],
+                ["انتهاء الجواز", selected.expiry, hasIssue("expired_passport", selected)],
+                ["البطاقة", selected.national_id, false],
+                ["انتهاء البطاقة", (selected as any).id_expiry, hasIssue("expired_id", selected)],
+                ["الجنسية", selected.nat, false],
+                ["الجنس", selected.gender, false],
+                ["الميلاد", selected.dob, false],
+                ["التليفون", selected.phone, false],
+              ] as [string, string | undefined, boolean][]).map(([lbl, val, isDanger]) => {
+                const empty = val === undefined || val === null || String(val).trim() === "";
+                return (
+                  <div key={lbl} style={{ background: isDanger ? "#FFEBEE" : "var(--ivory)", border: isDanger ? "1.5px solid #FFCDD2" : "1px solid var(--line)", borderRadius: 10, padding: "8px 11px", gridColumn: lbl === "التليفون" ? "span 2" : undefined }}>
+                    <div style={{ fontSize: 9.5, color: isDanger ? "#B71C1C" : "var(--muted)", fontWeight: 800, marginBottom: 2 }}>{lbl}</div>
+                    <div style={{ fontSize: 12.5, fontWeight: empty ? 700 : 900, color: empty ? "var(--muted)" : isDanger ? "#B71C1C" : "var(--ink)", fontStyle: empty ? "italic" : undefined }}
+                      dir={lbl === "التليفون" && !empty ? "ltr" : undefined}>
+                      {empty ? "غير مُدخل" : val}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {profileTab === "svc" && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+            {/* قيمة الإسناد من `allocationOf` نفسها التي يعرضها
+                الجدول — بتصنيف الكيان المُسنَد، لا بتصنيف ما طُلب.
+                وبطاقتا الطيران تُبقيان على اتّجاهيهما المنفصلين. */}
+            {([
+              ["الباص",   selected.services?.bus,       selected.bus_id != null ? (allocationOf(selected, "bus") || `باص #${selected.bus_id}`) : null, "#E3F2FD", "#1.5px solid #90CAF9", "#0D47A1", "#1565C0", false],
+              ["الفندق",  `${selected.services?.hotel_type || ""} ${selected.services?.hotel_view || ""}`.trim(), selected.room_id != null ? (allocationOf(selected, "hotel_type") || `غرفة #${selected.room_id}`) : null, "#FFF8E1", "1.5px solid #FFD54F", "#8B6700", "#B8880F", false],
+              ["منى",     selected.services?.camp_mina, selected.camp_mina_id != null ? (allocationOf(selected, "camp_mina") || `خيمة #${selected.camp_mina_id}`) : null, "#E8F5E9", "1.5px solid #A5D6A7", "#1B5E20", "#2E7D32", false],
+              ["عرفة",    selected.services?.camp_arafa,selected.camp_arafa_id != null ? (allocationOf(selected, "camp_arafa") || `خيمة #${selected.camp_arafa_id}`) : null, "#F3E5F5", "1.5px solid #CE93D8", "#6A1B9A", "#7B1FA2", false],
+              ["طيران الذهاب", selected.services?.flight,    (selected as any).flight_id != null ? (metaFlights.find((f: any) => f.id === (selected as any).flight_id)?.name || `رحلة #${(selected as any).flight_id}`) : null, "linear-gradient(135deg,#1a1a2e,#2d1b4e)", "1.5px solid #4a3575", "#fff", "#c4a8ff", false],
+              ["طيران العودة", selected.services?.flight,    (selected as any).return_flight_id != null ? (metaFlights.find((f: any) => f.id === (selected as any).return_flight_id)?.name || `رحلة #${(selected as any).return_flight_id}`) : null, "linear-gradient(135deg,#1a1a2e,#2d1b4e)", "1.5px solid #4a3575", "#fff", "#c4a8ff", false],
+            ] as [string, string | undefined, string | null, string, string, string, string, boolean][]).map(([lbl, cls, assign, bg, border, valColor, lblColor, full]) => {
+              /* بطاقتا الطيران تشتركان في مفتاح الخدمة نفسه */
+              const svcKey: ServiceKey | null =
+                lbl === "الباص" ? "bus" : lbl === "الفندق" ? "hotel_type" :
+                lbl === "منى" ? "camp_mina" : lbl === "عرفة" ? "camp_arafa" :
+                lbl.startsWith("طيران") ? "flight" : null;
+              const optedOut = svcKey ? !wantsService(selected, svcKey) : false;
+              /* «معلَّق» = طلبها ولم تُسنَد. لا تُقاس بـ`isMissingService`
+                 هنا لأن بطاقة العودة تسأل عن `return_flight_id`،
+                 وتلك تسأل عن الذهاب — والشرط المشترك هو الاستثناء
+                 وحده، وهو `wantsService`. */
+              const pending = !optedOut && !assign;
+              const dest = svcKey ? SERVICE_DEST[svcKey] : null;
+              /* الصلاحية نفسها التي تحرس زرّ غرفة العمليات */
+              const mayGo = dest ? !!currentUser?.permissions?.[dest.perm] : false;
+              return (
+              <div key={lbl} style={{ background: bg, border, borderRadius: 12, padding: "11px 12px", gridColumn: full ? "span 2" : undefined }}>
+                <div style={{ fontSize: 9.5, fontWeight: 800, color: lblColor, marginBottom: 4 }}>{lbl}{cls ? ` · ${cls}` : ""}</div>
+                {/* «بانتظار التوزيع» كانت تُكتب حمراءَ لكل خانةٍ خالية
+                    — حتى لمن اعتذر عن الطيران، وهو وحده ما يجوز
+                    الاعتذار عنه. الحكم من `isMissingService` نفسها
+                    التي تعدّ بها غرفة العمليات، فلا يشكو الملفّ ممّا
+                    لا تشكو منه، ولا العكس. */}
+                {(() => {
+                  const text = assign || (optedOut ? "لم يطلب هذه الخدمة" : "لم يُوزع بعد");
+                  /* المعتذر عن الطيران ليس أمامه عملٌ يُقصد، فلا سهم له */
+                  const canGo = !!dest && !optedOut;
+                  const style = { fontSize: 14, fontWeight: 900, color: valColor, lineHeight: 1.2 } as const;
+                  if (!canGo) return <div style={style}>{text}</div>;
+                  return (
+                    <div
+                      onClick={() => { if (mayGo) window.dispatchEvent(new CustomEvent("hajj_goto_page", { detail: dest!.page })); }}
+                      title={mayGo ? `الانتقال إلى ${dest!.label}` : "لا تملك صلاحية هذه الصفحة"}
+                      style={{ ...style, display: "inline-flex", alignItems: "center", gap: 5, cursor: mayGo ? "pointer" : "not-allowed", opacity: mayGo ? 1 : .55, borderBottom: `1px dashed ${valColor}`, paddingBottom: 1, transition: "opacity .14s" }}
+                      onMouseEnter={e => { if (mayGo) e.currentTarget.style.opacity = ".72"; }}
+                      onMouseLeave={e => { e.currentTarget.style.opacity = mayGo ? "1" : ".55"; }}>
+                      {text}
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                        <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+                      </svg>
+                    </div>
+                  );
+                })()}
+                {!assign && !optedOut && pending && <div style={{ fontSize: 9.5, fontWeight: 800, color: "#B71C1C", marginTop: 3 }}>بانتظار التوزيع</div>}
+              </div>
+              );
+            })}
+          </div>
+          )}
+          {profileTab === "docs" && (
+          <div style={{ marginBottom: 10 }}>
+            {([
+              ["صورة شخصية", (selected as any).photo_url, "photo_url", "photo", "image/*"],
+              ["جواز السفر", (selected as any).passport_url, "passport_url", "passport_doc", "image/*"],
+              ["البطاقة", (selected as any).national_id_url, "national_id_url", "idcard", "image/*"],
+              ["العقد", (selected as any).contract_url, "contract_url", "contract", "image/*,application/pdf"],
+              ["تذكرة الطيران", (selected as any).flight_ticket_url, "flight_ticket_url", "flight_ticket", "image/*,application/pdf"],
+              ["تصريح الحاج", (selected as any).hajj_permit_url, "hajj_permit_url", "hajj_permit", "image/*,application/pdf"],
+            ] as [string, string, string, string, string][]).map(([label, url, field, docType, accept]) => (
+              <div key={label} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", borderRadius: 9, border: "1px solid var(--line)", marginBottom: 6 }}>
+                <div style={{ width: 24, height: 24, borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, background: url ? "var(--success-bg)" : "var(--danger-bg)" }}>
+                  {url ? (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--success)" strokeWidth="3" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                  ) : (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" strokeWidth="3" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                  )}
+                </div>
+                <span style={{ flex: 1, fontSize: 11, fontWeight: 800, color: url ? "var(--ink)" : "var(--muted)" }}>{label}</span>
+                {docUploading === docType ? (
+                  <span style={{ fontSize: 9.5, color: "var(--muted)" }}>جاري الرفع...</span>
+                ) : url ? (
+                  <div style={{ display: "flex", gap: 3 }}>
+                    <button onClick={() => setDocViewer({ url, label })} style={{ background: "var(--male-bg)", border: "none", padding: "3px 7px", borderRadius: 6, fontSize: 9.5, cursor: "pointer", color: "var(--info)", fontWeight: 800 }}>عرض</button>
+                    <button onClick={() => downloadFile(url)} style={{ background: "var(--success-bg)", border: "none", padding: "3px 7px", borderRadius: 6, fontSize: 9.5, cursor: "pointer", color: "var(--primary-dark)" }}><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>
+                    <button disabled={readOnly} onClick={() => handleDocDelete(selected, field, url)} style={{ ...roOff, background: "var(--female-bg)", border: "none", padding: "3px 7px", borderRadius: 6, fontSize: 9.5, cursor: "pointer", color: "var(--danger)" }}><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg></button>
+                  </div>
+                ) : (
+                  <>
+                    <input id={`upload-${docType}`} disabled={readOnly} type="file" accept={accept} style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; if (f) handleDocUpload(selected, docType, field, f); e.currentTarget.value = ""; }} />
+                    <button onClick={() => document.getElementById(`upload-${docType}`)?.click()} style={{ background: "var(--danger-bg)", border: "none", padding: "3px 9px", borderRadius: 6, fontSize: 9.5, cursor: "pointer", color: "var(--danger)", fontWeight: 800 }}>رفع</button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+          )}
+          {/* الأقارب */}
+          {profileTab === "family" && (
+          <div style={{ border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: 500 }}>الأقارب</div>
+              <button disabled={readOnly} onClick={() => { setShowLinkFamily(true); setLinkSearch(""); }} style={{ ...roOff, background: "var(--success-bg)", border: "none", padding: "2px 8px", borderRadius: 6, fontSize: 10, cursor: "pointer", color: "var(--primary-dark)" }}>+ ربط</button>
+            </div>
+            {getFamilyMembers(selected).length === 0 ? (
+              <div style={{ fontSize: 10, color: "var(--text-muted)" }}>لا يوجد أقارب مرتبطين</div>
+            ) : (
+              getFamilyMembers(selected).map(fm => (
+                <div key={fm.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 10, border: "1px solid var(--line)", marginBottom: 6 }}>
+                  <div onClick={() => openPilgrim(fm)} style={{ flex: 1, cursor: "pointer", minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: "var(--ink)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fm.short_ar || fm.name_ar}</div>
+                    <div style={{ fontSize: 10, color: "var(--muted)", fontWeight: 600, marginTop: 1 }}>{fm.gender}</div>
+                  </div>
+                  <button disabled={readOnly} onClick={() => handleUnlinkFamily(fm)} title="فك الارتباط" style={{ ...roOff, background: "#FFEBEE", border: "none", cursor: "pointer", color: "#B71C1C", width: 26, height: 26, borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+          )}
+
+          {(selected.created_by || selected.updated_by) && (
+            <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 10, padding: "0 2px", lineHeight: 1.6 }}>
+              {selected.created_by && <div>أُضيف بواسطة: {selected.created_by}{selected.created_at && ` · ${timeAgo(selected.created_at)}`}</div>}
+              {selected.updated_by && <div>آخر تعديل: {selected.updated_by}{selected.updated_at && ` · ${timeAgo(selected.updated_at)}`}</div>}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 6 }}>
+            <button disabled={readOnly} onClick={() => setEditing(selected)} style={{ ...btnP({ background: "var(--male-bg)", color: "var(--info)" }), ...roOff, flex: 1 }}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> تعديل</button>
+            <button onClick={async () => { void requestDeleteP(selected); }} style={{ ...roOff, background: "var(--female-bg)", border: "none", padding: "7px 12px", borderRadius: 8, fontSize: 11, cursor: "pointer", color: "var(--danger)" }}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg></button>
+          </div>
+          <button onClick={() => {
+            /* طباعة الاستيكرات الـ3 عبر الدالة الموحّدة المشتركة مع صفحة التقارير */
+            printInPage(buildStickersHTML(
+              [selected as any],
+              { color_primary: reportBranding.primaryColor, color_accent: reportBranding.accentColor, name_ar: reportBranding.companyName,
+                /* الموسمُ المعروض — لا الحملة. فاستيكرُ موسمٍ مؤرشفٍ يحمل اسمَه وفندقَه هو. */
+                season_name: viewedSeason.name, hotel_name: viewedSeason.hotel_name || "", hotel_address: viewedSeason.hotel_address || "",
+                admin_phone: companyPortal.supportPhone, logo_url: reportBranding.logoUrl },
+              { rooms: metaRooms as any, buses: metaBuses as any, camps: metaCamps as any },
+              { sticker: true, hand_tag: true, long_tag: true }
+            ));
+          }} style={{ width: "100%", marginTop: 8, padding: "9px 0", borderRadius: 9, border: "none", background: "var(--paper)", borderTop: "1px dashed var(--line)", color: "var(--ink)", fontFamily: "inherit", fontWeight: 700, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+            طباعة الاستيكرات
+          </button>
+        </div>
+      )}
+
+      {/* مودال التحقق من الهوية */}
+      <Modal show={showVerify} onClose={discardVerify} title="تأكيد هوية الحاج" maxWidth={520}>
+        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 14px", lineHeight: 1.6 }}>تأكد إن صورة الجواز وصورة البطاقة لنفس الشخص قبل الحفظ</p>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+          {[["صورة الجواز", verifyData?.passportUrl], ["صورة البطاقة", verifyData?.idUrl]].map(([label, url]) => (
+            <div key={label as string} style={{ border: "0.5px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
+              <div style={{ background: "var(--bg-2)", padding: "6px 10px", fontSize: 11, fontWeight: 500, borderBottom: "0.5px solid var(--border)" }}>{label as string}</div>
+              {url ? (
+                <DocImage value={url as string} alt={label as string} style={{ width: "100%", height: 160, objectFit: "cover", display: "block" }} />
+              ) : (
+                <div style={{ height: 160, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--border)", fontSize: 12 }}>لم يتم الرفع</div>
+              )}
+            </div>
+          ))}
+        </div>
+        {verifyData?.idMismatch && (
+          <div style={{ background: "var(--warning-bg)", border: "0.5px solid #e67e22", borderRadius: 8, padding: "8px 12px", marginBottom: 14, display: "flex", gap: 8, alignItems: "flex-start" }}>
+            <span style={{ fontSize: 16 }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>
+            <span style={{ fontSize: 12, color: "var(--warning)", lineHeight: 1.6 }}>الرقم الشخصي في البطاقة مختلف عن المسجل في الجواز — تأكد قبل الحفظ</span>
+          </div>
+        )}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <button onClick={confirmVerify} style={{ background: "var(--em7)", color: "var(--g3)", border: "none", padding: "10px 0", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg> نعم، نفس الشخص — حفظ</button>
+          <button onClick={discardVerify} style={{ background: "var(--female-bg)", color: "var(--danger)", border: "0.5px solid #f0c0cc", padding: "10px 0", borderRadius: 8, fontSize: 13, fontWeight: 500, cursor: "pointer" }}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> لا، مش نفس الشخص</button>
+        </div>
+      </Modal>
+
+      {/* تأكيد تصريح الحج — مودال واحد لمساري ملف الحاجّ والمسح العام.
+          الرفع والحفظ والتنظيف تبقى هنا؛ المكوّن عرضٌ وتأكيد فقط. */}
+      <PermitConfirmModal
+        /* مفتاح بالملف: كل تصريح يفتح المودال من جديد، فلا يبقى بحث
+           المرّة السابقة معلّقاً في التالية */
+        key={permitConfirm ? `${permitConfirm.file.name}:${permitConfirm.file.lastModified}` : "none"}
+        state={permitConfirm}
+        passengers={passengers}
+        saving={permitSaving}
+        onChange={setPermitConfirm}
+        onCancel={() => setPermitConfirm(null)}
+        onConfirm={commitPermit}
+      />
+
+      <Modal show={showLinkFamily} onClose={() => setShowLinkFamily(false)} title="ربط بأقارب">
+        <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 10 }}>اختر الحاج اللي عايز تربطه بـ {selected?.short_ar}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg-2)", borderRadius: 8, padding: "6px 10px", marginBottom: 10 }}>
+          <span style={{ color: "var(--text-muted)" }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21-4.35-4.35"/></svg></span>
+          <input style={{ border: "none", background: "transparent", fontSize: 12, flex: 1, outline: "none", fontFamily: "inherit" }} placeholder="ابحث..." value={linkSearch} onChange={e => setLinkSearch(e.target.value)} autoFocus />
+        </div>
+        <div style={{ maxHeight: 300, overflowY: "auto" }}>
+          {passengers.filter(p => selected && p.id !== selected.id && (!linkSearch || p.name_ar.includes(linkSearch) || p.short_ar.includes(linkSearch))).map(p => (
+            <div key={p.id} onClick={() => selected && handleLinkFamily(selected, p)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 8px", borderRadius: 8, marginBottom: 3, cursor: "pointer", background: "transparent" }}
+              onMouseEnter={e => e.currentTarget.style.background = "var(--success-bg)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <Avatar name={p.name_ar} gender={p.gender} size={28} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 500 }}>{p.short_ar || p.name_ar}</div>
+                <div style={{ fontSize: 10, color: "var(--text-muted)" }}>{p.nat} · {p.gender}</div>
+              </div>
+              {p.family_id && <span style={{ fontSize: 9, background: "var(--success-bg)", color: "var(--primary-dark)", padding: "1px 5px", borderRadius: 99 }}>عنده أقارب</span>}
+            </div>
+          ))}
+        </div>
+        <button onClick={() => setShowLinkFamily(false)} style={{ ...btnS(), width: "100%", marginTop: 10 }}>إلغاء</button>
+      </Modal>
+
+      <Modal show={!!editing} onClose={() => setEditing(null)} title="تعديل بيانات الحاج" maxWidth={460}>
+        {editing && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+              {[["الاسم بالعربي", "name_ar"], ["الاسم بالإنجليزي", "name_en"], ["المختصر عربي", "short_ar"], ["المختصر إنجليزي", "short_en"], ["رقم الجواز", "passport"], ["الرقم الشخصي", "national_id"], ["الجنسية", "nat"], ["التليفون", "phone"], ["تاريخ الميلاد", "dob"], ["انتهاء الجواز", "expiry"]].map(([l, k]) => (
+                <div key={k as string}><div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>{l as string}</div><input style={inp} value={(editing as any)[k as string] || ""} onChange={e => setEditing({ ...editing, [k as string]: e.target.value })} /></div>
+              ))}
+              <div><div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>الجنس</div><select style={inp} value={editing.gender} onChange={e => setEditing({ ...editing, gender: e.target.value })}><option value="ذكر">ذكر</option><option value="أنثى">أنثى</option></select></div>
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 500, marginBottom: 8 }}>الخدمات المطلوبة</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {([["الباص", "bus", ["عادي","VIP"]], ["الطيران", "flight", ["عادي","درجة أولى","بدون"]], ["نوع الغرفة", "hotel_type", ["فردية","ثنائية","ثلاثية","رباعية","خاص"]], ["🪟 إطلالة", "hotel_view", ["مطلة","غير مطلة"]], ["منى", "camp_mina", ["عادي","خاص"]], ["عرفة", "camp_arafa", ["عادي","خاص"]]] as [string,string,string[]][]).map(([l,k,opts]) => (
+                  <div key={k}><div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4 }}>{l}</div>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      {opts.map(o => <div key={o} onClick={() => setEditing({ ...editing, services: { ...editing.services, [k]: o } })} style={{ flex: 1, padding: "4px 2px", borderRadius: 6, border: "1.5px solid " + (editing.services?.[k as keyof typeof editing.services] === o ? "var(--em7)" : "var(--border)"), background: editing.services?.[k as keyof typeof editing.services] === o ? "rgba(125,31,60,.08)" : "transparent", cursor: "pointer", fontSize: 10, color: editing.services?.[k as keyof typeof editing.services] === o ? "var(--em7)" : "var(--text-muted)", textAlign: "center" as const }}>{o}</div>)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => saveEdit(editing)} style={{ ...btnP(), flex: 1 }}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg> حفظ</button>
+              <button onClick={() => setEditing(null)} style={btnS()}>إلغاء</button>
+            </div>
+          </>
+        )}
+      </Modal>
+
+      {/* مودال الإضافة اليدوية */}
+      {/* مودال عارض المستند */}
+      {docViewer && (
+        <div onClick={() => setDocViewer(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "var(--paper)", borderRadius: 14, padding: 16, maxWidth: "90vw", maxHeight: "90vh", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={{ fontWeight: 700, color: "var(--ink)", fontSize: 14 }}>{docViewer.label}</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => downloadFile(docViewer.url)} style={{ fontSize: 11, padding: "4px 10px", borderRadius: 7, background: "var(--ivory2)", border: "1px solid var(--line)", cursor: "pointer", color: "var(--ink)" }}>تحميل</button>
+                <button onClick={() => setDocViewer(null)} style={{ fontSize: 16, background: "none", border: "none", cursor: "pointer", color: "var(--muted)", lineHeight: 1 }}>✕</button>
+              </div>
+            </div>
+            {docViewer.url.endsWith(".pdf") || docViewer.url.includes("pdf") ? (
+              <iframe src={docViewerUrl} style={{ width: "80vw", height: "75vh", border: "none", borderRadius: 8 }} />
+            ) : (
+              <img src={docViewerUrl} alt={docViewer.label} style={{ maxWidth: "80vw", maxHeight: "75vh", objectFit: "contain", borderRadius: 8 }} />
+            )}
+          </div>
+        </div>
+      )}
+      {/* مودال عارض المستند */}
+      {docViewer && (
+        <div onClick={() => setDocViewer(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "var(--paper)", borderRadius: 14, padding: 16, maxWidth: "90vw", maxHeight: "90vh", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={{ fontWeight: 700, color: "var(--ink)", fontSize: 14 }}>{docViewer.label}</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => downloadFile(docViewer.url)} style={{ fontSize: 11, padding: "4px 10px", borderRadius: 7, background: "var(--ivory2)", border: "1px solid var(--line)", cursor: "pointer", color: "var(--ink)" }}>تحميل</button>
+                <button onClick={() => setDocViewer(null)} style={{ fontSize: 18, background: "none", border: "none", cursor: "pointer", color: "var(--muted)", lineHeight: 1 }}>✕</button>
+              </div>
+            </div>
+            {docViewer.url.toLowerCase().includes("pdf") ? (
+              <iframe src={docViewerUrl} style={{ width: "80vw", height: "75vh", border: "none", borderRadius: 8 }} />
+            ) : (
+              <img src={docViewerUrl} alt={docViewer.label} style={{ maxWidth: "80vw", maxHeight: "75vh", objectFit: "contain", borderRadius: 8 }} />
+            )}
+          </div>
+        </div>
+      )}
+      <Modal show={showManual} onClose={() => { setShowManual(false); resetManualModal(); }} title={manualPassportImg || manualIdImg || manualScanning ? "إضافة بالمسح الذكي" : "إضافة حاج يدوياً"} maxWidth={(manualPassportImg || manualIdImg) ? 820 : 460}>
+        <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>{manualPassportImg || manualIdImg || manualScanning ? "راجع البيانات المستخرجة وعدّل لو محتاج" : "أدخل البيانات — المستندات تقدر ترفعها بعدين من ملف الحاج"}</span>
+        </div>
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+          {/* البيانات */}
+          <div style={{ flex: 1 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+              {([["الاسم بالعربي *", "name_ar"], ["الاسم بالإنجليزي", "name_en"], ["المختصر عربي", "short_ar"], ["المختصر إنجليزي", "short_en"], ["رقم الجواز", "passport"], ["رقم البطاقة", "national_id"], ["الجنسية", "nat"], ["التليفون", "phone"], ["تاريخ الميلاد", "dob"], ["انتهاء الجواز", "expiry"], ["انتهاء البطاقة", "id_expiry"]] as [string,string][]).map(([l, k]) => (
+                <div key={k}><div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>{l}</div>
+                  <input style={inp} value={(manualForm as any)[k]} onChange={e => setManualForm(prev => ({ ...prev, [k]: e.target.value }))} />
+                </div>
+              ))}
+              <div><div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>الجنس</div>
+                <select style={inp} value={manualForm.gender} onChange={e => setManualForm(prev => ({ ...prev, gender: e.target.value }))}>
+                  <option value="ذكر">ذكر</option><option value="أنثى">أنثى</option>
+                </select>
+              </div>
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 500, marginBottom: 8 }}>الخدمات</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {([["الباص", "bus", ["عادي","VIP"]], ["الطيران", "flight", ["عادي","درجة أولى","بدون"]], ["نوع الغرفة", "hotel_type", ["فردية","ثنائية","ثلاثية","رباعية","خاص"]], ["إطلالة", "hotel_view", ["مطلة","غير مطلة"]], ["منى", "camp_mina", ["عادي","خاص"]], ["عرفة", "camp_arafa", ["عادي","خاص"]]] as [string,string,string[]][]).map(([l,k,opts]) => (
+                  <div key={k}><div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 4 }}>{l}</div>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      {opts.map(o => <div key={o} onClick={() => setManualServices(prev => ({ ...prev, [k]: o }))} style={{ flex: 1, padding: "4px 2px", borderRadius: 6, border: `1.5px solid ${(manualServices as any)[k] === o ? "var(--em7)" : "var(--border)"}`, background: (manualServices as any)[k] === o ? "rgba(125,31,60,.08)" : "transparent", cursor: "pointer", fontSize: 10, color: (manualServices as any)[k] === o ? "var(--em7)" : "var(--text-muted)", textAlign: "center" }}>{o}</div>)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={handleManualSave} disabled={manualSaving} style={{ ...btnP(), flex: 1, opacity: manualSaving ? 0.6 : 1 }}>{manualSaving ? "جاري الحفظ..." : <><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> حفظ</>}</button>
+              <button onClick={() => { setShowManual(false); resetManualModal(); }} style={btnS()}>إلغاء</button>
+            </div>
+          </div>
+
+          {/* صور المستندات (الجواز / البطاقة) */}
+          {(manualPassportImg || manualIdImg) && (
+            <div style={{ width: 320, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
+              {/* صورة الجواز */}
+              {manualPassportImg && (
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--em7)" }}>📋 صورة الجواز</span>
+                    {!manualScanning && (
+                      <label style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, border: "1px solid var(--line)", background: "var(--bg-2)", cursor: "pointer" }}>
+                        تغيير
+                        <input type="file" accept="image/*" style={{ display: "none" }} onChange={async e => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          setManualPassportImg(null); setManualPassportFile(null);
+                          setManualScanning(true);
+                          const reader = new FileReader();
+                          reader.onload = async ev => {
+                            setManualPassportImg(ev.target?.result as string);
+                            setManualPassportFile(file);
+                            try {
+                              const parsed = await scanDocument(file, "passport");
+                              setManualForm(prev => ({
+                                ...prev,
+                                name_en: parsed.name_en || prev.name_en,
+                                short_en: parsed.name_en ? makeShort(parsed.name_en) : prev.short_en,
+                                name_ar: parsed.name_ar || prev.name_ar,
+                                short_ar: parsed.name_ar ? makeShort(parsed.name_ar) : prev.short_ar,
+                                passport: parsed.passport || prev.passport,
+                                national_id: parsed.national_id || prev.national_id,
+                                nat: parsed.nationality || prev.nat,
+                                dob: parsed.dob || prev.dob,
+                                expiry: parsed.expiry || prev.expiry,
+                                gender: parsed.gender || prev.gender,
+                              }));
+                            } catch { /* تجاهل */ }
+                            setManualScanning(false);
+                          };
+                          reader.readAsDataURL(file);
+                          e.target.value = "";
+                        }} />
+                      </label>
+                    )}
+                  </div>
+                  <div style={{ position: "relative", borderRadius: 10, overflow: "hidden" }}>
+                    <img src={manualPassportImg} style={{ width: "100%", display: "block", objectFit: "contain", maxHeight: 260, filter: manualScanning ? "blur(2px)" : "none", transition: "filter 0.3s" }} />
+                    {manualScanning && (
+                      <div style={{ position: "absolute", inset: 0, background: "rgba(125,31,60,0.15)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                        <div style={{ width: 36, height: 36, border: "3px solid rgba(255,255,255,0.3)", borderTop: "3px solid var(--em7)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                        <span style={{ fontSize: 12, color: "var(--em7)", fontWeight: 600, background: "rgba(255,255,255,0.9)", padding: "4px 10px", borderRadius: 99 }}>جاري القراءة...</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* صورة البطاقة الشخصية */}
+              {manualIdImg ? (
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--em7)" }}>🪪 صورة البطاقة الشخصية</span>
+                    {!manualScanning && (
+                      <label style={{ fontSize: 10, padding: "2px 8px", borderRadius: 99, border: "1px solid var(--line)", background: "var(--bg-2)", cursor: "pointer" }}>
+                        تغيير
+                        <input type="file" accept="image/*" style={{ display: "none" }} onChange={async e => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          setManualIdImg(null); setManualIdFile(null);
+                          setManualScanning(true);
+                          const reader = new FileReader();
+                          reader.onload = async ev => {
+                            setManualIdImg(ev.target?.result as string);
+                            setManualIdFile(file);
+                            try {
+                              const parsed = await scanDocument(file, "idcard");
+                              setManualForm(prev => ({
+                                ...prev,
+                                national_id: parsed.national_id || prev.national_id,
+                                id_expiry: parsed.id_expiry || prev.id_expiry,
+                              }));
+                            } catch { /* تجاهل */ }
+                            setManualScanning(false);
+                          };
+                          reader.readAsDataURL(file);
+                          e.target.value = "";
+                        }} />
+                      </label>
+                    )}
+                  </div>
+                  <div style={{ position: "relative", borderRadius: 10, overflow: "hidden" }}>
+                    <img src={manualIdImg} style={{ width: "100%", display: "block", objectFit: "contain", maxHeight: 260, filter: manualScanning ? "blur(2px)" : "none", transition: "filter 0.3s" }} />
+                    {manualScanning && (
+                      <div style={{ position: "absolute", inset: 0, background: "rgba(125,31,60,0.15)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                        <div style={{ width: 36, height: 36, border: "3px solid rgba(255,255,255,0.3)", borderTop: "3px solid var(--em7)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                        <span style={{ fontSize: 12, color: "var(--em7)", fontWeight: 600, background: "rgba(255,255,255,0.9)", padding: "4px 10px", borderRadius: 99 }}>جاري القراءة...</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "10px", borderRadius: 10, border: "1.5px dashed var(--line)", color: "var(--text-muted)", fontSize: 11, cursor: "pointer", background: "var(--bg-2)" }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  + إضافة صورة البطاقة الشخصية (اختياري)
+                  <input type="file" accept="image/*" style={{ display: "none" }} onChange={async e => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    setManualScanning(true);
+                    const reader = new FileReader();
+                    reader.onload = async ev => {
+                      setManualIdImg(ev.target?.result as string);
+                      setManualIdFile(file);
+                      try {
+                        const parsed = await scanDocument(file, "idcard");
+                        setManualForm(prev => ({
+                          ...prev,
+                          national_id: parsed.national_id || prev.national_id,
+                          id_expiry: parsed.id_expiry || prev.id_expiry,
+                        }));
+                      } catch { /* تجاهل */ }
+                      setManualScanning(false);
+                    };
+                    reader.readAsDataURL(file);
+                    e.target.value = "";
+                  }} />
+                </label>
+              )}
+            </div>
+          )}
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+
+
+export { PassengersStats, PassengersPage };

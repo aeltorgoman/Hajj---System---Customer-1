@@ -1,0 +1,1431 @@
+export type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: Json | undefined }
+  | Json[]
+
+export type Database = {
+  // Allows to automatically instantiate createClient with right options
+  // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
+  __InternalSupabase: {
+    PostgrestVersion: "14.5"
+  }
+  public: {
+    Tables: {
+      announcements: {
+        Row: {
+          body: string
+          created_at: string | null
+          created_by: string | null
+          expires_at: string | null
+          id: number
+          priority: string
+          push_sent_at: string | null
+          season_id: number
+          show_at: string
+          target_ids: number[]
+          target_type: string
+          title: string | null
+        }
+        Insert: {
+          body: string
+          created_at?: string | null
+          created_by?: string | null
+          expires_at?: string | null
+          id?: never
+          priority?: string
+          push_sent_at?: string | null
+          season_id?: number
+          show_at?: string
+          target_ids?: number[]
+          target_type?: string
+          title?: string | null
+        }
+        Update: {
+          body?: string
+          created_at?: string | null
+          created_by?: string | null
+          expires_at?: string | null
+          id?: never
+          priority?: string
+          push_sent_at?: string | null
+          season_id?: number
+          show_at?: string
+          target_ids?: number[]
+          target_type?: string
+          title?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "announcements_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      audit_log: {
+        Row: {
+          action: string
+          actor_id: string | null
+          actor_source: string
+          actor_username: string | null
+          at: string
+          id: number
+          new_value: Json | null
+          old_value: Json | null
+          row_id: string
+          season_id: number | null
+          table_name: string
+        }
+        Insert: {
+          action: string
+          actor_id?: string | null
+          actor_source: string
+          actor_username?: string | null
+          at?: string
+          id?: never
+          new_value?: Json | null
+          old_value?: Json | null
+          row_id: string
+          season_id?: number | null
+          table_name: string
+        }
+        Update: {
+          action?: string
+          actor_id?: string | null
+          actor_source?: string
+          actor_username?: string | null
+          at?: string
+          id?: never
+          new_value?: Json | null
+          old_value?: Json | null
+          row_id?: string
+          season_id?: number | null
+          table_name?: string
+        }
+        Relationships: []
+      }
+      audit_suppression: {
+        Row: {
+          txid: number
+        }
+        Insert: {
+          txid: number
+        }
+        Update: {
+          txid?: number
+        }
+        Relationships: []
+      }
+      buses: {
+        Row: {
+          capacity: number
+          created_at: string | null
+          id: number
+          name: string | null
+          season_id: number
+          type: string | null
+        }
+        Insert: {
+          capacity?: number
+          created_at?: string | null
+          id?: never
+          name?: string | null
+          season_id?: number
+          type?: string | null
+        }
+        Update: {
+          capacity?: number
+          created_at?: string | null
+          id?: never
+          name?: string | null
+          season_id?: number
+          type?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "buses_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      camps: {
+        Row: {
+          capacity: number | null
+          created_at: string | null
+          gender: string
+          id: number
+          name: string | null
+          page_type: string
+          season_id: number
+          sort_order: number | null
+          type: string | null
+        }
+        Insert: {
+          capacity?: number | null
+          created_at?: string | null
+          gender: string
+          id?: never
+          name?: string | null
+          page_type: string
+          season_id?: number
+          sort_order?: number | null
+          type?: string | null
+        }
+        Update: {
+          capacity?: number | null
+          created_at?: string | null
+          gender?: string
+          id?: never
+          name?: string | null
+          page_type?: string
+          season_id?: number
+          sort_order?: number | null
+          type?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "camps_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      company_assets: {
+        Row: {
+          alt_text: string | null
+          asset_key: string
+          asset_url: string
+          metadata: Json
+          updated_at: string | null
+        }
+        Insert: {
+          alt_text?: string | null
+          asset_key: string
+          asset_url: string
+          metadata?: Json
+          updated_at?: string | null
+        }
+        Update: {
+          alt_text?: string | null
+          asset_key?: string
+          asset_url?: string
+          metadata?: Json
+          updated_at?: string | null
+        }
+        Relationships: []
+      }
+      company_config: {
+        Row: {
+          admin_name: string | null
+          admin_phone: string | null
+          admin_whatsapp: string | null
+          bank_account_name: string | null
+          bank_account_number: string | null
+          bank_iban: string | null
+          bank_name: string | null
+          bank_swift: string | null
+          banner_position: string | null
+          banner_position_x: string | null
+          city: string | null
+          color_accent: string | null
+          color_primary: string | null
+          color_sidebar: string | null
+          commercial_registration: string | null
+          contact_email: string | null
+          contact_phone: string | null
+          country: string | null
+          id: number
+          name_ar: string
+          name_en: string | null
+          portal_help_message: string | null
+          portal_settings: Json
+          portal_welcome_message: string | null
+          tagline: string | null
+        }
+        Insert: {
+          admin_name?: string | null
+          admin_phone?: string | null
+          admin_whatsapp?: string | null
+          bank_account_name?: string | null
+          bank_account_number?: string | null
+          bank_iban?: string | null
+          bank_name?: string | null
+          bank_swift?: string | null
+          banner_position?: string | null
+          banner_position_x?: string | null
+          city?: string | null
+          color_accent?: string | null
+          color_primary?: string | null
+          color_sidebar?: string | null
+          commercial_registration?: string | null
+          contact_email?: string | null
+          contact_phone?: string | null
+          country?: string | null
+          id?: number
+          name_ar?: string
+          name_en?: string | null
+          portal_help_message?: string | null
+          portal_settings?: Json
+          portal_welcome_message?: string | null
+          tagline?: string | null
+        }
+        Update: {
+          admin_name?: string | null
+          admin_phone?: string | null
+          admin_whatsapp?: string | null
+          bank_account_name?: string | null
+          bank_account_number?: string | null
+          bank_iban?: string | null
+          bank_name?: string | null
+          bank_swift?: string | null
+          banner_position?: string | null
+          banner_position_x?: string | null
+          city?: string | null
+          color_accent?: string | null
+          color_primary?: string | null
+          color_sidebar?: string | null
+          commercial_registration?: string | null
+          contact_email?: string | null
+          contact_phone?: string | null
+          country?: string | null
+          id?: number
+          name_ar?: string
+          name_en?: string | null
+          portal_help_message?: string | null
+          portal_settings?: Json
+          portal_welcome_message?: string | null
+          tagline?: string | null
+        }
+        Relationships: []
+      }
+      custom_charges: {
+        Row: {
+          amount: number
+          created_at: string | null
+          created_by: string | null
+          description: string
+          id: number
+          notes: string | null
+          passenger_id: number
+          type: string
+        }
+        Insert: {
+          amount: number
+          created_at?: string | null
+          created_by?: string | null
+          description: string
+          id?: number
+          notes?: string | null
+          passenger_id: number
+          type: string
+        }
+        Update: {
+          amount?: number
+          created_at?: string | null
+          created_by?: string | null
+          description?: string
+          id?: number
+          notes?: string | null
+          passenger_id?: number
+          type?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "custom_charges_passenger_id_fkey"
+            columns: ["passenger_id"]
+            isOneToOne: false
+            referencedRelation: "passengers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      edge_rate_limits: {
+        Row: {
+          hits: number
+          scope: string
+          subject: string
+          window_start: string
+        }
+        Insert: {
+          hits?: number
+          scope: string
+          subject: string
+          window_start: string
+        }
+        Update: {
+          hits?: number
+          scope?: string
+          subject?: string
+          window_start?: string
+        }
+        Relationships: []
+      }
+      financial_group_members: {
+        Row: {
+          group_id: number
+          id: number
+          passenger_id: number
+        }
+        Insert: {
+          group_id: number
+          id?: number
+          passenger_id: number
+        }
+        Update: {
+          group_id?: number
+          id?: number
+          passenger_id?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "financial_group_members_group_id_fkey"
+            columns: ["group_id"]
+            isOneToOne: false
+            referencedRelation: "financial_groups"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "financial_group_members_passenger_id_fkey"
+            columns: ["passenger_id"]
+            isOneToOne: true
+            referencedRelation: "passengers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      financial_groups: {
+        Row: {
+          created_at: string | null
+          created_by: string | null
+          id: number
+          name: string
+          notes: string | null
+          season_id: number
+        }
+        Insert: {
+          created_at?: string | null
+          created_by?: string | null
+          id?: number
+          name: string
+          notes?: string | null
+          season_id?: number
+        }
+        Update: {
+          created_at?: string | null
+          created_by?: string | null
+          id?: number
+          name?: string
+          notes?: string | null
+          season_id?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "financial_groups_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      flights: {
+        Row: {
+          airline: string | null
+          arrival_date: string | null
+          arrival_time: string | null
+          capacity: number | null
+          created_at: string | null
+          date: string | null
+          from_airport: string | null
+          id: number
+          name: string | null
+          season_id: number
+          time: string | null
+          to_airport: string | null
+          type: string
+        }
+        Insert: {
+          airline?: string | null
+          arrival_date?: string | null
+          arrival_time?: string | null
+          capacity?: number | null
+          created_at?: string | null
+          date?: string | null
+          from_airport?: string | null
+          id?: never
+          name?: string | null
+          season_id?: number
+          time?: string | null
+          to_airport?: string | null
+          type: string
+        }
+        Update: {
+          airline?: string | null
+          arrival_date?: string | null
+          arrival_time?: string | null
+          capacity?: number | null
+          created_at?: string | null
+          date?: string | null
+          from_airport?: string | null
+          id?: never
+          name?: string | null
+          season_id?: number
+          time?: string | null
+          to_airport?: string | null
+          type?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "flights_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      notification_deliveries: {
+        Row: {
+          announcement_id: number
+          error: string | null
+          id: number
+          passenger_id: number
+          read_at: string | null
+          sent_at: string
+          status: string
+        }
+        Insert: {
+          announcement_id: number
+          error?: string | null
+          id?: number
+          passenger_id: number
+          read_at?: string | null
+          sent_at?: string
+          status?: string
+        }
+        Update: {
+          announcement_id?: number
+          error?: string | null
+          id?: number
+          passenger_id?: number
+          read_at?: string | null
+          sent_at?: string
+          status?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "notification_deliveries_announcement_id_fkey"
+            columns: ["announcement_id"]
+            isOneToOne: false
+            referencedRelation: "announcements"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "notification_deliveries_passenger_id_fkey"
+            columns: ["passenger_id"]
+            isOneToOne: false
+            referencedRelation: "passengers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      passengers: {
+        Row: {
+          bus: string | null
+          bus_id: number | null
+          bus_sort_order: number | null
+          camp_arafa: string | null
+          camp_arafa_id: number | null
+          camp_arafa_sort_order: number | null
+          camp_mina: string | null
+          camp_mina_id: number | null
+          camp_mina_sort_order: number | null
+          contract_url: string | null
+          created_at: string
+          created_by: string | null
+          custom_price: number | null
+          dob: string | null
+          expiry: string | null
+          family_id: string | null
+          flight: string | null
+          flight_class: string | null
+          flight_id: number | null
+          flight_ticket_url: string | null
+          gender: string | null
+          hajj_permit_url: string | null
+          hotel_type: string | null
+          hotel_view: string | null
+          id: number
+          id_expiry: string | null
+          name_ar: string | null
+          name_en: string | null
+          nat: string | null
+          national_id: string | null
+          national_id_url: string | null
+          passenger_type: string | null
+          passport: string | null
+          passport_url: string | null
+          phone: string | null
+          photo_url: string | null
+          return_flight_id: number | null
+          room_id: number | null
+          room_sort_order: number | null
+          season_id: number
+          short_ar: string | null
+          short_en: string | null
+          sort_order: number | null
+          updated_at: string | null
+          updated_by: string | null
+          wants_flight: boolean | null
+        }
+        Insert: {
+          bus?: string | null
+          bus_id?: number | null
+          bus_sort_order?: number | null
+          camp_arafa?: string | null
+          camp_arafa_id?: number | null
+          camp_arafa_sort_order?: number | null
+          camp_mina?: string | null
+          camp_mina_id?: number | null
+          camp_mina_sort_order?: number | null
+          contract_url?: string | null
+          created_at?: string
+          created_by?: string | null
+          custom_price?: number | null
+          dob?: string | null
+          expiry?: string | null
+          family_id?: string | null
+          flight?: string | null
+          flight_class?: string | null
+          flight_id?: number | null
+          flight_ticket_url?: string | null
+          gender?: string | null
+          hajj_permit_url?: string | null
+          hotel_type?: string | null
+          hotel_view?: string | null
+          id?: number
+          id_expiry?: string | null
+          name_ar?: string | null
+          name_en?: string | null
+          nat?: string | null
+          national_id?: string | null
+          national_id_url?: string | null
+          passenger_type?: string | null
+          passport?: string | null
+          passport_url?: string | null
+          phone?: string | null
+          photo_url?: string | null
+          return_flight_id?: number | null
+          room_id?: number | null
+          room_sort_order?: number | null
+          season_id?: number
+          short_ar?: string | null
+          short_en?: string | null
+          sort_order?: number | null
+          updated_at?: string | null
+          updated_by?: string | null
+          wants_flight?: boolean | null
+        }
+        Update: {
+          bus?: string | null
+          bus_id?: number | null
+          bus_sort_order?: number | null
+          camp_arafa?: string | null
+          camp_arafa_id?: number | null
+          camp_arafa_sort_order?: number | null
+          camp_mina?: string | null
+          camp_mina_id?: number | null
+          camp_mina_sort_order?: number | null
+          contract_url?: string | null
+          created_at?: string
+          created_by?: string | null
+          custom_price?: number | null
+          dob?: string | null
+          expiry?: string | null
+          family_id?: string | null
+          flight?: string | null
+          flight_class?: string | null
+          flight_id?: number | null
+          flight_ticket_url?: string | null
+          gender?: string | null
+          hajj_permit_url?: string | null
+          hotel_type?: string | null
+          hotel_view?: string | null
+          id?: number
+          id_expiry?: string | null
+          name_ar?: string | null
+          name_en?: string | null
+          nat?: string | null
+          national_id?: string | null
+          national_id_url?: string | null
+          passenger_type?: string | null
+          passport?: string | null
+          passport_url?: string | null
+          phone?: string | null
+          photo_url?: string | null
+          return_flight_id?: number | null
+          room_id?: number | null
+          room_sort_order?: number | null
+          season_id?: number
+          short_ar?: string | null
+          short_en?: string | null
+          sort_order?: number | null
+          updated_at?: string | null
+          updated_by?: string | null
+          wants_flight?: boolean | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "passengers_bus_id_fkey"
+            columns: ["bus_id"]
+            isOneToOne: false
+            referencedRelation: "buses"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "passengers_camp_arafa_id_fkey"
+            columns: ["camp_arafa_id"]
+            isOneToOne: false
+            referencedRelation: "camps"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "passengers_camp_mina_id_fkey"
+            columns: ["camp_mina_id"]
+            isOneToOne: false
+            referencedRelation: "camps"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "passengers_flight_id_fkey"
+            columns: ["flight_id"]
+            isOneToOne: false
+            referencedRelation: "flights"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "passengers_return_flight_id_fkey"
+            columns: ["return_flight_id"]
+            isOneToOne: false
+            referencedRelation: "flights"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "passengers_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      payments: {
+        Row: {
+          amount: number
+          created_at: string | null
+          created_by: string | null
+          id: number
+          method: string
+          notes: string | null
+          passenger_id: number
+          payment_date: string
+          receipt_id: number | null
+        }
+        Insert: {
+          amount: number
+          created_at?: string | null
+          created_by?: string | null
+          id?: number
+          method?: string
+          notes?: string | null
+          passenger_id: number
+          payment_date?: string
+          receipt_id?: number | null
+        }
+        Update: {
+          amount?: number
+          created_at?: string | null
+          created_by?: string | null
+          id?: number
+          method?: string
+          notes?: string | null
+          passenger_id?: number
+          payment_date?: string
+          receipt_id?: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "payments_passenger_id_fkey"
+            columns: ["passenger_id"]
+            isOneToOne: false
+            referencedRelation: "passengers"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "payments_receipt_id_fkey"
+            columns: ["receipt_id"]
+            isOneToOne: false
+            referencedRelation: "payment_receipts"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      payment_receipts: {
+        Row: {
+          cancel_reason: string | null
+          cancelled_at: string | null
+          cancelled_by: string | null
+          group_name: string | null
+          id: number
+          issued_at: string
+          issued_by: string | null
+          method: string
+          notes: string | null
+          payer_name: string
+          payment_date: string
+          receipt_number: number
+          season_id: number
+          season_name: string
+          status: string
+          total_amount: number
+        }
+        Insert: {
+          cancel_reason?: string | null
+          cancelled_at?: string | null
+          cancelled_by?: string | null
+          group_name?: string | null
+          id?: never
+          issued_at?: string
+          issued_by?: string | null
+          method: string
+          notes?: string | null
+          payer_name: string
+          payment_date: string
+          receipt_number: number
+          season_id: number
+          season_name: string
+          status?: string
+          total_amount: number
+        }
+        Update: {
+          cancel_reason?: string | null
+          cancelled_at?: string | null
+          cancelled_by?: string | null
+          group_name?: string | null
+          id?: never
+          issued_at?: string
+          issued_by?: string | null
+          method?: string
+          notes?: string | null
+          payer_name?: string
+          payment_date?: string
+          receipt_number?: number
+          season_id?: number
+          season_name?: string
+          status?: string
+          total_amount?: number
+        }
+        Relationships: []
+      }
+      pilgrim_push_subscriptions: {
+        Row: {
+          auth: string
+          created_at: string
+          endpoint: string
+          id: number
+          last_seen_at: string
+          p256dh: string
+          passenger_id: number
+          platform: string
+          user_agent: string | null
+        }
+        Insert: {
+          auth: string
+          created_at?: string
+          endpoint: string
+          id?: number
+          last_seen_at?: string
+          p256dh: string
+          passenger_id: number
+          platform?: string
+          user_agent?: string | null
+        }
+        Update: {
+          auth?: string
+          created_at?: string
+          endpoint?: string
+          id?: number
+          last_seen_at?: string
+          p256dh?: string
+          passenger_id?: number
+          platform?: string
+          user_agent?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "pilgrim_push_subscriptions_passenger_id_fkey"
+            columns: ["passenger_id"]
+            isOneToOne: false
+            referencedRelation: "passengers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      pilgrim_sessions: {
+        Row: {
+          absolute_expires_at: string
+          idle_expires_at: string
+          issued_at: string
+          last_seen_at: string
+          passenger_id: number
+          revoked_at: string | null
+          season_id: number
+          token_hash: string
+        }
+        Insert: {
+          absolute_expires_at: string
+          idle_expires_at: string
+          issued_at?: string
+          last_seen_at?: string
+          passenger_id: number
+          revoked_at?: string | null
+          season_id: number
+          token_hash: string
+        }
+        Update: {
+          absolute_expires_at?: string
+          idle_expires_at?: string
+          issued_at?: string
+          last_seen_at?: string
+          passenger_id?: number
+          revoked_at?: string | null
+          season_id?: number
+          token_hash?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "pilgrim_sessions_passenger_id_fkey"
+            columns: ["passenger_id"]
+            isOneToOne: false
+            referencedRelation: "passengers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      pricing_settings: {
+        Row: {
+          amount: number
+          id: number
+          key: string
+          label: string
+          type: string
+          updated_at: string | null
+        }
+        Insert: {
+          amount?: number
+          id?: number
+          key: string
+          label: string
+          type: string
+          updated_at?: string | null
+        }
+        Update: {
+          amount?: number
+          id?: number
+          key?: string
+          label?: string
+          type?: string
+          updated_at?: string | null
+        }
+        Relationships: []
+      }
+      rooms: {
+        Row: {
+          capacity: number | null
+          created_at: string | null
+          floor: string | null
+          id: number
+          notes: string | null
+          number: string | null
+          season_id: number
+          type: string | null
+        }
+        Insert: {
+          capacity?: number | null
+          created_at?: string | null
+          floor?: string | null
+          id?: never
+          notes?: string | null
+          number?: string | null
+          season_id?: number
+          type?: string | null
+        }
+        Update: {
+          capacity?: number | null
+          created_at?: string | null
+          floor?: string | null
+          id?: never
+          notes?: string | null
+          number?: string | null
+          season_id?: number
+          type?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "rooms_season_id_fkey"
+            columns: ["season_id"]
+            isOneToOne: false
+            referencedRelation: "seasons"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      season_pricing_snapshot: {
+        Row: {
+          amount: number
+          captured_at: string
+          key: string
+          label: string
+          season_id: number
+          type: string
+        }
+        Insert: {
+          amount: number
+          captured_at?: string
+          key: string
+          label: string
+          season_id: number
+          type: string
+        }
+        Update: {
+          amount?: number
+          captured_at?: string
+          key?: string
+          label?: string
+          season_id?: number
+          type?: string
+        }
+        Relationships: []
+      }
+      seasons: {
+        Row: {
+          arafa_address: string | null
+          arafa_url: string | null
+          closed_at: string | null
+          closed_by: string | null
+          created_at: string | null
+          hijri_year: number
+          hotel_address: string | null
+          hotel_name: string | null
+          hotel_url: string | null
+          id: number
+          mina_address: string | null
+          mina_url: string | null
+          name: string
+          receipt_next_number: number
+          receipt_start_number: number
+        }
+        Insert: {
+          arafa_address?: string | null
+          arafa_url?: string | null
+          closed_at?: string | null
+          closed_by?: string | null
+          created_at?: string | null
+          hijri_year: number
+          hotel_address?: string | null
+          hotel_name?: string | null
+          hotel_url?: string | null
+          id?: never
+          mina_address?: string | null
+          mina_url?: string | null
+          name: string
+          receipt_next_number?: number
+          receipt_start_number?: number
+        }
+        Update: {
+          arafa_address?: string | null
+          arafa_url?: string | null
+          closed_at?: string | null
+          closed_by?: string | null
+          created_at?: string | null
+          hijri_year?: number
+          hotel_address?: string | null
+          hotel_name?: string | null
+          hotel_url?: string | null
+          id?: never
+          mina_address?: string | null
+          mina_url?: string | null
+          name?: string
+          receipt_next_number?: number
+          receipt_start_number?: number
+        }
+        Relationships: []
+      }
+      user_profiles: {
+        Row: {
+          created_at: string
+          email: string
+          id: string
+          is_active: boolean
+          name: string
+          permissions: Json
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          email: string
+          id: string
+          is_active?: boolean
+          name: string
+          permissions?: Json
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          email?: string
+          id?: string
+          is_active?: boolean
+          name?: string
+          permissions?: Json
+          updated_at?: string
+        }
+        Relationships: []
+      }
+    }
+    Views: {
+      company_profile_public: {
+        Row: {
+          color_accent: string | null
+          color_primary: string | null
+          color_sidebar: string | null
+          id: number | null
+          name_ar: string | null
+          name_en: string | null
+          tagline: string | null
+        }
+        Insert: {
+          color_accent?: string | null
+          color_primary?: string | null
+          color_sidebar?: string | null
+          id?: number | null
+          name_ar?: string | null
+          name_en?: string | null
+          tagline?: string | null
+        }
+        Update: {
+          color_accent?: string | null
+          color_primary?: string | null
+          color_sidebar?: string | null
+          id?: number | null
+          name_ar?: string | null
+          name_en?: string | null
+          tagline?: string | null
+        }
+        Relationships: []
+      }
+    }
+    Functions: {
+      _pilgrim_session_owner: { Args: { p_token: string }; Returns: number }
+      active_season_id: { Args: never; Returns: number }
+      admin_delete_user_profile: {
+        Args: { p_actor: string; p_id: string }
+        Returns: undefined
+      }
+      admin_write_user_profile: {
+        Args: {
+          p_actor: string
+          p_email?: string
+          p_id: string
+          p_is_active?: boolean
+          p_mode: string
+          p_name?: string
+          p_permissions?: Json
+        }
+        Returns: undefined
+      }
+      announcement_audience: {
+        Args: { p_target_ids: number[]; p_target_type: string }
+        Returns: {
+          passenger_id: number
+        }[]
+      }
+      cancel_payment_receipt: {
+        Args: { p_reason: string; p_receipt_id: number }
+        Returns: Database["public"]["Tables"]["payment_receipts"]["Row"]
+      }
+      close_season: {
+        Args: {
+          p_actor: string
+          p_closed_by: string
+          p_new_hijri_year: number
+          p_new_name: string
+        }
+        Returns: number
+      }
+      issue_payment_receipt: {
+        Args: {
+          p_allocations: Json
+          p_group_name?: string | null
+          p_method: string
+          p_notes?: string | null
+          p_payment_date: string
+        }
+        Returns: Database["public"]["Tables"]["payment_receipts"]["Row"]
+      }
+      remove_passenger_with_history: {
+        Args: { p_passenger_id: number }
+        Returns: Json
+      }
+      set_season_receipt_start: {
+        Args: { p_season_id: number; p_start: number }
+        Returns: number
+      }
+      consume_rate_limit: {
+        Args: {
+          p_limit: number
+          p_scope: string
+          p_subject: string
+          p_window_seconds: number
+        }
+        Returns: boolean
+      }
+      create_financial_group_with_member: {
+        Args: {
+          p_created_by: string
+          p_name: string
+          p_notes: string
+          p_passenger_id: number
+        }
+        Returns: Json
+      }
+      create_pilgrim_session: {
+        Args: { p_day: number; p_doc: string; p_month: number; p_year: number }
+        Returns: Json
+      }
+      delete_season: {
+        Args: { p_actor: string; p_season_id: number }
+        Returns: undefined
+      }
+      get_pilgrim_portal_by_session: {
+        Args: { p_token: string }
+        Returns: Json
+      }
+      get_portal_announcements: { Args: never; Returns: Json }
+      has_permission: { Args: { p_key: string }; Returns: boolean }
+      is_active_employee: { Args: never; Returns: boolean }
+      mark_pilgrim_notification_read: {
+        Args: { p_announcement_id: number; p_token: string }
+        Returns: boolean
+      }
+      push_enabled_passengers: {
+        Args: never
+        Returns: {
+          devices: number
+          passenger_id: number
+        }[]
+      }
+      record_season_event: {
+        Args: {
+          p_action: string
+          p_actor: string
+          p_new: Json
+          p_old: Json
+          p_season_id: number
+        }
+        Returns: undefined
+      }
+      register_pilgrim_push: {
+        Args: {
+          p_auth: string
+          p_endpoint: string
+          p_p256dh: string
+          p_platform?: string
+          p_token: string
+          p_user_agent?: string
+        }
+        Returns: boolean
+      }
+      resolve_pilgrim_id: {
+        Args: { p_day: number; p_doc: string; p_month: number; p_year: number }
+        Returns: number
+      }
+      revoke_pilgrim_session: { Args: { p_token: string }; Returns: boolean }
+      room_type_capacity: { Args: { p_type: string }; Returns: number }
+      set_audit_actor: { Args: { p_actor: string }; Returns: undefined }
+      unregister_pilgrim_push: {
+        Args: { p_endpoint: string; p_token: string }
+        Returns: boolean
+      }
+      update_active_season: {
+        /* كما في `update_portal_settings`: المولّدُ يكتب الوسائطَ غيرَ
+           قابلةٍ للعدم، والدالّةُ تقبل NULL في حقول الأماكن فعلاً —
+           وهي الطريقةُ التي يُفرَّغ بها حقلٌ اختياريّ. */
+        Args: {
+          p_arafa_address: string | null
+          p_arafa_url: string | null
+          p_hotel_address: string | null
+          p_hotel_name: string | null
+          p_hotel_url: string | null
+          p_mina_address: string | null
+          p_mina_url: string | null
+          p_name: string
+        }
+        Returns: Database["public"]["Tables"]["seasons"]["Row"]
+      }
+      update_portal_settings: {
+        /* المولّدُ يكتب وسائطَ الدوالّ غيرَ قابلةٍ للعدم دائماً، ودالّتُنا
+           تقبل NULL في حقول النصّ فعلاً (وهي الطريقةُ التي يُفرَّغ بها
+           حقلٌ اختياريّ). فالتوقيعُ هنا مُصحَّحٌ ليطابق SQL. */
+        Args: {
+          p_admin_name: string | null
+          p_admin_phone: string | null
+          p_admin_whatsapp: string | null
+          p_portal_help_message: string | null
+          p_portal_settings: Json
+          p_portal_welcome_message: string | null
+        }
+        Returns: Database["public"]["Tables"]["company_config"]["Row"]
+      }
+      verify_pilgrim_session: { Args: { p_token: string }; Returns: number }
+    }
+    Enums: {
+      [_ in never]: never
+    }
+    CompositeTypes: {
+      [_ in never]: never
+    }
+  }
+}
+
+type DatabaseWithoutInternals = Omit<Database, "__InternalSupabase">
+
+type DefaultSchema = DatabaseWithoutInternals[Extract<keyof Database, "public">]
+
+export type Tables<
+  DefaultSchemaTableNameOrOptions extends
+    | keyof (DefaultSchema["Tables"] & DefaultSchema["Views"])
+    | { schema: keyof DatabaseWithoutInternals },
+  TableName extends DefaultSchemaTableNameOrOptions extends {
+    schema: keyof DatabaseWithoutInternals
+  }
+    ? keyof (DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"] &
+        DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Views"])
+    : never = never,
+> = DefaultSchemaTableNameOrOptions extends {
+  schema: keyof DatabaseWithoutInternals
+}
+  ? (DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"] &
+      DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Views"])[TableName] extends {
+      Row: infer R
+    }
+    ? R
+    : never
+  : DefaultSchemaTableNameOrOptions extends keyof (DefaultSchema["Tables"] &
+        DefaultSchema["Views"])
+    ? (DefaultSchema["Tables"] &
+        DefaultSchema["Views"])[DefaultSchemaTableNameOrOptions] extends {
+        Row: infer R
+      }
+      ? R
+      : never
+    : never
+
+export type TablesInsert<
+  DefaultSchemaTableNameOrOptions extends
+    | keyof DefaultSchema["Tables"]
+    | { schema: keyof DatabaseWithoutInternals },
+  TableName extends DefaultSchemaTableNameOrOptions extends {
+    schema: keyof DatabaseWithoutInternals
+  }
+    ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
+    : never = never,
+> = DefaultSchemaTableNameOrOptions extends {
+  schema: keyof DatabaseWithoutInternals
+}
+  ? DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"][TableName] extends {
+      Insert: infer I
+    }
+    ? I
+    : never
+  : DefaultSchemaTableNameOrOptions extends keyof DefaultSchema["Tables"]
+    ? DefaultSchema["Tables"][DefaultSchemaTableNameOrOptions] extends {
+        Insert: infer I
+      }
+      ? I
+      : never
+    : never
+
+export type TablesUpdate<
+  DefaultSchemaTableNameOrOptions extends
+    | keyof DefaultSchema["Tables"]
+    | { schema: keyof DatabaseWithoutInternals },
+  TableName extends DefaultSchemaTableNameOrOptions extends {
+    schema: keyof DatabaseWithoutInternals
+  }
+    ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
+    : never = never,
+> = DefaultSchemaTableNameOrOptions extends {
+  schema: keyof DatabaseWithoutInternals
+}
+  ? DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"][TableName] extends {
+      Update: infer U
+    }
+    ? U
+    : never
+  : DefaultSchemaTableNameOrOptions extends keyof DefaultSchema["Tables"]
+    ? DefaultSchema["Tables"][DefaultSchemaTableNameOrOptions] extends {
+        Update: infer U
+      }
+      ? U
+      : never
+    : never
+
+export type Enums<
+  DefaultSchemaEnumNameOrOptions extends
+    | keyof DefaultSchema["Enums"]
+    | { schema: keyof DatabaseWithoutInternals },
+  EnumName extends DefaultSchemaEnumNameOrOptions extends {
+    schema: keyof DatabaseWithoutInternals
+  }
+    ? keyof DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"]
+    : never = never,
+> = DefaultSchemaEnumNameOrOptions extends {
+  schema: keyof DatabaseWithoutInternals
+}
+  ? DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"][EnumName]
+  : DefaultSchemaEnumNameOrOptions extends keyof DefaultSchema["Enums"]
+    ? DefaultSchema["Enums"][DefaultSchemaEnumNameOrOptions]
+    : never
+
+export type CompositeTypes<
+  PublicCompositeTypeNameOrOptions extends
+    | keyof DefaultSchema["CompositeTypes"]
+    | { schema: keyof DatabaseWithoutInternals },
+  CompositeTypeName extends PublicCompositeTypeNameOrOptions extends {
+    schema: keyof DatabaseWithoutInternals
+  }
+    ? keyof DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"]
+    : never = never,
+> = PublicCompositeTypeNameOrOptions extends {
+  schema: keyof DatabaseWithoutInternals
+}
+  ? DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"][CompositeTypeName]
+  : PublicCompositeTypeNameOrOptions extends keyof DefaultSchema["CompositeTypes"]
+    ? DefaultSchema["CompositeTypes"][PublicCompositeTypeNameOrOptions]
+    : never
+
+export const Constants = {
+  public: {
+    Enums: {},
+  },
+} as const

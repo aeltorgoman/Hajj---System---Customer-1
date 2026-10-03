@@ -1,0 +1,96 @@
+import { useRef } from "react";
+import type { Passenger, User } from "../types";
+import { canAccessPage } from "../navigation/nav";
+import { SeasonPhaseCard, PackagesCard, TotalPilgrimsCard, SmartAlertsCard } from "./Seasontimeline";
+
+function Dashboard({ passengers, setPage, currentUser, onAddManual, onScan }: {
+  passengers: Passenger[];
+  setPage: (p: string) => void;
+  currentUser: User;
+  onAddManual?: () => void;
+  onScan?: (file: File) => void;
+}) {
+
+  const navTo = (page: string) => {
+    /* الصلاحيةُ من مصدر التنقّل الواحد — لا خريطةَ ثانية */
+    if (canAccessPage(currentUser, page)) setPage(page);
+  };
+
+  const scanInputRef = useRef<HTMLInputElement>(null);
+
+  return (
+    <div style={{ display: "flex", flex: 1 }}>
+
+      {/* ══ العمود الأوسط ══ */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", padding: 14, gap: 12, minWidth: 0 }}>
+
+        {/* 1) أزرار الإجراءات */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, flexShrink: 0 }}>
+
+          {/* مسح مستند — لون الثيم الأساسي */}
+          <div onClick={() => scanInputRef.current?.click()}
+            style={{ display: "flex", alignItems: "center", gap: 11, padding: "13px 16px", borderRadius: 12, cursor: "pointer", background: "linear-gradient(135deg, var(--primary), var(--primary-light))", color: "var(--text-inverse)", boxShadow: "var(--shadow-md)" }}>
+            <div style={{ width: 38, height: 38, borderRadius: 10, background: "rgba(255,255,255,.15)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="var(--accent-light)" strokeWidth="2" strokeLinecap="round">
+                <path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+                <path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+                <line x1="7" y1="12" x2="17" y2="12"/>
+              </svg>
+            </div>
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, lineHeight: 1.2 }}>مسح مستند</div>
+              <div style={{ fontSize: 10.5, marginTop: 2, opacity: .75 }}>جواز / بطاقة / تصريح حج</div>
+            </div>
+          </div>
+          {/* نفس مدخل صفحة الحجاج: يقبل PDF فعلياً، والعرض يلحق بالواقع */}
+          <input ref={scanInputRef} type="file" accept="image/*,application/pdf" style={{ display: "none" }} onChange={e => {
+            const file = e.target.files?.[0]; if (!file) return;
+            if (onScan) { onScan(file); } else { (window as any).__hajj_pending_scan_file__ = file; setPage("passengers"); }
+            e.target.value = "";
+          }} />
+
+          {/* إضافة يدوي — لون الـ accent الذهبي */}
+          <div onClick={() => { onAddManual ? onAddManual() : navTo("passengers"); }}
+            style={{ display: "flex", alignItems: "center", gap: 11, padding: "13px 16px", borderRadius: 12, cursor: "pointer", background: "linear-gradient(135deg, var(--accent-dark), var(--accent))", color: "#1a1200", boxShadow: "var(--shadow-sm)" }}>
+            <div style={{ width: 38, height: 38, borderRadius: 10, background: "rgba(255,255,255,.2)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="rgba(0,0,0,.6)" strokeWidth="2.2" strokeLinecap="round">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </div>
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, lineHeight: 1.2 }}>إضافة يدوي</div>
+              <div style={{ fontSize: 10.5, marginTop: 2, opacity: .65 }}>إدخال بيانات الحاج يدوياً</div>
+            </div>
+          </div>
+        </div>
+
+        {/* 2) كارت مراحل الموسم */}
+        <SeasonPhaseCard passengers={passengers} setPage={navTo} />
+
+        {/* 3) الصف السفلي: آخر المسجلين + توزيع الباقات */}
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flex: 1, minHeight: 0, overflowY: "auto" }}>
+
+          {/* الكارت الذكي — تنبيهات حسب المرحلة */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <SmartAlertsCard passengers={passengers} setPage={navTo} />
+          </div>
+
+
+          {/* توزيع الباقات */}
+          <PackagesCard passengers={passengers} setPage={navTo} />
+        </div>
+      </div>
+
+      {/* ══ العمود الأيسر — Analytics ══ */}
+      <div style={{ width: "var(--sidebar-width)", flexShrink: 0, background: "var(--paper)", borderRight: "1px solid var(--line)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px 0", display: "flex", flexDirection: "column", minHeight: 0, gap: 12 }}>
+          <div style={{ flexShrink: 0, padding: "0 12px" }}>
+            <TotalPilgrimsCard passengers={passengers} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export { Dashboard };

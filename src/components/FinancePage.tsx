@@ -1,0 +1,1621 @@
+import { useState, useEffect, useMemo } from "react";
+import { useSeasonWrite } from "../season/useSeasonWrite";
+import { useSeason } from "../season/useSeason";
+import { isHajj, byOrder } from "../utils/passenger";
+import * as XLSX from "xlsx";
+import { AlertModal, useAlert, ConfirmModal, useConfirm } from "./AlertModal";
+import { supabase } from "../supabase";
+import { useReportBranding, useCompanyAssets } from "../company/CompanyContext";
+import { signedPrivateCompanyUrl } from "../utils";
+import type { Passenger, User } from "../types";
+
+import type { PricingMap, Payment, PaymentReceipt, CustomCharge, FinancialGroup, FinancialGroupMember, PrintBrand, FinanceFilterStatus, FinanceSortKey, FinanceSortDir, FinanceTotals, AllocTypeMaps, GroupPayForm, PayForm, ChargeForm, ChargeErrors, PricingRow, CreatedGroupWithMember } from "./finance/finance.types";
+import { PRICING_KEYS, SERVICE_FILTERS, serviceLabel, SPECIAL_PACKAGE_LABEL, isSpecialPackage, matchesPackageFilter, matchesServiceFilter, getPackageKey, getPriceInfo, chargesFor, paymentsFor, calcTotalDue, calcTotalPaid, totalsFor, sortFinanceRows, matchesFinanceSearch, fmtAmt, financeStatus, localDateISO } from "./finance/finance.utils";
+import { FinanceListView } from "./finance/FinanceListView";
+import { CompanyBankCard } from "./finance/CompanyBankCard";
+import { PassengerFinanceView } from "./finance/PassengerFinanceView";
+import { FinancialGroupView } from "./finance/FinancialGroupView";
+import { initialPrintOptions, chromeFromOptions } from "../print";
+import { PrintOptionsMenu } from "./PrintOptionsMenu";
+import { printInPage, makeReceiptHTML, makePassengerStatementHTML, makeGroupStatementHTML, printFullReport, printPaymentsReport, printPackagesReport, printAddonsReport, printCashflowReport } from "./finance/finance.print";
+
+// ============================================================
+// المكوّن الرئيسي
+// ============================================================
+export function FinancePage({ passengers, setPassengers, currentUser }: { passengers: Passenger[]; setPassengers?: (updater: (prev: Passenger[]) => Passenger[]) => void; currentUser: User }) {
+  const reportBranding = useReportBranding();
+  const companyAssets = useCompanyAssets();
+  const { alert: alertState, showAlert } = useAlert();
+  const { assertWritable } = useSeasonWrite(showAlert);
+  const { viewedSeason, canWrite: seasonWritable, refreshSeasons } = useSeason();
+
+  /* مصدر التسعير الذي حُسبت به أرقام هذه الشاشة:
+       live            الموسم مفتوح  → التسعير الحيّ، وهو الصحيح له
+       snapshot        الموسم مقفل   → لقطة تسعيره يوم الإقفال
+       missing         الموسم مقفل ولا لقطة له (أُقفل قبل بناء الآلية)
+                       → رجوعٌ إلى الحيّ **مع تحذير ظاهر**، لأن رقماً
+                       صامتاً غير قابل للتحقّق أسوأ من رقمٍ موصوف.
+       error           تعذّر جلب اللقطة — وهي **ليست** كغيابها: الغياب
+                       حقيقةٌ عن الماضي، والفشل عطلٌ في هذه اللحظة. ولو
+                       خُلطا لقال الشريط للمستخدم سبباً غير صحيح. */
+  /* خياراتُ عرض المطبوع — محليّةٌ للجلسة، وافتراضُها المظهرُ المقبول */
+  const [printOpts, setPrintOpts] = useState(() => initialPrintOptions("finance"));
+  const [pricingSource, setPricingSource] = useState<"live"|"snapshot"|"missing"|"error">("live");
+
+  /* مداخل الكتابة هنا خصائص تُمرَّر إلى مكوّنات فرعية، فلا يُعطَّل
+     زرّ في هذا الملف. الرفض يقع عند محاولة الفتح برسالة صريحة —
+     أوضح للمستخدم من زرّ لا يستجيب، وبلا مساس بالمكوّنات الفرعية. */
+  const canManage = !!currentUser.permissions?.manage_payments;
+
+  const [subView, setSubView]     = useState<"list"|"detail"|"settings"|"reports"|"group">("list");
+  /* تبويباتُ «إعدادات الحسابات» — تنظيمُ واجهةٍ لا تغييرُ مالكِ بيانات.
+     ولكلِّ تبويبٍ مصدرُه وصلاحيتُه كما هي في القاعدة، لا كما يوحي
+     جمعُها في سطحٍ واحد. */
+  /* والافتراضيُّ يُحسب مرّةً: من لا يملك المالَ لا يُنزَل على مُحرِّرِ
+     أسعارٍ لا يستطيع حفظَه. */
+  const [settingsTab, setSettingsTab] = useState<"pricing"|"bank"|"receipts">(
+    () => (currentUser.permissions?.manage_payments ? "pricing" : "bank"));
+
+  /* ── البنك والسداد: مِلكُ `company_config` كما كان ──
+     الكتابةُ عليه تشترط `manage_users` في RLS، وهذا السطحُ يُفتَح
+     بـ`manage_payments`. فلا تُوسَّع صلاحيةٌ ولا تُنسَخ حقول: من لا
+     يملك `manage_users` يرى القيمَ ولا يُعدّلها. */
+  const canEditBank = !!currentUser.permissions?.manage_users;
+
+  /* ⚠️ فتحُ السطحِ ليس صلاحيةً ثالثةً: هو «أملكُ قسماً واحداً على
+     الأقلّ». وقرنُه بـ`manage_payments` وحدَها كان انحداراً حقيقيّاً —
+     مالكُ `manage_users` وحدَه كان يُحرّر البنكَ في موضعِه القديم، فلو
+     نُقل المُحرِّرُ إلى سطحٍ لا يبلغه لفقد قدرةً كانت له. */
+  const canOpenSettings = canManage || canEditBank;
+
+  /* ── الإيصالات: مِلكُ صفِّ الموسم ── */
+  /* مُخزَّنٌ مع معرّفِ موسمِه: العرضُ يُشتَقّ، فإن لم يُحرَّر شيءٌ —
+     أو حُرِّر لموسمٍ آخر — ظهرت قيمةُ الموسمِ المعروضِ من القاعدة.
+     ولا أثرَ يُزامِن، ولا رايةَ «عُدِّل» تُخترَع. */
+  const [startEdit, setStartEdit] = useState<{ seasonId: number; value: string } | null>(null);
+  const [startSaving, setStartSaving] = useState(false);
+  const [startMsg, setStartMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [selectedP, setSelectedP] = useState<Passenger | null>(null);
+  const [editingCustomPrice, setEditingCustomPrice] = useState(false);
+  const [customPriceInput, setCustomPriceInput]     = useState("");
+  const [savingCustomPrice, setSavingCustomPrice]   = useState(false);
+  const [selectedGroup, setSelectedGroup] = useState<FinancialGroup | null>(null);
+
+  const [pricing, setPricing]               = useState<PricingMap>({});
+  const [payments, setPayments]             = useState<Payment[]>([]);
+  const [receipts, setReceipts]             = useState<PaymentReceipt[]>([]);
+  const [customCharges, setCustomCharges]   = useState<CustomCharge[]>([]);
+  const [groups, setGroups]                 = useState<FinancialGroup[]>([]);
+  const [groupMembers, setGroupMembers]     = useState<FinancialGroupMember[]>([]);
+  const [loading, setLoading]               = useState(true);
+  const [refreshing, setRefreshing]         = useState(false);
+  const [lastUpdated, setLastUpdated]       = useState<Date | null>(null);
+  /* خطأُ التحميل حالةٌ باقية لا تنبيهٌ يُغلَق: أرقامٌ ناقصة لا تُعرض
+     صامتةً، ويبقى للموظّف زرُّ إعادة محاولة. */
+  const [loadError, setLoadError]           = useState<string | null>(null);
+  /* تصنيفُ الكيان المُسنَد — `id,type` وحدهما، للسياق الإخباريّ فقط */
+  const [allocTypes, setAllocTypes]         = useState<AllocTypeMaps>({ bus:new Map(), camp:new Map(), room:new Map() });
+
+  // بحث وفلتر
+  const [searchTerm, setSearchTerm]       = useState("");
+  const [filterStatus, setFilterStatus]   = useState<FinanceFilterStatus>("all");
+  const [filterPackage, setFilterPackage] = useState("all");
+  /* فلترُ الخدمة المطلوبة — مفاتيحُ `pricing_settings` نفسها */
+  const [filterService, setFilterService] = useState("all");
+  /* `manual` هو الترتيب المعتمَد (sort_order ثم id) وهو الافتراضيّ؛
+     وبقيّة المفاتيح عرضٌ للتحصيل لا تغيّر ترتيباً محفوظاً. */
+  const [sortKey, setSortKey] = useState<FinanceSortKey>("manual");
+  const [sortDir, setSortDir] = useState<FinanceSortDir>("asc");
+
+  // مودال دفعة
+  const [showPayModal, setShowPayModal] = useState(false);
+  const [payForm, setPayForm]           = useState<PayForm>({ amount:"", payment_date:localDateISO(), method:"نقدي", notes:"" });
+  const [savingPay, setSavingPay]       = useState(false);
+
+  // إيصال
+  /* الإيصالُ هو ما يُعرَض ويُطبَع — لا سطرُ الدفع */
+  const [issuedReceipt, setIssuedReceipt]   = useState<PaymentReceipt | null>(null);
+  const [cancelTarget, setCancelTarget]     = useState<PaymentReceipt | null>(null);
+  const [viewReceipt, setViewReceipt]       = useState<PaymentReceipt | null>(null);
+  const [cancelReason, setCancelReason]     = useState("");
+  const [cancelling, setCancelling]         = useState(false);
+  const [selectedPayment, setSelectedPayment] = useState<Payment | null>(null);
+
+  // مودال بند خاص
+  const [showChargeModal, setShowChargeModal] = useState(false);
+  const [chargeType, setChargeType]           = useState<"إضافة"|"خصم">("إضافة");
+  const [chargeForm, setChargeForm]           = useState<ChargeForm>({ description:"", amount:"", notes:"" });
+  const [chargeErrors, setChargeErrors]       = useState<ChargeErrors>({ description: false, amount: false });
+
+  // مودال التأكيد الموحد (بديل window.confirm)
+  const { confirmState, confirmAction: showConfirm, handleConfirm: handleConfirmYes, handleCancel: handleConfirmNo } = useConfirm();
+  const [savingCharge, setSavingCharge]       = useState(false);
+
+  // إعدادات أسعار
+  const [editPricing, setEditPricing]     = useState<Record<string, string>>({});
+  const [savingPricing, setSavingPricing] = useState(false);
+
+  // تقارير
+  const [reportType, setReportType] = useState<"full"|"late"|"payments"|"packages"|"addons"|"cashflow">("full");
+  const [cashflowFrom, setCashflowFrom] = useState("");
+  const [cashflowTo,   setCashflowTo]   = useState("");
+
+  // مجموعات مالية
+  const [showAddMemberModal, setShowAddMemberModal]           = useState(false);
+  const [showPassengerGroupModal, setShowPassengerGroupModal] = useState(false);
+  const [groupModalMode, setGroupModalMode]       = useState<"create"|"addTo">("create");
+  const [groupForm, setGroupForm]                 = useState({ name:"", notes:"" });
+  const [savingGroup, setSavingGroup]             = useState(false);
+  const [addingMemberId, setAddingMemberId]       = useState<number | null>(null);
+  const [showGroupPayModal, setShowGroupPayModal] = useState(false);
+
+  /* إغلاق المودالات بمفتاح Escape — مودالات الإدخال تطلب تأكيداً */
+  useEffect(() => {
+    const h = async (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const askClose = async (msg: string) => showConfirm(msg, { title: "إغلاق النموذج" });
+      if (showGroupPayModal) { if (await askClose("هل تريد الإغلاق؟ ستفقد البيانات المدخلة.")) setShowGroupPayModal(false); return; }
+      if (showAddMemberModal || showPassengerGroupModal) { if (await askClose("هل تريد الإغلاق؟ ستفقد البيانات المدخلة.")) { setShowAddMemberModal(false); setShowPassengerGroupModal(false); } return; }
+      if (showChargeModal)   { if (await askClose("هل تريد الإغلاق؟ ستفقد البيانات المدخلة.")) setShowChargeModal(false); return; }
+      if (showPayModal)      { if (await askClose("هل تريد الإغلاق؟ ستفقد البيانات المدخلة.")) setShowPayModal(false); return; }
+      if (selectedPayment) { setSelectedPayment(null); return; }
+      if (selectedGroup)   { setSelectedGroup(null); return; }
+      if (selectedP)       { setSelectedP(null); return; }
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, [selectedP, selectedGroup, selectedPayment, showPayModal, showChargeModal, showAddMemberModal, showPassengerGroupModal, showGroupPayModal]);
+  const [groupPayForm, setGroupPayForm]           = useState<GroupPayForm>({ amount:"", payment_date:localDateISO(), method:"نقدي", notes:"" });
+  const [savingGroupPay, setSavingGroupPay]       = useState(false);
+
+  // بيانات الشركة للطباعة
+  const { primaryColor, accentColor, companyName, tagline, logoUrl } = reportBranding;
+  const printBrand: PrintBrand = { logoUrl, companyName, tagline, primaryColor, accentColor };
+
+  useEffect(() => { loadFinanceData(); }, []);
+
+  /* تحديث لحظي للبيانات المالية */
+  useEffect(() => {
+    const channel = supabase
+      .channel("finance-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "payments" },                 () => loadFinanceData(true))
+      .on("postgres_changes", { event: "*", schema: "public", table: "custom_charges" },           () => loadFinanceData(true))
+      .on("postgres_changes", { event: "*", schema: "public", table: "pricing_settings" },         () => loadFinanceData(true))
+      .on("postgres_changes", { event: "*", schema: "public", table: "financial_groups" },         () => loadFinanceData(true))
+      .on("postgres_changes", { event: "*", schema: "public", table: "financial_group_members" },  () => loadFinanceData(true))
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, []);
+
+  /* القاعدة تفرض financial_group_members_passenger_id_key UNIQUE (passenger_id)،
+     فلو سبق مستخدمٌ آخر بإضافة الحاج بين فحصنا وإدراجنا يعود الخطأ 23505.
+     نترجمه إلى رسالة مفهومة بدل رسالة عامة */
+  function groupMemberErrorMessage(error: { code?: string; message?: string } | null): string {
+    if (error?.code === "23505" || /duplicate key|unique constraint/i.test(error?.message || "")) {
+      return "هذا الحاج منتمٍ بالفعل إلى مجموعة مالية. لا يمكن ضمّه إلى أكثر من مجموعة.";
+    }
+    return "تعذر إضافة الحاج إلى المجموعة";
+  }
+
+  function requireManage(): boolean {
+    if (canManage) return true;
+    showAlert("error", "لا تملك صلاحية إجراء عمليات مالية");
+    return false;
+  }
+
+  async function loadFinanceData(silent = false) {
+    if (silent) setRefreshing(true); else setLoading(true);
+    /* الموسم المقفل يقرأ لقطته، والمفتوح يقرأ الحيّ. والحيّ يُجلب في
+       الحالتين: محرّر الأسعار في تبويب الإعدادات يعرض الإعداد الحاليّ
+       للشركة دائماً، لا سعراً تاريخياً لا يُعدَّل. */
+    const isArchived = viewedSeason.closed_at !== null;
+
+    const [pRes, pyRes, ccRes, gRes, gmRes, snapRes, rcRes] = await Promise.all([
+      supabase.from("pricing_settings").select("*"),
+      /* حالةُ الإيصالِ الأبِ تأتي مُضمَّنةً في نفسِ الاستعلام، فلا ربطَ
+         يدويٌّ ولا خريطةٌ تُمرَّر إلى دالّاتِ الحساب. */
+      supabase.from("payments").select("*, receipt:payment_receipts(*)").order("payment_date", { ascending:false }),
+      supabase.from("custom_charges").select("*"),
+      supabase.from("financial_groups").select("*").eq("season_id", viewedSeason.id).order("created_at", { ascending:false }),
+      supabase.from("financial_group_members").select("*"),
+      isArchived
+        ? supabase.from("season_pricing_snapshot").select("key,label,type,amount").eq("season_id", viewedSeason.id)
+        : Promise.resolve({ data: null, error: null }),
+      /* الإيصالاتُ تُجلب مستقلّةً لا مشتقّةً من الدفعات: إيصالٌ زالت
+         سطورُه كلُّها (أُزيل حاجُّه) يبقى في التقرير — المالُ استُلم. */
+      supabase.from("payment_receipts").select("*").eq("season_id", viewedSeason.id).order("receipt_number", { ascending:false }),
+    ]);
+
+    /* تصنيفُ الكيانات المُسنَدة — خارج حسابِ الفشل الجزئيّ لأنه سياقٌ
+       إخباريّ لا رقمٌ ماليّ: غيابه يُسكت السطر ولا يُفسد مبلغاً. */
+    const [busRes, campRes, roomRes] = await Promise.all([
+      supabase.from("buses").select("id,type"),
+      supabase.from("camps").select("id,type"),
+      supabase.from("rooms").select("id,type"),
+    ]);
+    const toTypeMap = (rows: { id:number; type:string|null }[] | null) => {
+      const m = new Map<number, string>();
+      (rows ?? []).forEach(r => { if (r.type) m.set(r.id, r.type); });
+      return m;
+    };
+    setAllocTypes({
+      bus:  toTypeMap(busRes.data  as { id:number; type:string|null }[] | null),
+      camp: toTypeMap(campRes.data as { id:number; type:string|null }[] | null),
+      room: toTypeMap(roomRes.data as { id:number; type:string|null }[] | null),
+    });
+
+    /* أي جزء يفشل يُبلَّغ عنه صراحةً ولا يُكتب في الحالة، حتى لا تُعرض
+       بيانات ناقصة كأنها كاملة (مثلاً دفعات بلا بنود خاصة = رصيد مضلِّل) */
+    const parts: { res: { error: unknown }; label: string }[] = [
+      { res: pRes,  label: "الأسعار" },
+      { res: pyRes, label: "الدفعات" },
+      { res: ccRes, label: "البنود الخاصة" },
+      { res: gRes,  label: "المجموعات المالية" },
+      { res: gmRes, label: "أعضاء المجموعات" },
+      { res: snapRes as { error: unknown }, label: "لقطة تسعير الموسم" },
+      { res: rcRes, label: "الإيصالات" },
+    ];
+    const failed = parts.filter(p => p.res.error).map(p => p.label);
+
+    const toMap = (rows: PricingRow[]): PricingMap => {
+      const map: PricingMap = {};
+      rows.forEach(r => { map[r.key] = { label: r.label, amount: Number(r.amount), type: r.type }; });
+      return map;
+    };
+
+    if (pRes.data && !pRes.error) {
+      const em: Record<string,string> = {};
+      (pRes.data as PricingRow[]).forEach(r => { em[r.key] = String(r.amount); });
+      /* محرّر الأسعار من الحيّ دائماً — إعداد الشركة الحاليّ */
+      setEditPricing(em);
+    }
+
+    /* نقطة الحسم الوحيدة: من أين تأتي خريطة الأسعار التي تُحسب بها
+       الأرقام. `calcTotalDue` لا يتغيّر ولا يعرف بالفرق — يتغيّر
+       المصدر لا طريقة الحساب. */
+    const snapRows = (snapRes.data ?? []) as PricingRow[] | null;
+    if (isArchived && snapRows && snapRows.length > 0) {
+      setPricing(toMap(snapRows));
+      setPricingSource("snapshot");
+    } else if (pRes.data && !pRes.error) {
+      setPricing(toMap(pRes.data as PricingRow[]));
+      /* فشلُ الجلب لا يُقرأ غياباً: «أُقفل قبل الآلية» جملةٌ عن الماضي
+         لا تصحّ حين يكون السبب عطلاً الآن. */
+      setPricingSource(!isArchived ? "live" : (snapRes.error ? "error" : "missing"));
+    }
+    if (pyRes.data && !pyRes.error) setPayments(pyRes.data as unknown as Payment[]);
+    if (rcRes.data && !rcRes.error) setReceipts(rcRes.data as PaymentReceipt[]);
+    if (ccRes.data && !ccRes.error) setCustomCharges(ccRes.data as CustomCharge[]);
+    if (gRes.data  && !gRes.error)  setGroups(gRes.data as FinancialGroup[]);
+    if (gmRes.data && !gmRes.error) setGroupMembers(gmRes.data as FinancialGroupMember[]);
+
+    if (failed.length === 0) {
+      setLastUpdated(new Date());
+      setLoadError(null);
+    } else {
+      const msg = `تعذر تحميل: ${failed.join("، ")}. الأرقام المعروضة غير مكتملة ولا يُعتمد عليها.`;
+      setLoadError(msg);
+      showAlert("error", `${msg} أعد المحاولة.`);
+    }
+
+    setLoading(false);
+    setRefreshing(false);
+  }
+
+  /* خرائط مُجهّزة مسبقاً لتفادي تكرار البحث داخل المصفوفات */
+  const paymentsByPassenger = useMemo(() => {
+    const map = new Map<number, Payment[]>();
+    for (const py of payments) {
+      const list = map.get(py.passenger_id) ?? [];
+      list.push(py);
+      map.set(py.passenger_id, list);
+    }
+    return map;
+  }, [payments]);
+
+  const chargesByPassenger = useMemo(() => {
+    const map = new Map<number, CustomCharge[]>();
+    for (const c of customCharges) {
+      const list = map.get(c.passenger_id) ?? [];
+      list.push(c);
+      map.set(c.passenger_id, list);
+    }
+    return map;
+  }, [customCharges]);
+
+  const groupByPassenger = useMemo(() => {
+    const byId = new Map<number, FinancialGroup>();
+    for (const g of groups) byId.set(g.id, g);
+    const map = new Map<number, FinancialGroup>();
+    for (const m of groupMembers) {
+      const g = byId.get(m.group_id);
+      if (g && !map.has(m.passenger_id)) map.set(m.passenger_id, g);
+    }
+    return map;
+  }, [groups, groupMembers]);
+
+  const groupPassengerIds = useMemo(() => new Set(groupMembers.map(m => m.passenger_id)), [groupMembers]);
+
+  /* §٤ من #42: الدفعاتُ والرسومُ تُشتقّ موسمَها من الحاجّ — وهو
+     الصواب، إذ لا تُتصوَّر دفعةٌ بموسمٍ يخالف صاحبَها. وهذه
+     المجموعة أداةُ ذلك الاشتقاق. أمّا المجموعةُ المالية فصارت
+     موسميةً بالتخزين في م٧/٣، وتُجلب بموسمها أعلاه. */
+  const viewedPassengerIds = useMemo(() => new Set(passengers.map(p => p.id)), [passengers]);
+
+
+  /* حفظُ رقمِ البداية عبر الدالّةِ المعتمَدةِ وحدَها. ولا تفاؤلَ:
+     لا يُعلَن نجاحٌ إلا بعد أن تعود الدالّةُ بلا خطأ، ثُمّ تُقرأ
+     حالةُ الموسمِ المُثبَتةُ من القاعدة. */
+  async function saveReceiptStart() {
+    const raw = (startEdit?.seasonId === viewedSeason.id
+      ? startEdit.value
+      : String(viewedSeason.receipt_start_number ?? 1)).trim();
+    if (!raw) { setStartMsg({ text: "أدخل رقم البداية.", ok: false }); return; }
+    if (!/^\d+$/.test(raw)) {
+      setStartMsg({ text: "رقم البداية عدد صحيح موجب — بلا كسور ولا إشارة.", ok: false }); return; }
+    const n = Number(raw);
+    if (!Number.isSafeInteger(n) || n < 1) {
+      setStartMsg({ text: "رقم البداية يجب أن يكون ١ أو أكبر.", ok: false }); return; }
+
+    setStartSaving(true);
+    setStartMsg(null);
+    const { error } = await supabase.rpc("set_season_receipt_start", {
+      p_season_id: viewedSeason.id, p_start: n,
+    });
+    if (error) {
+      setStartSaving(false);
+      /* رسالةُ الخادمِ كما هي — هي التي تقول «صدرت إيصالات» أو
+         «الموسم مقفل»، ولا تُستبدَل بعبارةٍ عامّةٍ تُخفيها. */
+      setStartMsg({ text: error.message || "تعذّر حفظ رقم البداية.", ok: false });
+      return;
+    }
+    await refreshSeasons();
+    /* يُطرَح المُخزَّنُ فيرجع العرضُ إلى قيمةِ القاعدةِ المُثبَتة */
+    setStartEdit(null);
+    setStartSaving(false);
+    setStartMsg({ text: "تم حفظ رقم البداية.", ok: true });
+  }
+
+  async function savePricing() {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    const rows: { key:string; label:string; type:string; amount:number; updated_at:string }[] = [];
+    for (const key of Object.keys(editPricing)) {
+      const amount = Number(editPricing[key]);
+      if (!Number.isFinite(amount) || amount < 0) {
+        const meta = PRICING_KEYS.find(k => k.key === key);
+        showAlert("error", `قيمة غير صالحة في: ${meta?.label || key}`);
+        return;
+      }
+      const meta = PRICING_KEYS.find(k => k.key === key);
+      rows.push({
+        key,
+        label: pricing[key]?.label || meta?.label || key,
+        type:  pricing[key]?.type  || meta?.type  || "addon",
+        amount,
+        updated_at: new Date().toISOString(),
+      });
+    }
+    if (rows.length === 0) return;
+    setSavingPricing(true);
+    const { error } = await supabase.from("pricing_settings").upsert(rows, { onConflict: "key" });
+    setSavingPricing(false);
+    if (error) { showAlert("error", "تعذر حفظ الأسعار، لم يتم تطبيق أي تغيير"); return; }
+    await loadFinanceData(true);
+    showAlert("success","تم حفظ الأسعار بنجاح");
+  }
+
+  async function saveCustomPrice() {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    if (!selectedP) return;
+    setSavingCustomPrice(true);
+    const amt = Number(customPriceInput);
+    if (!Number.isFinite(amt) || amt < 0) {
+      showAlert("error", "يرجى إدخال سعر صحيح غير سالب");
+      setSavingCustomPrice(false);
+      return;
+    }
+    const newServices = { ...selectedP.services, custom_price: String(amt) };
+    const { error } = await supabase.from("passengers").update({ custom_price: amt }).eq("id", selectedP.id);
+    if (!error) {
+      setSelectedP({ ...selectedP, services: newServices });
+      setPassengers?.(prev => prev.map(p => p.id === selectedP.id ? { ...p, services: newServices } as Passenger : p));
+      setEditingCustomPrice(false);
+      showAlert("success", "تم حفظ السعر الخاص");
+    } else {
+      showAlert("error", "حدث خطأ أثناء حفظ السعر");
+    }
+    setSavingCustomPrice(false);
+  }
+
+  async function addPayment() {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    if (!selectedP) return;
+    const amount = Number(payForm.amount);
+    if (!payForm.amount.trim() || !Number.isFinite(amount) || amount <= 0) {
+      showAlert("error", "يرجى إدخال مبلغ صحيح أكبر من صفر");
+      return;
+    }
+    if (!payForm.payment_date || Number.isNaN(new Date(payForm.payment_date).getTime())) {
+      showAlert("error", "يرجى تحديد تاريخ صحيح للدفعة");
+      return;
+    }
+    const dueNow  = calcTotalDue(selectedP, pricing, chargesByPassenger);
+    const paidNow = calcTotalPaid(selectedP.id, paymentsByPassenger);
+    const remaining = dueNow - paidNow;
+    if (amount > remaining) {
+      const ok = await showConfirm(
+        `المبلغ المدخل يتجاوز المتبقي على الحاج (${fmtAmt(remaining)} ر.ق). سيُسجَّل الفارق رصيداً دائناً للحاج. هل تريد المتابعة؟`,
+        { title: "مبلغ يتجاوز المتبقي" }
+      );
+      if (!ok) return;
+    }
+    setSavingPay(true);
+    /* ⚠️ الرقمُ يُخصَّص في القاعدةِ داخلَ نفسِ معاملةِ الإدراج: لا
+       MAX()+1 ولا قراءةٌ ثُمّ كتابة. والدالّةُ تبني سطورَ التوزيعِ
+       وتضبط `created_by` من الرمزِ لا من جسمِ الطلب. */
+    const { data, error } = await supabase.rpc("issue_payment_receipt", {
+      p_allocations: [{ passenger_id: selectedP.id, amount }],
+      p_payment_date: payForm.payment_date,
+      p_method: payForm.method,
+      p_notes: payForm.notes || null,
+      p_group_name: null,
+    });
+    setSavingPay(false);
+    if (error || !data) {
+      showAlert("error", error?.message || "تعذر تسجيل الدفعة، يرجى المحاولة مرة أخرى");
+      return;
+    }
+    setShowPayModal(false);
+    setIssuedReceipt(data as PaymentReceipt);
+    setPayForm({ amount:"", payment_date:localDateISO(), method:"نقدي", notes:"" });
+    /* إعادةُ الجلبِ لا دفعٌ محلّيّ: السطورُ أُنشئت في القاعدةِ ولها
+       حالةُ أبٍ مُضمَّنةٌ لا تُخمَّن هنا. */
+    void loadFinanceData(true);
+  }
+
+  /* ═══ لا حذفَ لدفعةٍ صادرٍ إيصالُها ═══
+     الحذفُ الصلبُ كان يمحو سطرَ الدفعِ ولا يبقى إلا صفُّ تدقيقٍ يُهذَّب
+     بعد خمسِ سنوات. والآن يُلغى **الإيصال**: الرقمُ يبقى مشغولاً،
+     والسطورُ باقيةٌ لا تُمَسّ، والسببُ مطلوبٌ ومحفوظ. */
+  function requestCancelReceipt(id: number) {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    const py = payments.find(p => p.id === id);
+    const rc = py?.receipt ?? null;
+    if (!rc) {
+      showAlert("error", "هذه دفعةٌ قديمةٌ بلا إيصال — لا يمكن إلغاؤها من هنا");
+      return;
+    }
+    if (rc.status === "cancelled") { showAlert("error", "الإيصال ملغى بالفعل"); return; }
+    setCancelReason("");
+    setCancelTarget(rc);
+  }
+
+  async function confirmCancelReceipt() {
+    if (!cancelTarget) return;
+    if (!cancelReason.trim()) { showAlert("error", "سبب الإلغاء مطلوب"); return; }
+    setCancelling(true);
+    const { data, error } = await supabase.rpc("cancel_payment_receipt", {
+      p_receipt_id: cancelTarget.id,
+      p_reason: cancelReason.trim(),
+    });
+    setCancelling(false);
+    if (error || !data) { showAlert("error", error?.message || "تعذر إلغاء الإيصال، لم يتغيّر شيء"); return; }
+    setCancelTarget(null);
+    setCancelReason("");
+    setSelectedPayment(null);
+    void loadFinanceData(true);
+    showAlert("success", `تم إلغاء الإيصال رقم ${(data as PaymentReceipt).receipt_number}`);
+  }
+
+  async function addCustomCharge() {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    const amount = Number(chargeForm.amount);
+    const badAmount = !chargeForm.amount.trim() || !Number.isFinite(amount) || amount <= 0;
+    const errs = { description: !chargeForm.description.trim(), amount: badAmount };
+    setChargeErrors(errs);
+    if (!selectedP || errs.description || errs.amount) {
+      if (badAmount && chargeForm.amount.trim()) showAlert("error", "يرجى إدخال مبلغ صحيح أكبر من صفر");
+      return;
+    }
+    setSavingCharge(true);
+    const { data, error } = await supabase.from("custom_charges").insert({ passenger_id:selectedP.id, description:chargeForm.description, amount, type:chargeType, notes:chargeForm.notes, created_by:currentUser.email||"" }).select().single();
+    setSavingCharge(false);
+    if (error || !data) { showAlert("error", "تعذر حفظ البند، يرجى المحاولة مرة أخرى"); return; }
+    setCustomCharges(prev => [...prev, data as CustomCharge]);
+    setShowChargeModal(false);
+    setChargeForm({ description:"", amount:"", notes:"" });
+  }
+
+  async function deleteCustomCharge(id: number) {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    const target = customCharges.find(c => c.id === id);
+    const what = target
+      ? `${target.type === "إضافة" ? "بند خاص" : "خصم خاص"} «${target.description}» بمبلغ ${fmtAmt(Number(target.amount))} ر.ق`
+      : "هذا البند";
+    if (!await showConfirm(`هل تريد حذف ${what}؟ لا يمكن التراجع.`, { title: "حذف بند" })) return;
+    const { error } = await supabase.from("custom_charges").delete().eq("id",id);
+    if (error) { showAlert("error", "تعذر حذف البند، لم يتم تنفيذ الحذف"); return; }
+    setCustomCharges(prev => prev.filter(c => c.id !== id));
+    showAlert("success", "تم حذف البند");
+  }
+
+  function getPassengerGroup(passengerId: number): FinancialGroup | null {
+    return groupByPassenger.get(passengerId) || null;
+  }
+
+  function getGroupPassengers(groupId: number): Passenger[] {
+    const pids = groupMembers.filter(m => m.group_id === groupId).map(m => m.passenger_id);
+    return passengers.filter(p => pids.includes(p.id));
+  }
+
+  async function createGroupAndAdd() {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    if (!selectedP) return;
+    if (!groupForm.name.trim()) { showAlert("error", "يرجى إدخال اسم المجموعة"); return; }
+    if (groupPassengerIds.has(selectedP.id)) {
+      showAlert("error", "هذا الحاج منتمٍ بالفعل إلى مجموعة مالية أخرى");
+      return;
+    }
+    setSavingGroup(true);
+    /* إنشاء المجموعة وأول عضو داخل معاملة واحدة على الخادم — أي فشل
+       أو انقطاع يُرجع الاثنين معاً فلا تبقى مجموعة فارغة */
+    const { data, error } = await supabase.rpc("create_financial_group_with_member", {
+      p_name: groupForm.name.trim(),
+      p_notes: groupForm.notes,
+      p_created_by: currentUser.email || "",
+      p_passenger_id: selectedP.id,
+    });
+    setSavingGroup(false);
+    if (error || !data) {
+      showAlert("error", error?.code === "23505"
+        ? "هذا الحاج منتمٍ بالفعل إلى مجموعة مالية. لم يتم إنشاء المجموعة."
+        : "تعذر إنشاء المجموعة، يرجى المحاولة مرة أخرى");
+      if (error?.code === "23505") loadFinanceData(true);
+      return;
+    }
+    const { group: grp, member: mem } = data as unknown as CreatedGroupWithMember;
+    setGroups(prev => [grp, ...prev]);
+    setGroupMembers(prev => [...prev, mem]);
+    setShowPassengerGroupModal(false);
+    setGroupForm({ name:"", notes:"" });
+    showAlert("success", `تم إنشاء المجموعة "${grp.name}" بنجاح`);
+  }
+
+  async function addMemberToGroup(groupId: number, passengerId: number) {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    if (addingMemberId === passengerId) return;
+    const existing = groupMembers.find(m => m.passenger_id === passengerId);
+    if (existing) {
+      showAlert("error", existing.group_id === groupId
+        ? "هذا الحاج مضاف بالفعل إلى هذه المجموعة"
+        : "هذا الحاج منتمٍ بالفعل إلى مجموعة مالية أخرى");
+      return;
+    }
+    setAddingMemberId(passengerId);
+    const { data, error } = await supabase.from("financial_group_members").insert({ group_id:groupId, passenger_id:passengerId }).select().single();
+    setAddingMemberId(null);
+    if (error || !data) {
+      showAlert("error", groupMemberErrorMessage(error));
+      if (error?.code === "23505") loadFinanceData(true);
+      return;
+    }
+    setGroupMembers(prev => [...prev, data as FinancialGroupMember]);
+    setShowAddMemberModal(false);
+    setShowPassengerGroupModal(false);
+    showAlert("success","تمت إضافة الحاج إلى المجموعة بنجاح");
+  }
+
+  async function removeFromGroup(passengerId: number, groupId: number) {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    /* المجموعة لا يجوز أن تبقى بلا أعضاء — إزالة آخر عضو تعني حذف المجموعة بالكامل */
+    const isLastMember = groupMembers.filter(m => m.group_id === groupId).length <= 1;
+    const confirmed = isLastMember
+      ? await showConfirm("هذا آخر عضو في المجموعة. عند المتابعة سيتم حذف المجموعة بالكامل. هل تريد الاستمرار؟", { title: "حذف المجموعة" })
+      : await showConfirm("هل تريد إزالة هذا الحاج من المجموعة؟", { title: "إزالة من المجموعة" });
+    if (!confirmed) return;
+
+    const { error } = await supabase.from("financial_group_members").delete().eq("group_id",groupId).eq("passenger_id",passengerId);
+    if (error) { showAlert("error", "تعذر إزالة الحاج من المجموعة"); return; }
+
+    if (isLastMember) {
+      /* حذف المجموعة يتم تلقائياً في قاعدة البيانات، والاستدعاء هنا للتأكيد ولا يفشل إن كانت محذوفة */
+      const { error: gErr } = await supabase.from("financial_groups").delete().eq("id",groupId);
+      if (gErr) {
+        showAlert("error", "تمت إزالة الحاج، لكن تعذر حذف المجموعة الفارغة");
+        setGroupMembers(prev => prev.filter(m => !(m.group_id===groupId && m.passenger_id===passengerId)));
+        return;
+      }
+      setGroupMembers(prev => prev.filter(m => m.group_id !== groupId));
+      setGroups(prev => prev.filter(g => g.id !== groupId));
+      if (selectedGroup?.id === groupId) { setSelectedGroup(null); if (subView === "group") setSubView("list"); }
+      showAlert("success", "تمت إزالة آخر عضو وحُذفت المجموعة");
+      return;
+    }
+
+    setGroupMembers(prev => prev.filter(m => !(m.group_id===groupId && m.passenger_id===passengerId)));
+    showAlert("success", "تمت إزالة الحاج من المجموعة");
+  }
+
+  async function deleteGroup(groupId: number) {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    if (!await showConfirm("هل تريد حذف هذه المجموعة؟", { title: "حذف مجموعة" })) return;
+    const { error } = await supabase.from("financial_groups").delete().eq("id",groupId);
+    if (error) { showAlert("error", "تعذر حذف المجموعة، لم يتم تنفيذ الحذف"); return; }
+    setGroups(prev => prev.filter(g => g.id !== groupId));
+    setGroupMembers(prev => prev.filter(m => m.group_id !== groupId));
+    setSubView("list"); setSelectedGroup(null);
+  }
+
+  async function addGroupPayment() {
+    if (!assertWritable()) return;
+    if (!requireManage()) return;
+    if (!selectedGroup) return;
+    const total = Number(groupPayForm.amount);
+    if (!groupPayForm.amount.trim() || !Number.isFinite(total) || total <= 0) {
+      showAlert("error", "يرجى إدخال مبلغ صحيح أكبر من صفر");
+      return;
+    }
+    if (!groupPayForm.payment_date || Number.isNaN(new Date(groupPayForm.payment_date).getTime())) {
+      showAlert("error", "يرجى تحديد تاريخ صحيح للدفعة");
+      return;
+    }
+    const members = getGroupPassengers(selectedGroup.id);
+    if (members.length === 0) { showAlert("error", "لا يوجد أعضاء في هذه المجموعة"); return; }
+    setSavingGroupPay(true);
+    /* التوزيع بالسنتات: يُضاف فرق التقريب إلى الأعضاء الأخيرين ليساوي المجموع المبلغ المدخل تماماً */
+    const totalUnits = Math.round(total * 100);
+    const baseUnits  = Math.floor(totalUnits / members.length);
+    const extraUnits = totalUnits - baseUnits * members.length;
+    const shares = members.map((_, i) => (baseUnits + (i >= members.length - extraUnits ? 1 : 0)) / 100);
+    /* دفعةُ المجموعةِ حدثٌ **واحد**: إيصالٌ واحدٌ برقمٍ واحد، وسطورُ
+       توزيعٍ عدّة. ومنطقُ التوزيعِ بالسنتاتِ أعلاه لم يتغيّر حرفاً —
+       يُمرَّر كما هو والقاعدةُ تجمعه فتُحسب الإجمالياتُ منه لا من مُدخَل. */
+    const { data, error } = await supabase.rpc("issue_payment_receipt", {
+      p_allocations: members.map((p, i) => ({ passenger_id: p.id, amount: shares[i] })),
+      p_payment_date: groupPayForm.payment_date,
+      p_method: groupPayForm.method,
+      p_notes: groupPayForm.notes || null,
+      p_group_name: selectedGroup.name,
+    });
+    setSavingGroupPay(false);
+    if (error || !data) { showAlert("error", error?.message || "تعذر توزيع الدفعة، لم يتم تسجيل أي مبلغ"); return; }
+    setIssuedReceipt(data as PaymentReceipt);
+    void loadFinanceData(true);
+    setShowGroupPayModal(false);
+    setGroupPayForm({ amount:"", payment_date:localDateISO(), method:"نقدي", notes:"" });
+    const minShare = Math.min(...shares), maxShare = Math.max(...shares);
+    const shareText = minShare === maxShare ? `${fmtAmt(minShare)} ر.ق للفرد` : `${fmtAmt(minShare)} — ${fmtAmt(maxShare)} ر.ق للفرد`;
+    showAlert("success", `تم توزيع ${fmtAmt(total)} ر.ق على ${members.length} من الأعضاء (${shareText})`);
+  }
+
+  // ── تصدير التقارير ──
+  function exportFullReportXLSX(data:{p:Passenger;due:number;paid:number;balance:number}[], title="تقرير الحجاج المالي الكامل") {
+    const headers = ["م", "الاسم", "الباقة", "المطلوب", "المدفوع", "المتبقي", "الحالة"];
+    const rows = data.map((r, i) => {
+      const st = financeStatus(r.due, r.paid);
+      return [
+        i + 1,
+        r.p.short_ar || r.p.name_ar,
+        getPriceInfo(r.p.services, pricing).label.replace("باقة ", ""),
+        r.due,
+        r.paid,
+        r.balance,
+        st.label,
+      ];
+    });
+    const tD = data.reduce((s, r) => s + r.due, 0);
+    const tP = data.reduce((s, r) => s + r.paid, 0);
+    const tB = tD - tP;
+    const ws = XLSX.utils.aoa_to_sheet([
+      headers,
+      ...rows,
+      ["", "الإجمالي", "", tD, tP, tB, ""],
+    ]);
+    ws["!cols"] = [{ wch: 4 }, { wch: 28 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 12 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "التقرير");
+    XLSX.writeFile(wb, `${title}.xlsx`);
+  }
+
+  // مساعدات التصميم
+  /* الترتيب المعتمَد للمشروع: `sort_order` ثم `id` يحسم التعادل —
+     بالمساعد المشترك نفسه، فلا فرزَ ثانٍ ينحرف عنه. */
+  const sortedPassengers = useMemo(
+    () => passengers.filter(isHajj).sort(byOrder("sort_order")),
+    [passengers],
+  );
+
+  /* المطلوب والمدفوع والمتبقّي مرّةً واحدة لكل حاجّ — كانت `calcTotalDue`
+     تُنادى أربع مرّاتٍ لكل صفّ في كل رسمة. الحساب نفسه لم يتغيّر:
+     `totalsFor` تستدعي `calcTotalDue` وهي المصدر الوحيد كما هي. */
+  const totalsByPassenger = useMemo(() => {
+    const m = new Map<number, FinanceTotals>();
+    for (const p of sortedPassengers) m.set(p.id, totalsFor(p, pricing, chargesByPassenger, paymentsByPassenger));
+    return m;
+  }, [sortedPassengers, pricing, chargesByPassenger, paymentsByPassenger]);
+
+  const summary = useMemo(() => {
+    let due = 0, paid = 0, lateCount = 0;
+    for (const t of totalsByPassenger.values()) {
+      due += t.due; paid += t.paid;
+      if (t.balance > 0) lateCount += 1;
+    }
+    return { due, paid, balance: due - paid, lateCount };
+  }, [totalsByPassenger]);
+  const inputStyle = { width:"100%", padding:"8px 12px", borderRadius:8, border:"1px solid var(--border)", background:"var(--bg-input)", fontFamily:"var(--font-body)", fontSize:13, boxSizing:"border-box" as const };
+  const thStyle    = { padding:"10px 12px", background:"var(--em8)", color:"#fff", textAlign:"right" as const, fontSize:12, fontWeight:600 };
+  const tdStyle    = { padding:"8px 12px", border:"1px solid var(--border)", fontSize:13 };
+
+  const filteredPassengers = useMemo(() => {
+    const wanted: Record<string,string> = { paid:"مسدد", partial:"جزئي", unpaid:"لم يدفع", unpriced:"غير مسعّر", credit:"رصيد دائن" };
+    const rows = sortedPassengers.filter(p => {
+      if (!matchesFinanceSearch(p, searchTerm)) return false;
+      if (!matchesPackageFilter(p, filterPackage)) return false;
+      if (!matchesServiceFilter(p, filterService)) return false;
+      if (filterStatus !== "all") {
+        const t = totalsByPassenger.get(p.id);
+        if (!t) return false;
+        if (financeStatus(t.due, t.paid).label !== wanted[filterStatus]) return false;
+      }
+      return true;
+    });
+    return sortFinanceRows(rows, totalsByPassenger, sortKey, sortDir);
+  }, [sortedPassengers, totalsByPassenger, searchTerm, filterPackage, filterService, filterStatus, sortKey, sortDir]);
+
+  /* «سعر خاص» — عددُهم ومجموعُ أسعارهم اليدويّة. مصدرٌ واحد تقرأه
+     الشاشة، ونسخةُ الطباعة تحسبه بالمنطق نفسه في `finance.print.ts`. */
+  const specialPkg = useMemo(() => {
+    const rows = sortedPassengers.filter(isSpecialPackage);
+    return { count: rows.length, total: rows.reduce((sum, p) => sum + (Number(p.services.custom_price) || 0), 0) };
+  }, [sortedPassengers]);
+
+  /* ضغطةٌ على العمود نفسه تقلب الاتّجاه، وعلى عمودٍ آخر تبدأ تنازلياً
+     للمبالغ (الأكبر أوّلاً هو المطلوب في التحصيل) وتصاعدياً للاسم. */
+  function changeSort(key: FinanceSortKey) {
+    if (key === sortKey) { setSortDir(d => d === "asc" ? "desc" : "asc"); return; }
+    setSortKey(key);
+    setSortDir(key === "name" ? "asc" : "desc");
+  }
+
+  /* سطورُ توزيعِ إيصالٍ بأسماءِ أصحابِها — للطباعةِ وحدَها.
+     وإيصالٌ زالت سطورُه (أُزيل حاجُّه) يُطبَع بإجماليِّه التاريخيِّ
+     بلا جدولِ أنصبة: الإجماليُّ لا يُعاد حسابُه من الباقي. */
+  const allocationsOf = (rc: PaymentReceipt) =>
+    payments
+      .filter(py => py.receipt_id === rc.id)
+      .map(py => {
+        const p = passengers.find(x => x.id === py.passenger_id);
+        return { name: p ? (p.short_ar || p.name_ar) : "—", amount: Number(py.amount) };
+      });
+
+  /* ═══ حدُّ التكاملِ مع الختمِ والتوقيع (PR #177) — أصغرُ ما يكفي ═══
+     الأصلانِ خاصّان: المخزَّنُ في `company_assets.asset_url` **مفتاحُ
+     كائنٍ** لا رابط. فيُوقَّع هنا لحظةَ الطباعةِ بعمرٍ قصير، ويُمرَّر
+     إلى القشرةِ `src` جاهزاً — ولا يُخزَّن الرابطُ الموقَّعُ بحال،
+     ولا يُعلَن مفتاحُ الكائن، ولا تُمَسُّ حاويةٌ ولا سياسةٌ من #177.
+
+     ومَن يُوقَّع له: قراءةُ الحاويةِ الخاصّةِ لـ`manage_users` (كلُّ
+     كائناتِها)، و**لـ`manage_payments` كائنا الختمِ والتوقيعِ وحدَهما**
+     (الترحيلة 20260926092000). ومن لا يملك أيّاً منهما يُرفَض توقيعُه
+     فترجع "" ويُطبَع صندوقُ الموضعِ بلا صورة — لا انكسار.
+
+     ⚠️ وحلُّ وعدِ التوقيعِ **ليس** وصولَ الصورة: الرابطُ يُعطى فوراً،
+     والصورةُ تُجلب بعده عند رسمِ المستند. وانتظارُها قبلَ النداءِ على
+     `print()` مِلكُ `printInPage` لا هذه الدالّة. */
+  const printReceipt = async (rc: PaymentReceipt) => {
+    const [stampUrl, signatureUrl] = await Promise.all([
+      signedPrivateCompanyUrl(companyAssets.company_stamp?.url),
+      signedPrivateCompanyUrl(companyAssets.manager_signature?.url),
+    ]);
+    printInPage(makeReceiptHTML(rc, { ...reportBranding, stampUrl, signatureUrl }, allocationsOf(rc)));
+  };
+
+
+  // ══════════════════════════════════════════════
+  // RECEIPT VIEW — إعادةُ طباعةٍ أو إلغاء
+  // ══════════════════════════════════════════════
+  /* عقدةُ JSX لا مكوّنٌ يُنشأ أثناء التصيير: القاعدةُ تمنع تعريفَ
+     مكوّنٍ داخل مكوّن، والحاجةُ هنا عقدةٌ شرطيّةٌ لا مكوّن. */
+  const receiptViewNode = (() => {
+    if (!viewReceipt) return null;
+    const rc = viewReceipt;
+    const cancelled = rc.status === "cancelled";
+    return (
+      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1500 }} onClick={() => setViewReceipt(null)}>
+        <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:380, boxShadow:"var(--shadow-xl)" }} onClick={e => e.stopPropagation()}>
+          <div style={{ fontWeight:700, fontSize:16, color:"var(--text)", marginBottom:4, textAlign:"center" }}>إيصال رقم {rc.receipt_number}</div>
+          {cancelled && (
+            <div style={{ background:"var(--danger-bg)", border:"1px solid var(--danger)", color:"var(--danger)", borderRadius:10, padding:"8px 10px", fontSize:12, fontWeight:700, marginBottom:12, textAlign:"center" }}>
+              ملغي{rc.cancel_reason ? ` — ${rc.cancel_reason}` : ""}
+            </div>
+          )}
+          <div style={{ background:"var(--success-bg)", border:"1px solid var(--success)", borderRadius:12, padding:14, marginBottom:14, textAlign:"center" }}>
+            <div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>المبلغ</div>
+            <div style={{ fontSize:30, fontWeight:900, color:"var(--success)", textDecoration: cancelled ? "line-through" : "none" }}>{fmtAmt(Number(rc.total_amount))}</div>
+            <div style={{ fontSize:12, color:"var(--text-muted)" }}>ر.ق</div>
+          </div>
+          {[
+            { label:"الدافع", value: rc.payer_name },
+            ...(rc.group_name ? [{ label:"مجموعة", value: rc.group_name }] : []),
+            { label:"التاريخ", value: rc.payment_date },
+            { label:"طريقة الدفع", value: rc.method },
+            { label:"الموسم", value: rc.season_name },
+            ...(rc.issued_by ? [{ label:"المُحصِّل", value: rc.issued_by }] : []),
+          ].map(row => (
+            <div key={row.label} style={{ display:"flex", justifyContent:"space-between", padding:"7px 0", borderBottom:"1px solid var(--border)", fontSize:13 }}>
+              <span style={{ color:"var(--text-muted)" }}>{row.label}</span>
+              <span style={{ fontWeight:600 }}>{row.value}</span>
+            </div>
+          ))}
+          <div style={{ display:"flex", gap:10, marginTop:16 }}>
+            <button onClick={() => { void printReceipt(rc); }}
+              style={{ flex:1, padding:10, background:"var(--em8)", color:"#fff", border:"none", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer", fontWeight:600 }}>
+              🖨️ طباعة
+            </button>
+            {!cancelled && canManage && (
+              <button onClick={() => { if (!assertWritable()) return; setCancelReason(""); setCancelTarget(rc); setViewReceipt(null); }}
+                style={{ flex:1, padding:10, background:"transparent", color:"var(--danger)", border:"1px solid var(--danger)", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer", fontWeight:600 }}>
+                إلغاء الإيصال
+              </button>
+            )}
+          </div>
+          <button onClick={() => setViewReceipt(null)}
+            style={{ width:"100%", marginTop:10, padding:8, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer" }}>
+            إغلاق
+          </button>
+        </div>
+      </div>
+    );
+  })();
+
+  // ══════════════════════════════════════════════
+  // CANCEL RECEIPT — السببُ مطلوب
+  // ══════════════════════════════════════════════
+  const cancelReceiptNode = (() => {
+    if (!cancelTarget) return null;
+    const rc = cancelTarget;
+    return (
+      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1600 }}>
+        <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:400, boxShadow:"var(--shadow-xl)" }}>
+          <div style={{ fontWeight:700, fontSize:16, color:"var(--danger)", marginBottom:6, textAlign:"center" }}>إلغاء الإيصال رقم {rc.receipt_number}</div>
+          <div style={{ fontSize:12.5, color:"var(--text-muted)", lineHeight:1.7, marginBottom:14, textAlign:"center" }}>
+            {rc.payer_name} · {fmtAmt(Number(rc.total_amount))} ر.ق · {rc.payment_date}
+            <br />
+            الرقم يبقى محفوظاً ولا يُعاد استخدامه، ويظل الإيصال قابلاً للطباعة موسوماً «ملغي».
+          </div>
+          <label style={{ fontSize:12, fontWeight:700, color:"var(--em8)", display:"block", marginBottom:5 }}>سبب الإلغاء (مطلوب)</label>
+          <textarea value={cancelReason} onChange={e => setCancelReason(e.target.value)} rows={3}
+            placeholder="مثال: خطأ في الإدخال — لم تُستلم الدفعة · أو: تم استرجاع المبلغ للحاج"
+            style={{ width:"100%", padding:10, borderRadius:10, border:"1px solid var(--border)", background:"var(--bg-2)", color:"var(--text)", fontFamily:"var(--font-body)", fontSize:13, resize:"vertical" }} />
+          <div style={{ display:"flex", gap:10, marginTop:14 }}>
+            <button onClick={confirmCancelReceipt} disabled={cancelling || !cancelReason.trim()}
+              style={{ flex:1, padding:10, background:"var(--danger)", color:"#fff", border:"none", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, fontWeight:600, cursor: cancelling || !cancelReason.trim() ? "not-allowed" : "pointer", opacity: cancelling || !cancelReason.trim() ? 0.6 : 1 }}>
+              {cancelling ? "جارٍ الإلغاء..." : "تأكيد الإلغاء"}
+            </button>
+            <button onClick={() => { setCancelTarget(null); setCancelReason(""); }} disabled={cancelling}
+              style={{ flex:1, padding:10, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer" }}>
+              رجوع
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  })();
+
+  // ══════════════════════════════════════════════
+  // RECEIPT MODAL
+  // ══════════════════════════════════════════════
+  const ReceiptModal = () => {
+    if (!issuedReceipt) return null;
+    return (
+      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1500 }}>
+        <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:340, boxShadow:"var(--shadow-xl)", textAlign:"center" }}>
+          <div style={{ width:48, height:48, borderRadius:"50%", background:"var(--success-bg)", color:"var(--success)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:22, fontWeight:700, margin:"0 auto 12px" }}>✓</div>
+          <div style={{ fontSize:15, fontWeight:700, color:"var(--text)", marginBottom:4 }}>تم تسجيل الدفعة</div>
+          <div style={{ fontSize:13, color:"var(--text-muted)", marginBottom:2 }}>{issuedReceipt.payer_name}</div>
+          <div style={{ fontSize:12, color:"var(--em8)", fontWeight:700, marginBottom:4 }}>إيصال رقم {issuedReceipt.receipt_number}</div>
+          <div style={{ fontSize:24, fontWeight:900, color:"var(--success)", marginBottom:16 }}>{fmtAmt(Number(issuedReceipt.total_amount))} <span style={{ fontSize:13 }}>ر.ق</span></div>
+          <button onClick={() => { void printReceipt(issuedReceipt); }}
+            style={{ width:"100%", padding:10, marginBottom:10, background:"var(--em8)", color:"#fff", border:"none", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer", fontWeight:600 }}>
+            🖨️ طباعة
+          </button>
+          <button onClick={() => setIssuedReceipt(null)}
+            style={{ width:"100%", padding:8, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer" }}>
+            إغلاق
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // ══════════════════════════════════════════════
+  // PAYMENT DETAIL MODAL
+  // ══════════════════════════════════════════════
+  const PaymentDetailModal = () => {
+    if (!selectedPayment) return null;
+    const modalP = selectedP ?? passengers.find(x => x.id === selectedPayment.passenger_id) ?? null;
+    const pName = modalP ? (modalP.short_ar || modalP.name_ar) : "—";
+    return (
+      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1500 }} onClick={() => setSelectedPayment(null)}>
+        <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:360, boxShadow:"var(--shadow-xl)" }} onClick={e => e.stopPropagation()}>
+          <div style={{ fontWeight:700, fontSize:16, color:"var(--text)", marginBottom:16, textAlign:"center" }}>تفاصيل الدفعة</div>
+          <div style={{ background:"var(--success-bg)", border:"1px solid var(--success)", borderRadius:12, padding:16, marginBottom:16, textAlign:"center" }}>
+            <div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>المبلغ</div>
+            <div style={{ fontSize:32, fontWeight:900, color:"var(--success)" }}>{fmtAmt(Number(selectedPayment.amount))}</div>
+            <div style={{ fontSize:12, color:"var(--text-muted)" }}>ر.ق</div>
+          </div>
+          {[
+            { label:"الحاج",         value: pName },
+            ...(selectedPayment.receipt ? [{ label:"رقم الإيصال", value: String(selectedPayment.receipt.receipt_number) }] : []),
+            ...(selectedPayment.receipt?.status === "cancelled"
+                  ? [{ label:"الحالة", value: `ملغي — ${selectedPayment.receipt.cancel_reason ?? ""}` }] : []),
+            ...(selectedPayment.receipt?.group_name ? [{ label:"دفعة مجموعة", value: selectedPayment.receipt.group_name }] : []),
+            { label:"التاريخ",       value: selectedPayment.payment_date },
+            { label:"طريقة الدفع",   value: selectedPayment.method },
+            ...(selectedPayment.notes ? [{ label:"ملاحظات", value: selectedPayment.notes }] : []),
+            ...(selectedPayment.created_by ? [{ label:"سجّل بواسطة", value: selectedPayment.created_by }] : []),
+          ].map(row => (
+            <div key={row.label} style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", borderBottom:"1px solid var(--border)", fontSize:13 }}>
+              <span style={{ color:"var(--text-muted)" }}>{row.label}</span>
+              <span style={{ fontWeight:600 }}>{row.value}</span>
+            </div>
+          ))}
+          <div style={{ display:"flex", gap:10, marginTop:16 }}>
+            <button disabled={!selectedPayment.receipt}
+              onClick={() => { const rc = selectedPayment.receipt; if (rc) void printReceipt(rc); }}
+              style={{ flex:1, padding:10, background:"var(--em8)", color:"#fff", border:"none", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, cursor: selectedPayment.receipt ? "pointer" : "not-allowed", fontWeight:600, opacity: selectedPayment.receipt ? 1 : 0.5 }}>
+              🖨️ طباعة إيصال
+            </button>
+            <button onClick={() => setSelectedPayment(null)}
+              style={{ flex:1, padding:10, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:10, fontFamily:"var(--font-body)", fontSize:13, cursor:"pointer" }}>
+              إغلاق
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ══════════════════════════════════════════════
+  // SETTINGS VIEW
+  // ══════════════════════════════════════════════
+  /* شريطٌ يقول للمستخدم بأيّ تسعيرٍ حُسبت الأرقام أمامه. الحالة
+     الوحيدة الصامتة هي `live` — وهي الحالة العادية للموسم المفتوح.
+     ولقطةٌ مفقودة تُقال صراحةً: التسعير المعروض هو الحاليّ لا تسعير
+     ذلك الموسم، والأرقام تتحرّك بتحرّكه. */
+  const pricingNotice = pricingSource === "live" ? null : (() => {
+    const missing = pricingSource !== "snapshot";
+    return (
+      <div style={{
+        display:"flex", alignItems:"center", gap:8, marginBottom:14, padding:"9px 13px",
+        borderRadius:9, fontSize:12.5, fontWeight:600, lineHeight:1.7,
+        background: missing ? "var(--warning-bg, #FFF4E5)" : "var(--info-bg, #EAF3FB)",
+        color:      missing ? "#8A5A00" : "var(--info, #1D4ED8)",
+        border:     `1px solid ${missing ? "rgba(138,90,0,.25)" : "rgba(29,78,216,.2)"}`,
+      }}>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" style={{ flexShrink:0 }}>
+          <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+        </svg>
+        <span>
+          {pricingSource === "snapshot"
+            ? `الأرقام محسوبة بتسعير موسم ${viewedSeason.name} كما كان يوم إقفاله.`
+            : pricingSource === "error"
+              ? `تعذّر جلب لقطة تسعير موسم ${viewedSeason.name}. الأرقام معروضة بالتسعير الحاليّ للشركة ولا يُعتمد عليها — أعد تحميل الصفحة.`
+              : `موسم ${viewedSeason.name} أُقفل قبل تفعيل لقطة التسعير، فلا تسعير محفوظ له. الأرقام محسوبة بالتسعير الحاليّ للشركة وقد تتغيّر بتغيّره.`}
+        </span>
+      </div>
+    );
+  })();
+
+  if (subView === "settings") {
+    /* ═══ إعدادات الحسابات — سطحٌ واحدٌ، وثلاثةُ مُلّاكِ بياناتٍ ═══
+         الأسعار   → `pricing_settings`  · الكتابةُ manage_payments
+         البنك    → `company_config`    · الكتابةُ manage_users
+         الإيصالات → صفُّ الموسم         · الكتابةُ manage_payments عبر RPC
+       الجمعُ بصريٌّ لا صلاحيّ: لم تُوسَّع سياسةٌ واحدةٌ في القاعدة. */
+    const tabs = [
+      { key: "pricing"  as const, label: "الأسعار" },
+      { key: "bank"     as const, label: "البنك والسداد" },
+      { key: "receipts" as const, label: "الإيصالات" },
+    ];
+    const tabBtn = (active: boolean) => ({
+      padding: "7px 16px", borderRadius: 8, fontFamily: "var(--font-body)", fontSize: 12.5,
+      fontWeight: active ? 700 : 500, cursor: "pointer",
+      border: active ? "1px solid var(--primary)" : "1px solid var(--border)",
+      background: active ? "var(--primary)" : "var(--bg-2)",
+      color: active ? "#fff" : "var(--text)",
+    });
+    const cardBox = { background:"var(--bg-card)", borderRadius:12, padding:16, marginBottom:16, boxShadow:"var(--shadow-sm)" };
+    const cardTitle = { fontWeight:700, color:"var(--text)", marginBottom:12, fontSize:14, borderBottom:"1px solid var(--border)", paddingBottom:8 };
+    const noteBox = (ok: boolean) => ({
+      marginTop: 12, padding: "9px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600, lineHeight: 1.7,
+      background: ok ? "var(--success-bg)" : "var(--danger-bg)",
+      color: ok ? "var(--success)" : "var(--danger)",
+      border: `1px solid ${ok ? "var(--success)" : "var(--danger)"}`,
+    });
+
+    /* ⚠️ حالةُ القفلِ من عقدِ القاعدةِ لا من رايةٍ في المتصفّح:
+       تقدُّمُ العدّادِ عن رقمِ البدايةِ هو نفسُه شرطُ الدالّةِ
+       (`v_next <> v_start`)، فما يُعرَض هو ما سيُنفَّذ. */
+    const startNo = viewedSeason.receipt_start_number ?? 1;
+    const nextNo  = viewedSeason.receipt_next_number ?? 1;
+    const numberingLocked = nextNo !== startNo;
+    const issuedCount = Math.max(0, nextNo - startNo);
+
+    return (
+    <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+      <AlertModal alert={alertState} onClose={() => showAlert(null)} />
+      <ConfirmModal state={confirmState} onConfirm={handleConfirmYes} onCancel={handleConfirmNo} />
+      <div style={{ maxWidth:560, margin:"0 auto" }}>
+        {pricingNotice}
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+          <button onClick={() => setSubView("list")} style={{ background:"none", border:"none", cursor:"pointer", color:"var(--primary)", fontSize:24 }}>←</button>
+          <div style={{ fontFamily:"var(--font-heading)", fontSize:20, fontWeight:600, color:"var(--text)" }}>إعدادات الحسابات</div>
+        </div>
+
+        <div style={{ display:"flex", gap:8, marginBottom:18, flexWrap:"wrap" }}>
+          {tabs.map(t => (
+            <button key={t.key} onClick={() => setSettingsTab(t.key)} style={tabBtn(settingsTab === t.key)}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* ══════════ الأسعار — كما كانت، نُقل موضعُها لا منطقُها ══════════ */}
+        {settingsTab === "pricing" && (
+          <>
+            {(["package","addon","discount"] as const).map(type => (
+              <div key={type} style={cardBox}>
+                <div style={cardTitle}>
+                  {type==="package"?"الباقات الأساسية":type==="addon"?"الإضافات":"الخصومات"}
+                </div>
+                {PRICING_KEYS.filter(k=>k.type===type).map(k => (
+                  <div key={k.key} style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+                    <div style={{ flex:1, fontSize:13 }}>{k.label}</div>
+                    <input type="number" min="0" value={editPricing[k.key]||"0"}
+                      readOnly={!canManage} disabled={!canManage}
+                      onChange={e=>setEditPricing(prev=>({...prev,[k.key]:e.target.value}))}
+                      style={{ width:130, padding:"6px 10px", borderRadius:8, border:"1px solid var(--border)", background:canManage?"var(--bg-input)":"var(--bg-2)", textAlign:"center", fontSize:13, cursor:canManage?"text":"not-allowed" }} />
+                    <span style={{ fontSize:12, color:"var(--text-muted)", width:24 }}>ر.ق</span>
+                  </div>
+                ))}
+              </div>
+            ))}
+            {canManage ? (
+              <button onClick={savePricing} disabled={savingPricing} style={{ width:"100%", padding:12, background:"var(--primary)", color:"#fff", border:"none", borderRadius:10, fontFamily:"var(--font-body)", fontSize:14, cursor:savingPricing?"not-allowed":"pointer", fontWeight:600, opacity:savingPricing?0.6:1 }}>
+                {savingPricing?"جارٍ الحفظ...":"حفظ الأسعار"}
+              </button>
+            ) : (
+              /* لا زرَّ حفظٍ لمن لا يملك الصلاحية: `savePricing` كانت
+                 ترفض عند النداءِ، والرفضُ قبلَ الضغطِ أصدق. */
+              <div style={{ padding:"10px 13px", borderRadius:9, background:"var(--bg-2)", border:"1px solid var(--border)", fontSize:11.5, color:"var(--text-muted)", lineHeight:1.9 }}>
+                تعديل الأسعار يحتاج صلاحية إدارة الحسابات المالية. القيمُ معروضةٌ للاطّلاع.
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ══════════ البنك والسداد — بيانُ شركةٍ، مصدرُه company_config ══════════ */}
+        {settingsTab === "bank" && <CompanyBankCard canEdit={canEditBank} />}
+
+        {/* ══════════ الإيصالات — ترقيمٌ يملكه صفُّ الموسم ══════════ */}
+        {settingsTab === "receipts" && (
+          <div style={cardBox}>
+            <div style={cardTitle}>إعدادات الإيصالات</div>
+            {/* سياقُ الموسمِ صريحٌ: الترقيمُ موسميٌّ ولو ظهر هنا */}
+            <div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>
+              ترقيم إيصالات الموسم: <strong style={{ color:"var(--primary)" }}>{viewedSeason.name}</strong>
+            </div>
+            {!seasonWritable && (
+              <div style={{ margin:"10px 0 14px", padding:"10px 13px", borderRadius:9, background:"var(--warn-bg, var(--bg-2))", border:"1px solid var(--border)", fontSize:11.5, color:"var(--text)", lineHeight:1.9 }}>
+                أنت تُطالع موسماً مؤرشفاً (<strong>{viewedSeason.name}</strong>). الأرقامُ المعروضةُ ترقيمُ هذا الموسمِ وحدَه، وهي للقراءةِ فقط.
+              </div>
+            )}
+
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))", gap:12, marginTop:12 }}>
+              <div>
+                <div style={{ fontSize:11, color:"var(--text-muted)", marginBottom:4, fontWeight:600 }}>
+                  {numberingLocked ? "رقم البداية" : "رقم بداية الإيصالات"}
+                </div>
+                {numberingLocked || !seasonWritable || !canManage ? (
+                  <div style={{ ...inputStyle, background:"var(--bg-2)", display:"flex", alignItems:"center", gap:8, fontWeight:700 }}>
+                    <span>{startNo}</span>
+                    {numberingLocked && <span title="مُثبَّت">🔒</span>}
+                  </div>
+                ) : (
+                  <input
+                    type="text" inputMode="numeric" dir="ltr"
+                    value={startEdit?.seasonId === viewedSeason.id ? startEdit.value : String(startNo)}
+                    onChange={e => setStartEdit({ seasonId: viewedSeason.id, value: e.target.value })}
+                    style={inputStyle} />
+                )}
+              </div>
+              <div>
+                <div style={{ fontSize:11, color:"var(--text-muted)", marginBottom:4, fontWeight:600 }}>الرقم التالي</div>
+                <div style={{ ...inputStyle, background:"var(--bg-2)", fontWeight:700 }}>{nextNo}</div>
+              </div>
+            </div>
+
+            {numberingLocked ? (
+              <div style={{ marginTop:14, padding:"10px 13px", borderRadius:9, background:"var(--bg-2)", border:"1px solid var(--border)", fontSize:11.5, color:"var(--text)", lineHeight:1.9 }}>
+                تم تثبيت الترقيم بعد إصدار أوّل إيصال ولا يمكن تغيير رقم البداية.
+                {issuedCount > 0 && <> صدر في هذا الموسم <strong>{issuedCount}</strong> إيصالاً.</>}
+              </div>
+            ) : seasonWritable && canManage ? (
+              <>
+                <div style={{ marginTop:12, fontSize:11, color:"var(--text-muted)", lineHeight:1.9 }}>
+                  يمكن تحديد رقم البداية قبل إصدار أول إيصال فقط.
+                </div>
+                <button onClick={saveReceiptStart} disabled={startSaving} style={{ width:"100%", marginTop:12, padding:12, background:"var(--primary)", color:"#fff", border:"none", borderRadius:10, fontFamily:"var(--font-body)", fontSize:14, cursor:startSaving?"not-allowed":"pointer", fontWeight:600, opacity:startSaving?0.6:1 }}>
+                  {startSaving ? "جارٍ الحفظ..." : "حفظ رقم البداية"}
+                </button>
+              </>
+            ) : !canManage ? (
+              <div style={{ marginTop:14, padding:"10px 13px", borderRadius:9, background:"var(--bg-2)", border:"1px solid var(--border)", fontSize:11.5, color:"var(--text-muted)", lineHeight:1.9 }}>
+                تعديل ترقيم الإيصالات يحتاج صلاحية إدارة الحسابات المالية.
+              </div>
+            ) : null}
+            {startMsg && <div style={noteBox(startMsg.ok)}>{startMsg.text}</div>}
+          </div>
+        )}
+      </div>
+    </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════
+  // GROUP VIEW
+  // ══════════════════════════════════════════════
+  if (subView === "group" && selectedGroup) {
+    const gPassengers = getGroupPassengers(selectedGroup.id);
+    /* الإداري خارج المال: لا يُضاف إلى مجموعة مالية ولو كانت أوراقه
+       أوراق حاجّ كاملة. الفلتر هنا لا يخفي عضواً قائماً — إخفاؤه
+       يجعله غير قابل للإزالة — بل يمنع دخول جديد. */
+    const availableToAdd=passengers.filter(p=>!groupPassengerIds.has(p.id)&&isHajj(p));
+    return (
+      <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+        <AlertModal alert={alertState} onClose={() => showAlert(null)} />
+        <ConfirmModal state={confirmState} onConfirm={handleConfirmYes} onCancel={handleConfirmNo} />
+        <ReceiptModal />{receiptViewNode}{cancelReceiptNode}
+        {pricingNotice}
+        <FinancialGroupView
+          canManage={canManage}
+          group={selectedGroup}
+          groupPassengers={gPassengers}
+          availableToAdd={availableToAdd}
+          pricing={pricing}
+          chargesByPassenger={chargesByPassenger}
+          paymentsByPassenger={paymentsByPassenger}
+          showAddMemberModal={showAddMemberModal}
+          showGroupPayModal={showGroupPayModal}
+          addingMemberId={addingMemberId}
+          groupPayForm={groupPayForm}
+          savingGroupPay={savingGroupPay}
+          onBack={() => { setSubView("list"); setSelectedGroup(null); }}
+          onPrintGroupStatement={()=>printInPage(makeGroupStatementHTML(selectedGroup, gPassengers, pricing, customCharges, payments, reportBranding))}
+          onDeleteGroup={gid => deleteGroup(gid)}
+          onSelectPassenger={p => { setSelectedP(p); setSubView("detail"); }}
+          onRemoveMember={(pid, gid) => removeFromGroup(pid, gid)}
+          onAddMember={(gid, pid) => addMemberToGroup(gid, pid)}
+          onOpenAddMemberModal={() => setShowAddMemberModal(true)}
+          onCloseAddMemberModal={() => setShowAddMemberModal(false)}
+          onOpenGroupPayModal={() => { if (assertWritable()) setShowGroupPayModal(true); }}
+          onCloseGroupPayModal={() => setShowGroupPayModal(false)}
+          onGroupPayFormChange={(key, value) => setGroupPayForm(prev => ({ ...prev, [key]: value }))}
+          onSubmitGroupPayment={addGroupPayment}
+          thStyle={thStyle}
+          tdStyle={tdStyle}
+          inputStyle={inputStyle}
+        />
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════
+  // DETAIL VIEW
+  // ══════════════════════════════════════════════
+  if (subView === "detail" && selectedP) {
+    const passengerGroup=getPassengerGroup(selectedP.id);
+    return (
+      <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+        <AlertModal alert={alertState} onClose={()=>showAlert(null)} />
+        <ConfirmModal state={confirmState} onConfirm={handleConfirmYes} onCancel={handleConfirmNo} />
+        <ReceiptModal />{receiptViewNode}{cancelReceiptNode}
+        <PaymentDetailModal />
+        {pricingNotice}
+        <PassengerFinanceView
+          canManage={canManage}
+          passenger={selectedP}
+          pricing={pricing}
+          passengerPayments={paymentsFor(selectedP.id, paymentsByPassenger)}
+          passengerCharges={chargesFor(selectedP.id, chargesByPassenger)}
+          group={passengerGroup}
+          allocTypes={allocTypes}
+          groups={groups}
+          editingCustomPrice={editingCustomPrice}
+          customPriceInput={customPriceInput}
+          savingCustomPrice={savingCustomPrice}
+          onBack={()=>{setSubView("list");setSelectedP(null);setSelectedPayment(null);}}
+          onPrintStatement={()=>printInPage(makePassengerStatementHTML(selectedP, pricing, customCharges, payments, reportBranding))}
+          onEditCustomPrice={()=>{ setCustomPriceInput(String(selectedP.services.custom_price || "")); setEditingCustomPrice(true); }}
+          onCustomPriceInputChange={setCustomPriceInput}
+          onSaveCustomPrice={saveCustomPrice}
+          onCancelEditCustomPrice={()=>setEditingCustomPrice(false)}
+          onAddPayment={()=>{ if (assertWritable()) setShowPayModal(true); }}
+          onAddCharge={t=>{ if (!assertWritable()) return; setChargeType(t);setChargeForm({description:"",amount:"",notes:""});setShowChargeModal(true);}}
+          onOpenPayment={py=>setSelectedPayment(py)}
+          onDeletePayment={id=>requestCancelReceipt(id)}
+          onDeleteCharge={id=>deleteCustomCharge(id)}
+          onOpenGroup={g=>{setSelectedGroup(g);setSubView("group");}}
+          onRemoveFromGroup={gid=>removeFromGroup(selectedP.id,gid)}
+          onCreateGroup={()=>{ if (!assertWritable()) return; setGroupModalMode("create");setGroupForm({name:"",notes:""});setShowPassengerGroupModal(true);}}
+          onAddToExistingGroup={()=>{ if (!assertWritable()) return; setGroupModalMode("addTo");setShowPassengerGroupModal(true);}}
+          tdStyle={tdStyle}
+        />
+
+        {/* مودال: دفعة */}
+        {showPayModal&&(
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000 }}>
+            <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:340, boxShadow:"var(--shadow-xl)" }}>
+              <div style={{ fontWeight:700, fontSize:16, marginBottom:16, color:"var(--success)" }}>تسجيل دفعة جديدة</div>
+              {([{label:"المبلغ",key:"amount",type:"number",ph:"0"},{label:"التاريخ",key:"payment_date",type:"date",ph:""},{label:"ملاحظات (اختياري)",key:"notes",type:"text",ph:"..."}] as { label:string; key:keyof PayForm; type:string; ph:string }[]).map(f=>(
+                <div key={f.key} style={{ marginBottom:12 }}><div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>{f.label}</div><input type={f.type} min={f.type==="number"?0:undefined} placeholder={f.ph} value={payForm[f.key]} onChange={e=>setPayForm(p=>({...p,[f.key]:e.target.value}))} style={inputStyle}/></div>
+              ))}
+              <div style={{ marginBottom:16 }}><div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>طريقة الدفع</div><select value={payForm.method} onChange={e=>setPayForm(p=>({...p,method:e.target.value}))} style={inputStyle}>{["نقدي","تحويل بنكي","شيك"].map(m=><option key={m}>{m}</option>)}</select></div>
+              <div style={{ display:"flex", gap:10 }}>
+                <button onClick={addPayment} disabled={savingPay} style={{ flex:1, padding:10, background:"var(--success)", color:"#fff", border:"none", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer" }}>{savingPay?"جارٍ الحفظ...":"حفظ"}</button>
+                <button onClick={()=>setShowPayModal(false)} style={{ flex:1, padding:10, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer" }}>إلغاء</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* مودال: بند خاص */}
+        {showChargeModal&&(
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000 }}>
+            <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:360, boxShadow:"var(--shadow-xl)" }}>
+              {/* أيقونة + عنوان */}
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+                <div style={{ width:40, height:40, borderRadius:"50%", background:chargeType==="إضافة"?"var(--warning-bg)":"var(--danger-bg)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:20, fontWeight:900, color:chargeType==="إضافة"?"var(--warning)":"var(--danger)", flexShrink:0 }}>
+                  {chargeType==="إضافة" ? "+" : "−"}
+                </div>
+                <div>
+                  <div style={{ fontWeight:800, fontSize:16, color:chargeType==="إضافة"?"var(--warning)":"var(--danger)" }}>{chargeType==="إضافة"?"إضافة بند خاص":"إضافة خصم"}</div>
+                  <div style={{ fontSize:11, color:"var(--text-muted)", marginTop:2 }}>{chargeType==="إضافة"?"مبلغ إضافي على الحاج":"خصم من إجمالي الحاج"}</div>
+                </div>
+              </div>
+              {/* الحقول */}
+              {([
+                {label:chargeType==="إضافة"?"وصف البند *":"سبب الخصم *",key:"description",ph:chargeType==="إضافة"?"مثال: ليموزين من المطار":"مثال: خصم موظف"},
+                {label:"المبلغ *",key:"amount",ph:"0"},
+                {label:"ملاحظات (اختياري)",key:"notes",ph:"..."}
+              ] as { label:string; key:keyof ChargeForm; ph:string }[]).map(f=>(
+                <div key={f.key} style={{ marginBottom:12 }}>
+                  <div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>{f.label}</div>
+                  <input type={f.key==="amount"?"number":"text"} min={f.key==="amount"?0:undefined} placeholder={f.ph} value={chargeForm[f.key]}
+                    onChange={e=>{ setChargeForm(p=>({...p,[f.key]:e.target.value})); if(f.key!=="notes" && chargeErrors[f.key]) setChargeErrors(p=>({...p,[f.key]:false})); }}
+                    style={{ ...inputStyle, borderColor:(f.key!=="notes" && chargeErrors[f.key])?"var(--danger)":"" }} />
+                  {(f.key!=="notes" && chargeErrors[f.key]) && <div style={{ fontSize:11, color:"var(--danger)", marginTop:3 }}>يرجى إدخال {f.label.replace(" *","")}</div>}
+                </div>
+              ))}
+              <div style={{ display:"flex", gap:10, marginTop:4 }}>
+                <button onClick={addCustomCharge} disabled={savingCharge} style={{ flex:1, padding:10, background:chargeType==="إضافة"?"var(--warning)":"var(--danger)", color:"#fff", border:"none", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer", fontWeight:600 }}>{savingCharge?"جارٍ الحفظ...":"حفظ"}</button>
+                <button onClick={()=>{ setShowChargeModal(false); setChargeErrors({description:false,amount:false}); }} style={{ flex:1, padding:10, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer" }}>إلغاء</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+
+        {/* مودال تأكيد الإجراءات */}
+        <ConfirmModal state={confirmState} onConfirm={handleConfirmYes} onCancel={handleConfirmNo} />
+        {/* مودال: مجموعة */}
+        {showPassengerGroupModal&&(
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000 }}>
+            <div style={{ background:"var(--bg-card)", borderRadius:16, padding:24, width:360, boxShadow:"var(--shadow-xl)", maxHeight:"80vh", overflowY:"auto" }}>
+              {groupModalMode==="create"?(
+                <>
+                  <div style={{ fontWeight:700, fontSize:16, marginBottom:16, color:"var(--text)" }}>إنشاء مجموعة مالية جديدة</div>
+                  <div style={{ marginBottom:12 }}><div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>اسم المجموعة</div><input type="text" placeholder="مثال: عائلة الأحمدي" value={groupForm.name} onChange={e=>setGroupForm(p=>({...p,name:e.target.value}))} style={inputStyle}/></div>
+                  <div style={{ marginBottom:16 }}><div style={{ fontSize:12, color:"var(--text-muted)", marginBottom:4 }}>ملاحظات (اختياري)</div><input type="text" placeholder="..." value={groupForm.notes} onChange={e=>setGroupForm(p=>({...p,notes:e.target.value}))} style={inputStyle}/></div>
+                  <div style={{ display:"flex", gap:10 }}>
+                    <button onClick={createGroupAndAdd} disabled={savingGroup} style={{ flex:1, padding:10, background:"var(--primary)", color:"#fff", border:"none", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer" }}>{savingGroup?"جارٍ الإنشاء...":"إنشاء وإضافة الحاج"}</button>
+                    <button onClick={()=>setShowPassengerGroupModal(false)} style={{ flex:1, padding:10, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer" }}>إلغاء</button>
+                  </div>
+                </>
+              ):(
+                <>
+                  <div style={{ fontWeight:700, fontSize:16, marginBottom:16, color:"var(--text)" }}>إضافة إلى مجموعة موجودة</div>
+                  {/* المجموعةُ المالية كيانٌ موسميّ: موسمٌ جديد يبدأ
+                      بمجموعاتٍ جديدة، ولا تُعاد مجموعةُ موسمٍ مضى.
+                      وقد صار الجدولُ يحمل `season_id` في م٧/٣،
+                      فالقائمةُ مُرشَّحةٌ بالموسم في الجلب نفسِه. */}
+                  {groups.map(g=>(
+                    <div key={g.id} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 0", borderBottom:"1px solid var(--border)" }}>
+                      <div><div style={{ fontSize:13, fontWeight:600 }}>{g.name}</div><div style={{ fontSize:11, color:"var(--text-muted)" }}>{getGroupPassengers(g.id).length} أعضاء</div></div>
+                      <button
+                        disabled={addingMemberId===selectedP.id}
+                        onClick={()=>addMemberToGroup(g.id,selectedP.id)}
+                        style={{ padding:"4px 14px", background:addingMemberId===selectedP.id?"var(--bg-2)":"var(--primary)", color:addingMemberId===selectedP.id?"var(--text-muted)":"#fff", border:"none", borderRadius:6, fontSize:12, cursor:addingMemberId===selectedP.id?"not-allowed":"pointer" }}>
+                        {addingMemberId===selectedP.id?"جارٍ...":"إضافة"}
+                      </button>
+                    </div>
+                  ))}
+                  <button onClick={()=>setShowPassengerGroupModal(false)} style={{ width:"100%", marginTop:16, padding:10, background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontFamily:"var(--font-body)", cursor:"pointer" }}>إغلاق</button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════
+  // REPORTS VIEW
+  // ══════════════════════════════════════════════
+  if (subView === "reports") {
+    // مودال تفاصيل الدفعة متاح في التقارير
+    const allData=sortedPassengers.map(p=>{const due=calcTotalDue(p,pricing,chargesByPassenger),paid=calcTotalPaid(p.id,paymentsByPassenger);return{p,due,paid,balance:due-paid};});
+    const totDue=allData.reduce((s,r)=>s+r.due,0),totPaid=allData.reduce((s,r)=>s+r.paid,0),totBal=totDue-totPaid;
+    const filtered=reportType==="late"?allData.filter(r=>r.balance>0):allData;
+    const cfPayments = payments.filter(py => {
+      /* دفعات حجاج الموسم المعروض وحدهم — الجلب يأتي بالكل */
+      if (!viewedPassengerIds.has(py.passenger_id)) return false;
+      const d = py.payment_date;
+      return (!cashflowFrom || d >= cashflowFrom) && (!cashflowTo || d <= cashflowTo);
+    });
+    /* ═══ صفوفُ تقريرِ الدفعات = إيصالات ═══
+       دفعةُ المجموعةِ حدثٌ واحدٌ فتُعرَض **سطراً واحداً** بإجماليِّها
+       التاريخيّ، لا أربعةَ سطورٍ مستقلّة. والدفعاتُ السابقةُ لهذه
+       المرحلةِ بلا إيصالٍ تُعرَض كما كانت، فلا تاريخَ يختفي.
+       والملغى يبقى ظاهراً موسوماً ولا يدخل إجمالياً. */
+    const inRange = (d: string) => (!cashflowFrom || d >= cashflowFrom) && (!cashflowTo || d <= cashflowTo);
+    type CfRow = {
+      key: string; receiptNo: string; name: string; date: string; method: string;
+      amount: number; notes: string; cancelled: boolean;
+      receipt: PaymentReceipt | null; payment: Payment | null;
+    };
+    const cfRows: CfRow[] = [
+      ...receipts.filter(r => inRange(r.payment_date)).map(r => ({
+        key: `r${r.id}`, receiptNo: String(r.receipt_number),
+        name: r.payer_name + (r.group_name ? " (مجموعة)" : ""),
+        date: r.payment_date, method: r.method, amount: Number(r.total_amount),
+        notes: r.notes ?? "", cancelled: r.status === "cancelled",
+        receipt: r, payment: null,
+      })),
+      ...cfPayments.filter(py => !py.receipt_id).map(py => {
+        const p = passengers.find(x => x.id === py.passenger_id);
+        return {
+          key: `p${py.id}`, receiptNo: "—",
+          name: p ? (p.short_ar || p.name_ar) : "—",
+          date: py.payment_date, method: py.method, amount: Number(py.amount),
+          notes: py.notes ?? "", cancelled: false,
+          receipt: null, payment: py,
+        };
+      }),
+    ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    const cfByDate: Record<string, { total: number; count: number; methods: Record<string, number> }> = {};
+    cfRows.filter(r => !r.cancelled).forEach(r => {
+      if (!cfByDate[r.date]) cfByDate[r.date] = { total: 0, count: 0, methods: {} };
+      cfByDate[r.date].total += r.amount;
+      cfByDate[r.date].count += 1;
+      cfByDate[r.date].methods[r.method] = (cfByDate[r.date].methods[r.method] || 0) + r.amount;
+    });
+    const cfDates = Object.keys(cfByDate).sort();
+    const cfTotal = cfRows.filter(r => !r.cancelled).reduce((s, r) => s + r.amount, 0);
+    /* الموسمُ قدرةٌ مشتركة — والحسابُ والجداولُ كما هي بالحرف.
+       والخياراتُ عرضٌ لا حساب: لا صفَّ ولا إجماليَّ ولا باقةَ تمسّها. */
+    const finChrome = chromeFromOptions("finance", printOpts, { season: viewedSeason });
+    const printActions:Record<string,()=>void>={ full:()=>printFullReport(allData,pricing,printBrand,"تقرير الحجاج المالي الكامل",finChrome), late:()=>printFullReport(allData.filter(r=>r.balance>0),pricing,printBrand,"تقرير المتأخرين",finChrome), payments:()=>printPaymentsReport(cfRows,printBrand,cashflowFrom,cashflowTo,finChrome), packages:()=>printPackagesReport(sortedPassengers,pricing,printBrand,finChrome), addons:()=>printAddonsReport(sortedPassengers,pricing,printBrand,finChrome), cashflow:()=>printCashflowReport({ dates:cfDates, byDate:cfByDate, total:cfTotal, from:cashflowFrom, to:cashflowTo, brand:printBrand, chrome:finChrome }) };
+    const excelActions:Record<string,(()=>void)|undefined>={ full:()=>exportFullReportXLSX(allData), late:()=>exportFullReportXLSX(allData.filter(r=>r.balance>0),"تقرير المتأخرين") };
+    return (
+      <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+        <AlertModal alert={alertState} onClose={()=>showAlert(null)} />
+        <ConfirmModal state={confirmState} onConfirm={handleConfirmYes} onCancel={handleConfirmNo} />
+        <PaymentDetailModal />
+        {pricingNotice}
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+          <button onClick={()=>setSubView("list")} style={{ background:"none", border:"none", cursor:"pointer", color:"var(--primary)", fontSize:24 }}>←</button>
+          <div style={{ fontFamily:"var(--font-heading)", fontSize:18, fontWeight:700, color:"var(--text)" }}>التقارير المالية</div>
+          {excelActions[reportType] && (
+            <button onClick={excelActions[reportType]} style={{ marginRight:"auto", padding:"7px 18px", background:"#1D6F42", color:"#fff", border:"none", borderRadius:8, fontSize:13, cursor:"pointer", fontWeight:600, display:"inline-flex", alignItems:"center", gap:6, fontFamily:"var(--font-body)" }}><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>Excel</button>
+          )}
+          <PrintOptionsMenu report="finance" value={printOpts} onChange={setPrintOpts} />
+          <button onClick={printActions[reportType]} style={{ padding:"7px 18px", background:"var(--em8)", color:"#fff", border:"none", borderRadius:8, fontSize:13, cursor:"pointer", fontWeight:600, display:"inline-flex", alignItems:"center", gap:6, fontFamily:"var(--font-body)" }}><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>طباعة</button>
+        </div>
+        <div style={{ display:"flex", gap:8, marginBottom:16, flexWrap:"wrap" }}>
+          {([{key:"full",label:"تقرير الحجاج الكامل"},{key:"late",label:"المتأخرون"},{key:"payments",label:"سجل الدفعات"},{key:"packages",label:"تقرير الباقات"},{key:"addons",label:"ملخص الإضافات"},{key:"cashflow",label:"التحصيل اليومي"}] as const).map(t=>(
+            <button key={t.key} onClick={()=>setReportType(t.key)} style={{ padding:"6px 16px", borderRadius:99, border:"none", fontFamily:"var(--font-body)", fontSize:12, cursor:"pointer", fontWeight:reportType===t.key?700:400, background:reportType===t.key?"var(--em8)":"var(--bg-2)", color:reportType===t.key?"#fff":"var(--text)" }}>{t.label}</button>
+          ))}
+        </div>
+        {/* فلتر التاريخ المشترك بين سجل الدفعات والتحصيل اليومي */}
+        {(reportType==="payments"||reportType==="cashflow")&&(
+          <div style={{ marginBottom:16 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, background:"var(--bg-card)", borderRadius:12, padding:"12px 16px", boxShadow:"var(--shadow-sm)", flexWrap:"wrap" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--em8)" strokeWidth="2" strokeLinecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              <span style={{ fontSize:12, fontWeight:700, color:"var(--text-muted)" }}>من:</span>
+              <input type="date" value={cashflowFrom} onChange={e=>setCashflowFrom(e.target.value)} style={{ border:"0.5px solid var(--border)", borderRadius:8, padding:"5px 10px", fontSize:12, fontFamily:"var(--font-body)", background:"var(--bg-2)", color:"var(--text)", outline:"none" }} />
+              <span style={{ fontSize:12, fontWeight:700, color:"var(--text-muted)" }}>إلى:</span>
+              <input type="date" value={cashflowTo} onChange={e=>setCashflowTo(e.target.value)} style={{ border:"0.5px solid var(--border)", borderRadius:8, padding:"5px 10px", fontSize:12, fontFamily:"var(--font-body)", background:"var(--bg-2)", color:"var(--text)", outline:"none" }} />
+              {(cashflowFrom||cashflowTo)&&<button onClick={()=>{setCashflowFrom("");setCashflowTo("");}} style={{ fontSize:11, padding:"4px 10px", borderRadius:8, border:"0.5px solid var(--border)", background:"var(--bg-2)", cursor:"pointer", color:"var(--text-muted)", fontFamily:"var(--font-body)" }}>مسح الفلتر</button>}
+            </div>
+          </div>
+        )}
+        {(reportType==="full"||reportType==="late")&&(
+          <>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:16 }}>
+              {[{label:"إجمالي المطلوب",value:fmtAmt(totDue),color:"var(--text)"},{label:"إجمالي المحصل",value:fmtAmt(totPaid),color:"var(--success)"},{label:"إجمالي المتبقي",value:fmtAmt(totBal),color:"var(--danger)"}].map(c=>(
+                <div key={c.label} style={{ background:"var(--bg-card)", borderRadius:10, padding:"12px 16px", textAlign:"center", boxShadow:"var(--shadow-sm)" }}><div style={{ fontSize:11, color:"var(--text-muted)", marginBottom:4 }}>{c.label}</div><div style={{ fontSize:18, fontWeight:700, color:c.color }}>{c.value}</div><div style={{ fontSize:10, color:"var(--text-muted)" }}>ر.ق</div></div>
+              ))}
+            </div>
+            <div style={{ background:"var(--bg-card)", borderRadius:12, overflow:"hidden", boxShadow:"var(--shadow-sm)" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse" }}>
+                <thead><tr><th style={{ ...thStyle, textAlign:"center", width:36 }}>م</th><th style={thStyle}>الاسم</th><th style={{ ...thStyle, textAlign:"center" }}>الباقة</th><th style={{ ...thStyle, textAlign:"center" }}>المطلوب</th><th style={{ ...thStyle, textAlign:"center" }}>المدفوع</th><th style={{ ...thStyle, textAlign:"center" }}>المتبقي</th><th style={{ ...thStyle, textAlign:"center" }}>الحالة</th></tr></thead>
+                <tbody>
+                  {filtered.map(({p,due,paid,balance},i)=>{const st=financeStatus(due,paid);return(<tr key={p.id} onClick={()=>{setSelectedP(p);setSubView("detail");}} style={{ cursor:"pointer", background:i%2===0?"var(--bg-card)":"var(--bg-2)" }}><td style={{ ...tdStyle, textAlign:"center", color:"var(--text-muted)", fontSize:12 }}>{i+1}</td><td style={tdStyle}>{p.short_ar||p.name_ar}</td><td style={{ ...tdStyle, textAlign:"center", fontSize:11, color:"var(--text-muted)" }}>{getPriceInfo(p.services, pricing).label||"—"}</td><td style={{ ...tdStyle, textAlign:"center", color:"var(--text)", fontWeight:600 }}>{fmtAmt(due)}</td><td style={{ ...tdStyle, textAlign:"center", color:"var(--success)", fontWeight:600 }}>{fmtAmt(paid)}</td><td style={{ ...tdStyle, textAlign:"center", color:balance>0?"var(--danger)":"var(--success)", fontWeight:600 }}>{fmtAmt(balance)}</td><td style={{ ...tdStyle, textAlign:"center" }}><span style={{ fontSize:11, padding:"2px 8px", borderRadius:99, background:st.bg, color:st.color, fontWeight:700 }}>{st.label}</span></td></tr>);})}
+                  <tr style={{ background:"var(--em8)", color:"#fff", fontWeight:700 }}><td style={{ padding:"10px 12px" }} colSpan={3}>الإجمالي</td><td style={{ padding:"10px 12px", textAlign:"center" }}>{fmtAmt(totDue)}</td><td style={{ padding:"10px 12px", textAlign:"center" }}>{fmtAmt(totPaid)}</td><td style={{ padding:"10px 12px", textAlign:"center" }}>{fmtAmt(totBal)}</td><td style={{ padding:"10px 12px" }}></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+        {reportType==="payments"&&cfRows.length===0&&(
+          <div style={{ textAlign:"center", padding:40, color:"var(--text-muted)", fontSize:13 }}>لا توجد دفعات في الفترة المحددة</div>
+        )}
+        {reportType==="payments"&&cfRows.length>0&&(
+          <div style={{ background:"var(--bg-card)", borderRadius:12, overflow:"hidden", boxShadow:"var(--shadow-sm)" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse" }}>
+              <thead><tr><th style={{ ...thStyle, textAlign:"center", width:36 }}>م</th><th style={{ ...thStyle, textAlign:"center", width:70 }}>الإيصال</th><th style={thStyle}>الحاج</th><th style={{ ...thStyle, textAlign:"center" }}>التاريخ</th><th style={{ ...thStyle, textAlign:"center" }}>طريقة الدفع</th><th style={{ ...thStyle, textAlign:"center" }}>المبلغ</th><th style={thStyle}>ملاحظات</th><th style={{ ...thStyle, width:32 }}></th></tr></thead>
+              <tbody>
+                {cfRows.map((r,i)=>{const p=r.payment?passengers.find(x=>x.id===r.payment!.passenger_id):null;return(<tr key={r.key} onClick={()=>{ if(p) setSelectedP(p); if(r.payment) setSelectedPayment(r.payment); else if(r.receipt) setViewReceipt(r.receipt); }} style={{ background:i%2===0?"var(--bg-card)":"var(--bg-2)", cursor:"pointer", transition:"background 0.15s", opacity:r.cancelled?0.65:1 }} onMouseEnter={e=>(e.currentTarget.style.background="var(--primary-light,#f0e8ec)")} onMouseLeave={e=>(e.currentTarget.style.background=i%2===0?"var(--bg-card)":"var(--bg-2)")}><td style={{ ...tdStyle, textAlign:"center", color:"var(--text-muted)", fontSize:12 }}>{i+1}</td><td style={{ ...tdStyle, textAlign:"center", fontWeight:700, color:"var(--em8)" }}>{r.receiptNo}</td><td style={tdStyle}>{r.name}{r.cancelled&&<span style={{ marginInlineStart:6, fontSize:10, fontWeight:800, color:"var(--danger)", border:"1px solid var(--danger)", borderRadius:5, padding:"1px 5px" }}>ملغي</span>}</td><td style={{ ...tdStyle, textAlign:"center" }}>{r.date}</td><td style={{ ...tdStyle, textAlign:"center" }}>{r.method}</td><td style={{ ...tdStyle, textAlign:"center", color:r.cancelled?"var(--text-muted)":"var(--success)", fontWeight:600, textDecoration:r.cancelled?"line-through":"none" }}>{fmtAmt(r.amount)}</td><td style={{ ...tdStyle, color:"var(--text-muted)", fontSize:12 }}>{r.cancelled&&r.receipt?.cancel_reason?`سبب الإلغاء: ${r.receipt.cancel_reason}`:(r.notes||"—")}</td><td style={{ ...tdStyle, textAlign:"center", width:32 }}>{r.receipt&&<span onClick={e=>{e.stopPropagation();void printReceipt(r.receipt!);}} title="طباعة إيصال" style={{ cursor:"pointer", display:"inline-flex" }}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></span>}</td></tr>);})}
+                <tr style={{ background:"var(--em8)", color:"#fff", fontWeight:700 }}><td style={{ padding:"10px 12px" }} colSpan={5}>الإجمالي (بلا الملغى)</td><td style={{ padding:"10px 12px", textAlign:"center" }}>{fmtAmt(cfTotal)}</td><td style={{ padding:"10px 12px" }} colSpan={2}></td></tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+        {reportType==="packages"&&(
+          <div style={{ background:"var(--bg-card)", borderRadius:12, overflow:"hidden", boxShadow:"var(--shadow-sm)" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse" }}>
+              <thead><tr><th style={thStyle}>الباقة</th><th style={{ ...thStyle, textAlign:"center" }}>عدد الحجاج</th><th style={{ ...thStyle, textAlign:"center" }}>السعر الواحد</th><th style={{ ...thStyle, textAlign:"center" }}>الإجمالي المستحق</th></tr></thead>
+              <tbody>
+                {PRICING_KEYS.filter(k=>k.type==="package").map((pk,i)=>{const count=sortedPassengers.filter(p=>getPackageKey(p.services.hotel_type)===pk.key).length,price=pricing[pk.key]?.amount||0;return(<tr key={pk.key} style={{ background:i%2===0?"var(--bg-card)":"var(--bg-2)" }}><td style={tdStyle}>{pk.label}</td><td style={{ ...tdStyle, textAlign:"center", fontWeight:700 }}>{count}</td><td style={{ ...tdStyle, textAlign:"center" }}>{fmtAmt(price)}</td><td style={{ ...tdStyle, textAlign:"center", color:"var(--text)", fontWeight:700 }}>{fmtAmt(count*price)}</td></tr>);})}
+                {/* «خاص» سعرُها يدويّ لكل حاجّ فلا سعرَ واحد لها — ومجموعُها
+                    مجموعُ أسعارهم، كما في نسخة الطباعة القائمة. وكانت تسقط من
+                    الشاشة فيقرأ الموظّف مجموعاً أقلّ من الحقيقة. */}
+                {specialPkg.count > 0 && (
+                  <tr style={{ background:"var(--warning-bg)" }}>
+                    <td style={tdStyle}>{SPECIAL_PACKAGE_LABEL}</td>
+                    <td style={{ ...tdStyle, textAlign:"center", fontWeight:700 }}>{specialPkg.count}</td>
+                    <td style={{ ...tdStyle, textAlign:"center", color:"var(--text-muted)" }}>—</td>
+                    <td style={{ ...tdStyle, textAlign:"center", color:"var(--text)", fontWeight:700 }}>{fmtAmt(specialPkg.total)}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {reportType==="addons"&&(
+          <div style={{ background:"var(--bg-card)", borderRadius:12, overflow:"hidden", boxShadow:"var(--shadow-sm)" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse" }}>
+              <thead><tr><th style={thStyle}>الإضافة / الخصم</th><th style={{ ...thStyle, textAlign:"center" }}>عدد الحجاج</th><th style={{ ...thStyle, textAlign:"center" }}>السعر الواحد</th><th style={{ ...thStyle, textAlign:"center" }}>الإجمالي</th></tr></thead>
+              <tbody>{SERVICE_FILTERS.map((a,i)=>{const count=sortedPassengers.filter(a.check).length,price=pricing[a.key]?.amount||0,isDis=a.key==="discount_no_ticket";return(<tr key={a.key} style={{ background:i%2===0?"var(--bg-card)":"var(--bg-2)" }}><td style={tdStyle}>{serviceLabel(a.key, pricing)}</td><td style={{ ...tdStyle, textAlign:"center", fontWeight:700 }}>{count}</td><td style={{ ...tdStyle, textAlign:"center" }}>{fmtAmt(price)}</td><td style={{ ...tdStyle, textAlign:"center", color:isDis?"var(--danger)":"var(--em8)", fontWeight:700 }}>{isDis?`(${fmtAmt(count*price)})`:fmtAmt(count*price)}</td></tr>);})}</tbody>
+            </table>
+          </div>
+        )}
+        {reportType==="cashflow"&&(
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            {/* بطاقة الملخص */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
+              {[
+                { label:"إجمالي التحصيل", value:fmtAmt(cfTotal), color:"var(--success)" },
+                { label:"عدد الدفعات",    value:cfPayments.length, color:"var(--text)" },
+                { label:"عدد الأيام",     value:cfDates.length,    color:"var(--em8)" },
+              ].map(c=>(
+                <div key={c.label} style={{ background:"var(--bg-card)", borderRadius:10, padding:"12px 16px", textAlign:"center", boxShadow:"var(--shadow-sm)" }}>
+                  <div style={{ fontSize:11, color:"var(--text-muted)", marginBottom:4 }}>{c.label}</div>
+                  <div style={{ fontSize:18, fontWeight:700, color:c.color }}>{c.value}</div>
+                  {c.label==="إجمالي التحصيل"&&<div style={{ fontSize:10, color:"var(--text-muted)" }}>ر.ق</div>}
+                </div>
+              ))}
+            </div>
+            {/* جدول يومي */}
+            {cfDates.length===0?(
+              <div style={{ textAlign:"center", padding:40, color:"var(--text-muted)", fontSize:13 }}>لا توجد دفعات في الفترة المحددة</div>
+            ):(
+              <div style={{ background:"var(--bg-card)", borderRadius:12, overflow:"hidden", boxShadow:"var(--shadow-sm)" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ ...thStyle }}>التاريخ</th>
+                      <th style={{ ...thStyle, textAlign:"center" }}>عدد الدفعات</th>
+                      <th style={{ ...thStyle, textAlign:"center" }}>الإجمالي</th>
+                      <th style={{ ...thStyle }}>طرق الدفع</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cfDates.map((d,i)=>{
+                      const row=cfByDate[d];
+                      return(
+                        <tr key={d} style={{ background:i%2===0?"var(--bg-card)":"var(--bg-2)" }}>
+                          <td style={{ ...tdStyle, fontWeight:600 }}>{d}</td>
+                          <td style={{ ...tdStyle, textAlign:"center", color:"var(--text-muted)" }}>{row.count}</td>
+                          <td style={{ ...tdStyle, textAlign:"center", color:"var(--success)", fontWeight:700 }}>{fmtAmt(row.total)}</td>
+                          <td style={{ ...tdStyle, fontSize:11, color:"var(--text-muted)" }}>
+                            {Object.entries(row.methods).map(([m,v])=>(
+                              <span key={m} style={{ marginLeft:8 }}>{m}: <b style={{ color:"var(--text)" }}>{fmtAmt(v)}</b></span>
+                            ))}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    <tr style={{ background:"var(--em8)", color:"#fff", fontWeight:700 }}>
+                      <td style={{ padding:"10px 12px" }} colSpan={2}>الإجمالي</td>
+                      <td style={{ padding:"10px 12px", textAlign:"center" }}>{fmtAmt(cfTotal)}</td>
+                      <td style={{ padding:"10px 12px" }}></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════
+  // MAIN LIST VIEW
+  // ══════════════════════════════════════════════
+  return (
+    <div style={{ display:"flex", flexDirection:"column", height:"100%", overflow:"hidden" }}>
+      <AlertModal alert={alertState} onClose={()=>showAlert(null)} />
+      <ConfirmModal state={confirmState} onConfirm={handleConfirmYes} onCancel={handleConfirmNo} />
+      <ReceiptModal />{receiptViewNode}{cancelReceiptNode}
+      {pricingNotice}
+      <FinanceListView
+        canOpenSettings={canOpenSettings}
+        sortedPassengers={sortedPassengers}
+        filteredPassengers={filteredPassengers}
+        pricing={pricing}
+        totalsByPassenger={totalsByPassenger}
+        summary={summary}
+        getPassengerGroup={getPassengerGroup}
+        loading={loading}
+        refreshing={refreshing}
+        lastUpdated={lastUpdated}
+        loadError={loadError}
+        searchTerm={searchTerm}
+        filterStatus={filterStatus}
+        filterPackage={filterPackage}
+        filterService={filterService}
+        sortKey={sortKey}
+        sortDir={sortDir}
+        onSortChange={changeSort}
+        onSearchTermChange={setSearchTerm}
+        onFilterStatusChange={setFilterStatus}
+        onFilterPackageChange={setFilterPackage}
+        onFilterServiceChange={setFilterService}
+        onClearFilters={()=>{setSearchTerm("");setFilterStatus("all");setFilterPackage("all");setFilterService("all");}}
+        onRefresh={()=>loadFinanceData(true)}
+        onOpenReports={()=>setSubView("reports")}
+        onOpenSettings={()=>setSubView("settings")}
+        onSelectPassenger={p=>{setSelectedP(p);setSubView("detail");}}
+        onSelectGroup={g=>{setSelectedGroup(g);setSubView("group");}}
+        thStyle={thStyle}
+        tdStyle={tdStyle}
+      />
+    </div>
+  );
+}
