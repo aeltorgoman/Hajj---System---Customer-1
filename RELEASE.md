@@ -1,10 +1,10 @@
-# Customer Release 1.0.0
+# Customer Release 1.0.1
 
 | | |
 |---|---|
 | Product | Hajj Management System |
-| Release version | `v1.0.0` |
-| Snapshot generated | 2026-10-03 |
+| Release version | `v1.0.1` |
+| Snapshot generated | 2026-10-06 |
 | Allowlist manifest | `customer-release.manifest.json` v1 (Master) |
 
 This repository is a **clean release snapshot**, not a fork or mirror of the
