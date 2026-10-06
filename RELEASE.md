@@ -1,9 +1,9 @@
-# Customer Release 1.0.3
+# Customer Release 1.0.4
 
 | | |
 |---|---|
 | Product | Hajj Management System |
-| Release version | `v1.0.3` |
+| Release version | `v1.0.4` |
 | Snapshot generated | 2026-10-06 |
 | Allowlist manifest | `customer-release.manifest.json` v1 (Master) |
 
@@ -30,7 +30,8 @@ and vendor-internal GitHub workflows.
 Before the first deployment, the repository needs two GitHub secrets:
 `SUPABASE_PROJECT_REF` and `SUPABASE_ACCESS_TOKEN` — a Supabase access
 token scoped to this project with **Database: read & write**, **Edge Functions:
-read & write** and **Secrets: write**. No other secret or password is stored.
+read & write** and **Secrets: read & write**. No other secret or password is
+stored.
 
 1. **Supabase** — Authentication → Users → **Add user**. Enter the
    administrator's Login ID (email form, e.g. `admin@company.local`) and
