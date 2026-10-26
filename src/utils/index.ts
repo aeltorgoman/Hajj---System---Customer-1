@@ -3,12 +3,7 @@ import * as XLSX from "xlsx";
 import { supabase } from "../supabase";
 import { portalSupabase } from "../portalSupabase";
 
-export function makeShort(fullName: string): string {
-  if (!fullName) return "";
-  const parts = fullName.trim().split(/\s+/).filter(Boolean);
-  if (parts.length <= 3) return parts.join(" ");
-  return [parts[0], parts[1], parts[parts.length - 1]].join(" ");
-}
+export { makeShort } from "./names";
 
 /* «٥ بنود» — تمييزُ العربية لا صيغةٌ واحدة بـ«s». يسكن هنا لأن
    كارت الداشبورد وغرفة العمليات كليهما يعدّ بنوداً، ونسختان منه
@@ -391,6 +386,25 @@ export async function fetchDocumentBytes(value: string): Promise<Uint8Array> {
   return bytes;
 }
 
+const STORED_DOC_MIME: Record<string, string> = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", pdf: "application/pdf",
+};
+
+/** نوعُ المستند المخزَّن من امتداد مفتاحه — للعرض وإعادة الرفع. */
+export function storedDocMime(value: string | null | undefined): string {
+  const ext = docKey(value).toLowerCase().split(".").pop() ?? "";
+  return STORED_DOC_MIME[ext] ?? "";
+}
+
+/** مستندٌ مخزَّن كملفّ — عبر `fetchDocumentBytes` وبوّاباتها الثلاث.
+    يُستعمل لإعادة رفع صورةٍ محفوظة بعد تدويرها: الأصلُ لا يُعدَّل في
+    مكانه أبداً، بل يُرفع كائنٌ جديد ويُحذف القديم بعد نجاح الحفظ. */
+export async function storedDocAsFile(value: string): Promise<File> {
+  const bytes = await fetchDocumentBytes(value);
+  const name = docKey(value).split("/").pop() || "document";
+  return new File([bytes as BlobPart], name, { type: storedDocMime(value) || "application/octet-stream" });
+}
+
 /* ── بوابة الحاج — س٦ / الخطوة ٤ ──
    `publicDocUrl` انتهت. الحاجّ المجهول لا يبني رابطاً بنفسه بعد
    اليوم، ولا يملك ما يبنيه به أصلاً: البوابة لم تعد تستلم مفاتيح
@@ -460,6 +474,77 @@ export async function portalDocUrl(
   return doc;
 }
 
+/* ═══ بايتاتُ مستند PDF للبوابة — للعرض داخل الصفحة ═══
+   متصفّحاتُ الجوّال (Chrome على Android خاصّةً) لا تعرض PDF داخل إطار،
+   فيُقرأ الملفُّ نفسُه ويُصيَّر في الصفحة. والمسارُ هو مسارُ الرابط بعينه:
+   `pilgrim-doc` (الجلسة + إعداداتُ البوابة) ← رابطٌ موقّعٌ ١٥ دقيقة ← جلبٌ
+   من المتصفّح. لا مسارَ جديد ولا توقيعَ آخر.
+
+   وبوّاباتُ `fetchDocumentBytes` نفسُها قبل pdf.js: الرابطُ رابطُ تخزينٍ موقَّع،
+   والنوعُ المعلَن ليس نصّاً ولا HTML ولا JSON، والحجمُ معقول، والبايتاتُ تبدأ
+   بتوقيع PDF. وما يُرفض يُصنَّف ليعرف الحاجُّ ما يفعل. */
+export type PortalDocErrorKind = "unavailable" | "network" | "invalid" | "too_large" | "aborted";
+export class PortalDocError extends Error {
+  kind: PortalDocErrorKind;
+  constructor(kind: PortalDocErrorKind, message: string = kind) { super(message); this.kind = kind; }
+}
+
+/** سقفُ حجم الملفّ المعروض في البوابة — حارسُ ذاكرةٍ على الجوّال لا حدُّ صفحات */
+export const PORTAL_PDF_MAX_BYTES = 30 * 1024 * 1024;
+
+/** يتحقّق أنّ البايتات مستندُ PDF (توقيعُ `%PDF-` في أوّل ١٠٢٤ بايتاً كما تسمح المواصفة). */
+export function isPdfBytes(b: Uint8Array): boolean {
+  if (b.byteLength < 8 || looksLikeMarkup(b)) return false;
+  const n = Math.min(b.byteLength - 5, 1024);
+  for (let i = 0; i <= n; i++) {
+    if (b[i] === 0x25 && b[i + 1] === 0x50 && b[i + 2] === 0x44 && b[i + 3] === 0x46 && b[i + 4] === 0x2d) return true;
+  }
+  return false;
+}
+
+export async function portalDocBytes(
+  token: string | null,
+  docType: PortalDocType,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    /* المحاولةُ الثانية بتوقيعٍ جديد: الرابطُ المحفوظ قد يكون انتهى. وتوقيعٌ
+       جديدٌ يمرّ بـ`pilgrim-doc` كاملةً — فجلسةٌ انتهت أو مستندٌ أُخفي يُرفض. */
+    if (attempt === 1) portalDocCache.delete(docType);
+    const doc = await portalDocUrl(token, docType);
+    if (signal?.aborted) throw new PortalDocError("aborted");
+    if (!doc) throw new PortalDocError("unavailable");
+    if (!doc.url.includes("/storage/v1/object/sign/")) throw new PortalDocError("invalid", "الرابط ليس رابط تخزين موقّعاً");
+
+    let res: Response;
+    try {
+      res = await fetch(doc.url, { signal, credentials: "omit" });
+    } catch {
+      throw new PortalDocError(signal?.aborted ? "aborted" : "network");
+    }
+    /* ٤٠٠/٤٠١/٤٠٣ من التخزين: توقيعٌ منتهٍ أو مرفوض — يُعاد مرّةً بتوقيعٍ جديد */
+    if ([400, 401, 403].includes(res.status) && attempt === 0) continue;
+    if (res.status === 404 || [400, 401, 403].includes(res.status)) throw new PortalDocError("unavailable");
+    if (!res.ok) throw new PortalDocError("network", `HTTP ${res.status}`);
+
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (/text\/|json|html/.test(contentType)) throw new PortalDocError("invalid", `نوع غير متوقّع: ${contentType}`);
+    const declared = Number(res.headers.get("content-length") || 0);
+    if (declared > PORTAL_PDF_MAX_BYTES) throw new PortalDocError("too_large");
+
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(await res.arrayBuffer());
+    } catch {
+      throw new PortalDocError(signal?.aborted ? "aborted" : "network");
+    }
+    if (bytes.byteLength > PORTAL_PDF_MAX_BYTES) throw new PortalDocError("too_large");
+    if (!isPdfBytes(bytes)) throw new PortalDocError("invalid", "البايتات ليست مستند PDF");
+    return bytes;
+  }
+  throw new PortalDocError("unavailable");
+}
+
 /** خطّاف عرض للبوابة — يطلب الرابط عند الحاجة ويعيده جاهزاً للـ`src`. */
 export function usePortalDoc(
   token: string | null,
@@ -520,7 +605,17 @@ export async function downloadFile(value: string) {
 /** الاسم القديم — يبقى للمستدعين، وصار واجهةً لـ docKey. */
 export const getStoragePath = docKey;
 
-export function compressImage(file: File): Promise<Blob> {
+/** ربعُ دورة باتجاه عقارب الساعة — 0 إلى 3. أيّ عددٍ صحيح يُطبَّع إليها. */
+export function normalizeQuarterTurns(turns: number): 0 | 1 | 2 | 3 {
+  return ((((Math.round(turns) % 4) + 4) % 4) as 0 | 1 | 2 | 3);
+}
+
+/* `quarterTurns` يدوّر الصورة في **الترميز نفسه** — لا ترميزَ ثانٍ
+   فوق الأوّل. والصفرُ (الافتراضيّ) هو المسارُ القائم حرفاً بحرف.
+   واتجاهُ الكاميرا (EXIF) يطبّقه المتصفّح عند فكّ الصورة قبل الرسم،
+   فالتدويرُ اليدويّ يُضاف فوق صورةٍ معتدلةٍ أصلاً — كما تُعرض. */
+export function compressImage(file: File, quarterTurns = 0): Promise<Blob> {
+  const turns = normalizeQuarterTurns(quarterTurns);
   return new Promise((resolve) => {
     if (!file.type.startsWith("image/")) { resolve(file); return; }
     const isPng = file.type === "image/png";
@@ -535,7 +630,8 @@ export function compressImage(file: File): Promise<Blob> {
         else { width = width * maxDim / height; height = maxDim; }
       }
       const canvas = document.createElement("canvas");
-      canvas.width = width; canvas.height = height;
+      const sideways = turns % 2 === 1;
+      canvas.width = sideways ? height : width; canvas.height = sideways ? width : height;
       const ctx = canvas.getContext("2d");
       if (ctx && !isPng) {
         /* لون صريح لا متغيّر CSS: canvas لا يفسّر var() ويتجاهل القيمة
@@ -543,9 +639,15 @@ export function compressImage(file: File): Promise<Blob> {
            سوداء. ولو فُسِّر المتغيّر لتبع مظهر الواجهة — و‑‑text-inverse
            أسود في الثيم الداكن — والمطلوب أبيض دائماً تحت الشفافية. */
         ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, width, height);
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
-      ctx?.drawImage(img, 0, 0, width, height);
+      if (ctx && turns) {
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(turns * Math.PI / 2);
+        ctx.drawImage(img, -width / 2, -height / 2, width, height);
+      } else {
+        ctx?.drawImage(img, 0, 0, width, height);
+      }
       canvas.toBlob(b => resolve(b || file), outputType, outputQuality);
     };
     img.onerror = () => resolve(file);
@@ -553,8 +655,10 @@ export function compressImage(file: File): Promise<Blob> {
   });
 }
 
-export async function uploadDoc(file: File, passengerId: number, docType: string): Promise<string | null> {
-  const compressed = await compressImage(file);
+export async function uploadDoc(file: File, passengerId: number, docType: string, quarterTurns = 0): Promise<string | null> {
+  /* ملفّ PDF يُرفع كما هو: `compressImage` لا تلمس غير الصور، فالتدويرُ
+     لا يصل إليه أصلاً. */
+  const compressed = await compressImage(file, quarterTurns);
   const isPng = file.type === "image/png";
   const ext = file.type === "application/pdf" ? "pdf" : isPng ? "png" : "jpg";
   const contentType = file.type === "application/pdf" ? "application/pdf" : isPng ? "image/png" : "image/jpeg";
@@ -703,7 +807,7 @@ export {
   makeHTML, makeFinanceHTML,
   sectionLogoHtml, renderNamesTable, makeTwoLogoSectionHTML, joinSections, makeFlightSectionHTML,
   printInPage, downloadPDF,
-  buildStickerPageHTML, buildHandTagPageHTML, buildLongTagPageHTML, buildStickersHTML,
+  buildStickerPageHTML, buildHandTagPageHTML, buildLongTagPageHTML, buildStickersHTML, stickerDataGaps,
 } from "../print";
 
 

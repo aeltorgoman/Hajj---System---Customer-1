@@ -15,11 +15,13 @@
    يفترق مدخلان. وهيئةُ `FlightsPage` هي المرجع، ولا تُغيَّر. */
 import type { Passenger, Bus, Camp, Flight, Room } from "../types";
 import { roomCapacity } from "../utils/room";
+import { isHajj, roomOccupants, occupantName } from "../utils/passenger";
 import { chromeMetaHTML, pageStampHTML, seasonLabel, compactHeaderHTML,
          type PrintChrome, type PrintSeason } from "./print.chrome";
 import type { PrintBranding } from "./print.brand";
 import { safeBranding, escapeCompanyHtml } from "./print.brand";
 import { makeHTML } from "./print.shell";
+import { hasSeals, sealRowHTML, hotelSealPlanHTML } from "./print.seals";
 import { makeFlightSectionHTML, makeTwoLogoSectionHTML, renderNamesTable, joinSections } from "./print.blocks";
 import { busManifest, campManifest, flightManifest, flightsInOrder, campsInOrder,
          BUSES_DOC_TITLE, campsDocTitle, FLIGHTS_DOC_TITLE, type CampPageType } from "./print.manifests";
@@ -182,8 +184,9 @@ const CARD_METRICS: Record<"portrait" | "landscape", CardMetrics> = {
 };
 
 export function hotelRoomCard(
-  room: Room, occupants: { short_ar?: string; name_ar: string }[], fontSize: number, showPattern: boolean,
+  room: Room, occupants: { short_ar?: string | null; name_ar: string }[], fontSize: number, showPattern: boolean,
   orientation: "portrait" | "landscape" = "portrait",
+  hotelName: string | null = null,
 ): string {
   const { idxWidth, namePad } = CARD_METRICS[orientation];
   const type = (room.type || "").trim();
@@ -197,7 +200,7 @@ export function hotelRoomCard(
     return p
       ? `<tr>
               <td style="text-align:center;padding:${rowPad}px 4px;font-size:${numSize}px;font-weight:600;color:#333;width:${idxWidth}px;border-bottom:1px solid rgba(0,0,0,0.12);line-height:1.2">${i + 1}</td>
-              <td class="auto-fit-name" data-max-size="${fontSize}" data-pad="${namePad * 2}" style="padding:${rowPad}px ${namePad}px;font-size:${fontSize}px;font-weight:600;color:#000;border-bottom:1px solid rgba(0,0,0,0.12);line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.short_ar || p.name_ar}</td>
+              <td class="auto-fit-name" data-max-size="${fontSize}" data-pad="${namePad * 2}" style="padding:${rowPad}px ${namePad}px;font-size:${fontSize}px;font-weight:600;color:#000;border-bottom:1px solid rgba(0,0,0,0.12);line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeCompanyHtml(occupantName(p))}</td>
             </tr>`
       : `<tr>
               <td style="padding:${rowPad}px 4px;border-bottom:1px solid rgba(0,0,0,0.06);width:${idxWidth}px">&nbsp;</td>
@@ -205,9 +208,9 @@ export function hotelRoomCard(
             </tr>`;
   }).join("");
   const cardBg = showPattern ? "rgba(255,255,255,0.4)" : "#ffffff";
-  return `<div style="break-inside:avoid;border:1.5px solid ${clr};border-radius:5px;overflow:hidden;display:flex;flex-direction:column;height:100%;background:${cardBg}">
+  return `<div class="hotel-card" style="break-inside:avoid;border:1.5px solid ${clr};border-radius:5px;overflow:hidden;display:flex;flex-direction:column;height:100%;background:${cardBg}">
         <div style="background:${clr};color:#ffffff;padding:5px 7px;flex-shrink:0;text-align:center;font-size:${headerFs}px;font-weight:800;line-height:1.3">
-          غرفة ${room.number}${room.floor ? ` — الدور ${room.floor}` : ""}
+          ${hotelName ? `${escapeCompanyHtml(hotelName)} · ` : ""}غرفة ${room.number}${room.floor ? ` — الدور ${room.floor}` : ""}
           <div style="font-size:${Math.max(9, headerFs - 4)}px;font-weight:700;opacity:.92;margin-top:1px">${roomTypeBadge(room, occupants.length)}</div>
         </div>
         <table style="margin:0;width:100%;table-layout:fixed;border-collapse:collapse;flex:1;font-family:'Cairo',sans-serif;background:transparent">
@@ -221,7 +224,27 @@ export type HotelReportOptions = {
   showPattern?: boolean;
   subtitle?: string;
   chrome?: PrintChrome;
+  /* MOD-001: كشفٌ يجمع غرفَ أكثرَ من فندق (صفحة التقارير) يُسمّي فندقَ كلّ
+     غرفةٍ الفعليّ في رأس بطاقتها — فالرقمُ نفسُه قد يتكرّر بين فندقين.
+     وصفحةُ الفندق الواحد لا تمرّره فلا يتغيّر مطبوعُها. */
+  hotelOf?: (room: Room) => string | null;
+  /* «إظهار الملخص الإحصائي» — مطفأٌ افتراضاً. أرقامُ الغرف المطبوعة وحدها */
+  summary?: boolean;
 };
+
+/** ملخّصُ ما في الكشف: الغرفُ المطبوعة، والحجّاجُ المسكَّنون فيها، والأسرّةُ
+ *  الشاغرة فيها (غرفُ النوم ذاتُ السعة المحدّدة — المجلسُ خارجها، كمؤشّرات
+ *  صفحة الفندق). يُصدَّر ليُختبَر ويُطابَق بالحساب نفسه. */
+export function hotelPrintSummary(rooms: Room[], passengers: Passenger[]) {
+  const ids = new Set(rooms.map(r => r.id));
+  const housed = passengers.filter(p => p.room_id != null && ids.has(p.room_id) && isHajj(p)).length;
+  const freeBeds = rooms.reduce((n, r) => {
+    const cap = roomCapacity(r) ?? 0;
+    if (cap <= 0) return n;
+    return n + Math.max(0, cap - passengers.filter(p => p.room_id === r.id).length);
+  }, 0);
+  return { rooms: rooms.length, housed, freeBeds };
+}
 
 /** مستندُ الفندق كاملاً — المصدرُ الوحيد لصفحةِ الفندق وصفحةِ التقارير. */
 export function hotelReportDocument(
@@ -230,11 +253,19 @@ export function hotelReportDocument(
   branding: PrintBranding,
   options: HotelReportOptions = {},
 ): string {
-  const { landscape = false, showPattern = true, subtitle = "", chrome = {} } = options;
+  const { landscape = false, showPattern = true, subtitle = "", chrome = {}, hotelOf, summary = false } = options;
   const COLS = landscape ? 5 : 4;
+  /* ⚠️ الختمُ والتوقيع داخل الورقة لا فوقها: الورقةُ هنا ملكُ الشبكة كلُّها
+     (هامشُ `@page` صفر)، وأيُّ صورةٍ تعلو الصفَّ الأخير تغطّي أسماءً.
+     فيُبنى المستندُ بشبكته المعتمَدة كما هي، وفي كلّ ورقةٍ صفُّ الصورتين،
+     ثمّ يقرّر المخطِّطُ في المستند دوراً دوراً (`hotelSealPlanHTML`): خلايا
+     فارغةٌ تسعهما، أو صفُّهما بلا قصٍّ زائدٍ لكرت، أو غرفُ الدور بصفٍّ أقلّ في
+     كلّ ورقةٍ إن لم تزد ورقة. والمطفأُ كما كان بالحرف. */
+  const seals = hasSeals(chrome.seals) ? chrome.seals : null;
   const ROWS = landscape ? 3 : 4;
   const PER_PAGE = COLS * ROWS;
-  const occupantsOf = (roomId: number) => passengers.filter(p => p.room_id === roomId);
+  /* شاغلو الغرفة بترتيب كرتها على الشاشة وأسمائه — `roomOccupants`/`occupantName` */
+  const occupantsOf = (roomId: number) => roomOccupants(passengers, roomId);
 
   /* ═══ الدورُ حدُّ مجموعةٍ لا حدُّ صفحة ═══
      الدورُ وحدةٌ تشغيليّة: موظّفُ الفندق يحمل ورقةَ الدور ويصعد بها.
@@ -269,6 +300,20 @@ export function hotelReportDocument(
      تُقرأ وحدها، ولأنّهما داخلَ الورقة لا خارجَها فلا تُقسَّمان عنها. */
   const headerHTML = compactHeaderHTML(branding, `تقرير الفندق${subtitle}`);
   const metaHTML = chromeMetaHTML(chrome);
+  /* ═══ الملخّصُ الإحصائيّ — الورقةُ الأولى وحدها ═══
+     ثلاثةُ مؤشّراتٍ في صفٍّ أفقيٍّ مضغوط، يشارك سطرَ البيانات (الموسم
+     والنطاق) صفَّه بدل أن يزيد سطراً. والأرقامُ للكشف المطبوع كلِّه ولو
+     امتدّ أوراقاً. والشبكةُ بعده كما هي: الغرفُ في الورقة وأسماؤها وبطاقاتُها
+     لا تتغيّر — إنّما تنقص الأولى بضعةَ مليمترات من فراغ الصفوف. */
+  const sum = summary ? hotelPrintSummary(rooms, passengers) : null;
+  const { primaryColor } = safeBranding(branding);
+  const kpi = (n: number, label: string) =>
+    `<div class="hs-kpi"><span class="hs-num">${n}</span><span class="hs-lbl">${label}</span></div>`;
+  const firstSheetBar = sum
+    ? `<div class="hs-row" data-hotel-summary>${metaHTML}<div class="hs-strip">` +
+      kpi(sum.rooms, "إجمالي الغرف") + kpi(sum.housed, "الحجاج المسكَّنون") + kpi(sum.freeBeds, "الأسرّة الشاغرة") +
+      `</div></div>`
+    : metaHTML;
   const { companyName, tagline, footerText } = safeBranding(branding);
   const footerLine = footerText || `${companyName}${tagline ? " — " + tagline : ""} · تقرير الفندق${subtitle}`;
 
@@ -298,7 +343,14 @@ export function hotelReportDocument(
       .hotel-print-page .doc-header { margin-bottom: 2px; }
       .hotel-print-page .page-stamp { margin-top: 3pt; }
       .hotel-foot { text-align: center; color: #aaa; font-size: 7pt; margin-top: 2pt;
-                    border-top: 0.5pt solid #eee; padding-top: 3pt; }
+                    border-top: 0.5pt solid #eee; padding-top: 3pt; }${sum ? `
+      .hs-row { display: flex; align-items: center; justify-content: ${metaHTML ? "space-between" : "center"}; gap: 8pt; margin: 0 0 5pt; }
+      .hs-row .doc-meta { margin: 0; justify-content: flex-start; }
+      .hs-strip { display: flex; gap: 5pt; flex-shrink: 0; }
+      .hs-kpi { display: flex; align-items: baseline; gap: 4pt; padding: 1.5pt 7pt; background: #fff;
+                border: 0.75pt solid ${primaryColor}55; border-inline-start: 2.5pt solid ${primaryColor}; border-radius: 4pt; }
+      .hs-num { font-size: 13pt; font-weight: 800; color: ${primaryColor}; line-height: 1.15; }
+      .hs-lbl { font-size: 8pt; font-weight: 700; color: #555; white-space: nowrap; }` : ""}
     </style>` +
     pages.map((pageRooms, pi) => {
       /* أكبرُ سعةٍ معتمَدةٍ في الصفحة تحدّد الخطّ — لا أكبرُ إشغال */
@@ -307,39 +359,80 @@ export function hotelReportDocument(
       const padded: (Room | null)[] = [...pageRooms];
       while (padded.length < PER_PAGE) padded.push(null);
       const cells = padded.map(room =>
-        room ? hotelRoomCard(room, occupantsOf(room.id), fontSize, showPattern, landscape ? "landscape" : "portrait")
-             : `<div style="background:transparent"></div>`
+        room ? hotelRoomCard(room, occupantsOf(room.id), fontSize, showPattern, landscape ? "landscape" : "portrait", hotelOf?.(room) ?? null)
+             : `<div${seals ? ' class="hotel-empty"' : ""} style="background:transparent"></div>`
       ).join("");
       const stamp = chrome.pageNumbers ? pageStampHTML(pi + 1, pages.length) : "";
       /* الدورُ متاحٌ على الورقة بياناً لا زينة: سمةٌ تُقرأ آلياً ولا
          تضيف حرفاً مرئيّاً إلى تقريرٍ قُبل شكلُه. */
       const pageFloor = pageRooms.length ? floorKeyOf(pageRooms[0]) : "";
       /* ورقةٌ واحدةٌ كاملة: هويّةٌ وعنوانٌ وحواشٍ وشبكةٌ وترقيمٌ وتذييل */
-      return `<div class="hotel-print-page" data-floor="${escapeCompanyHtml(pageFloor)}">${headerHTML}${metaHTML}` +
-             `<div class="hotel-page">${cells}</div>${stamp}` +
+      return `<div class="hotel-print-page" data-floor="${escapeCompanyHtml(pageFloor)}">${headerHTML}${pi === 0 ? firstSheetBar : metaHTML}` +
+             `<div class="hotel-page">${cells}</div>${seals ? sealRowHTML(seals) : ""}${stamp}` +
              `<div class="hotel-foot">${footerLine}</div></div>`;
     }).join("");
 
-  /* ضبطُ حجم كلّ اسمٍ على حدة — منقولٌ بحرفه، ومعايرتُه مُختبَرة */
+  /* ═══ ضبطُ الأسماء ثمّ الكرت — لا اسمَ يُقصّ ولا صفَّ يختفي ═══
+     ⚠️ العطبُ القديم: كان مقاسُ الاسم يُقدَّر على لوحة رسم (canvas) لا في
+     الخليّة نفسها، و`.hotel-page td` تسمح بالالتفاف (`white-space: normal`).
+     فاسمٌ «يسع» بتقدير اللوحة يزيد في التخطيط الحقيقيّ كسراً فيلتفّ سطرين،
+     ويطول الصفّ، والكرتُ ثابتُ الارتفاع ويخفي ما فاض — فيختفي آخرُ حاجٍّ فيه.
+     فصار:
+       ١) الاسمُ يُقاس في خليّته بسطرٍ واحد ويُصغَّر حتى يسعها (حتى ٨px)؛
+          فإن لم يسعها التفّ ولا يُبتر — لا نقاطَ ولا حرفَ ضائع.
+       ٢) ثمّ الكرت: إن فاض محتواه صُغِّر خطُّ صفوفه وحشوُها معاً بقدر
+          الحاجة وحدها حتى يظهر كلُّ صفّ (حتى ٧px)، وكرتٌ يسع لا يُمسّ.
+     ويُعاد ضبطُ الكرت حين يُدخل المخطِّطُ صفَّ الختم (`__hotelFitCard`). */
   const autoFitScript = `<script>
       (function() {
-        function fitNames() {
-          var cells = document.querySelectorAll('.auto-fit-name');
-          var canvas = document.createElement('canvas');
-          var ctx = canvas.getContext('2d');
-          cells.forEach(function(cell) {
-            var maxSize = parseFloat(cell.getAttribute('data-max-size')) || 17;
-            var minSize = 8;
-            var available = cell.clientWidth - (parseFloat(cell.getAttribute('data-pad')) || 14);
-            var text = cell.textContent;
-            var size = maxSize;
-            while (size > minSize) {
-              ctx.font = '600 ' + size + 'px Cairo, sans-serif';
-              if (ctx.measureText(text).width <= available) break;
-              size -= 0.5;
-            }
+        var NAME_MIN = 8, CARD_MIN = 7;
+        function fitName(cell) {
+          var size = parseFloat(cell.getAttribute('data-max-size')) || 17;
+          cell.style.setProperty('white-space', 'nowrap', 'important');
+          cell.style.fontSize = size + 'px';
+          while (size > NAME_MIN && cell.scrollWidth > cell.clientWidth + 0.5) {
+            size -= 0.5;
             cell.style.fontSize = size + 'px';
+          }
+          cell.style.removeProperty('white-space');
+        }
+        function over(card) { return card.scrollHeight > card.clientHeight + 1; }
+        function remember(card) {
+          card.querySelectorAll('td').forEach(function (td) {
+            var cs = getComputedStyle(td);
+            td.setAttribute('data-fs', parseFloat(cs.fontSize));
+            td.setAttribute('data-pt', parseFloat(cs.paddingTop));
+            td.setAttribute('data-pb', parseFloat(cs.paddingBottom));
           });
+        }
+        /* يعيد الكرتَ إلى مقاس أسمائه ثمّ يصغّره بقدر ما يفيض — ويُعلم إن وسع */
+        function fitCard(card, minPx, fmin) {
+          var tds = card.querySelectorAll('td');
+          function apply(f) {
+            tds.forEach(function (td) {
+              var fs = +td.getAttribute('data-fs');
+              td.style.fontSize = Math.max(Math.min(fs, minPx), fs * f) + 'px';
+              td.style.paddingTop = (+td.getAttribute('data-pt') * f) + 'px';
+              td.style.paddingBottom = (+td.getAttribute('data-pb') * f) + 'px';
+            });
+          }
+          var f = 1;
+          apply(1);
+          while (over(card) && f - 0.03 >= fmin - 1e-9) { f -= 0.03; apply(f); }
+          card.setAttribute('data-fit-f', f);
+          return !over(card);
+        }
+        /* للمخطِّط: إعادةُ ملاءمة الكرت بعد صفّ الختم. التصغيرُ نسبةً إلى مقاس الكرت
+           بلا ختم (rel: ١ = كما هو بلا ختم، ٠٫٨٥ = أصغرُ منه بـ١٥٪ على الأكثر) */
+        window.__hotelFitCard = function (card, minPx, rel) {
+          var off = +(card.getAttribute('data-off-f') || 1);
+          return fitCard(card, minPx || CARD_MIN, off * (rel == null ? 0.85 : rel));
+        };
+        function fitAll() {
+          /* المقاسُ المرجعيّ بلا صفّ الختم — يُظهره المخطِّطُ بعدُ حيث يسع */
+          document.querySelectorAll('.hotel-print-page > .print-seals').forEach(function (r) { r.style.display = 'none'; });
+          document.querySelectorAll('.auto-fit-name').forEach(fitName);
+          document.querySelectorAll('.hotel-card').forEach(function (card) { remember(card); fitCard(card, CARD_MIN, 0.3); card.setAttribute('data-off-f', card.getAttribute('data-fit-f')); });
           document.documentElement.setAttribute('data-fit-done', '1');
         }
         function runWhenFontReady() {
@@ -347,9 +440,9 @@ export function hotelReportDocument(
             Promise.all([
               document.fonts.load('600 17px Cairo'),
               document.fonts.ready
-            ]).then(fitNames).catch(fitNames);
+            ]).then(fitAll).catch(fitAll);
           } else {
-            window.addEventListener('load', fitNames);
+            window.addEventListener('load', fitAll);
           }
         }
         runWhenFontReady();
@@ -359,7 +452,7 @@ export function hotelReportDocument(
   /* ⚠️ القشرةُ هنا غلافٌ لا تُضيف كتلةً: لا ترويسةَ قبل الجسم ولا
      تذييلَ بعده ولا هامشَ `@page` — فالأوراقُ الصريحةُ وحدها في الجسم.
      وهذا شرطُ ألّا يقسّم المتصفّحُ ترويسةً عن شبكتها أبداً. */
-  return makeHTML(`تقرير الفندق${subtitle}`, pagesHTML + autoFitScript, branding, {
+  return makeHTML(`تقرير الفندق${subtitle}`, pagesHTML + autoFitScript + (seals ? hotelSealPlanHTML(seals, { cols: COLS, rows: ROWS }) : ""), branding, {
     landscape,
     patternOpacity: showPattern ? 0.04 : 0,
     pageMargin: "0",

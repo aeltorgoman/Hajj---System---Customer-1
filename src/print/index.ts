@@ -15,7 +15,13 @@ export { makeHTML, makeFinanceHTML } from "./print.shell";
 export type { PrintChrome, HeaderMode, PrintSeason } from "./print.chrome";
 export type { PrintOptionKey, PrintOptionsState, PrintOptionsSpec,
               PrintReportKey, PrintOptionInputs } from "./print.options";
-export { PRINT_OPTION_LABEL, PRINT_SPECS, initialPrintOptions, chromeFromOptions } from "./print.options";
+export { PRINT_OPTION_LABEL, PRINT_SPECS, initialPrintOptions, chromeFromOptions, requestedSeals, effectiveOptions } from "./print.options";
+export type { SealImage, PrintSeals } from "./print.seals";
+export { hasSeals, sealSizeMm, sealBandMm, sealWidthMm, sealBottomMarginMm, sealPageCSS, sealPreloadHTML, sealRowHTML, sealImagesHTML,
+         sealPlanHTML, hotelSealPlanHTML, sealGroupPlanHTML, sealGroupHTML, sealGroupSize, stampSizeByInk, A4_STAMP_INK_MM, A4_SIGNATURE_BOX_MM, SEAL_OVERLAP_MM, bottomOfMargin, marginsOf, PAGE_MM,
+         STAMP_BOX_MM, SIGNATURE_BOX_MM, A5_SEAL_SCALE, SEAL_FIT_MIN_SCALE, SEAL_FIT_MIN_PT, SEAL_MIN_SIZE_SCALE } from "./print.seals";
+export type { PrintBankLine, BankSource } from "./print.bank";
+export { bankLinesFrom, bankBlockHTML } from "./print.bank";
 export { seasonLabel, compactHeaderHTML, chromeMetaHTML, pageStampHTML, CHROME_CSS } from "./print.chrome";
 export type { NameItem } from "./print.blocks";
 export { sectionLogoHtml, renderNamesTable, makeTwoLogoSectionHTML, joinSections,
@@ -23,7 +29,7 @@ export { sectionLogoHtml, renderNamesTable, makeTwoLogoSectionHTML, joinSections
 export type { PrintOptions } from "./print.output";
 export { printInPage, downloadPDF } from "./print.output";
 export type { StickerConfig, StickerPassenger, StickerMeta, StickerTypes } from "./print.stickers";
-export { buildStickerPageHTML, buildHandTagPageHTML, buildLongTagPageHTML, buildStickersHTML } from "./print.stickers";
+export { buildStickerPageHTML, buildHandTagPageHTML, buildLongTagPageHTML, buildStickersHTML, stickerDataGaps } from "./print.stickers";
 export type { Manifest, CampPageType } from "./print.manifests";
 export { busTitle, busRiders, busManifest,
          BUSES_DOC_TITLE, campsDocTitle, FLIGHTS_DOC_TITLE,
@@ -33,7 +39,7 @@ export { busTitle, busRiders, busManifest,
 export { flightSection, flightReportDocument, flightsReportDocument,
          busSection, busReportDocument, busesReportDocument,
          campSection, campReportDocument, campsReportDocument,
-         hotelReportDocument, hotelRoomCard, roomTypeBadge } from "./print.reports";
+         hotelReportDocument, hotelPrintSummary, hotelRoomCard, roomTypeBadge } from "./print.reports";
 export type { HotelReportOptions } from "./print.reports";
 export type { DocKind } from "./print.docs";
 export { docFileKind, docImageBody, docFailedBody } from "./print.docs";

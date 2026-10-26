@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { isHajj } from "../utils/passenger";
 import type { Dispatch, SetStateAction } from "react";
 import { supabase } from "../supabase";
@@ -9,7 +9,8 @@ import { StatsRow, type StatCardData } from "./StatCard";
 import { useReportBranding } from "../company/CompanyContext";
 import { inp, btnP, btnS, printInPage } from "../utils";
 import { busRiders, busReportDocument, busesReportDocument,
-         initialPrintOptions, chromeFromOptions } from "../print";
+         initialPrintOptions, chromeFromOptions, type PrintSeals } from "../print";
+import { usePrintSeals } from "../company/printSeals";
 import { PrintOptionsMenu } from "./PrintOptionsMenu";
 import { useSeasonWrite } from "../season/useSeasonWrite";
 import { useSeason } from "../season/useSeason";
@@ -21,6 +22,7 @@ import {
 import {
   allocWriteError, matchesPassenger, useAllocationDrag, useAllocationWrites, useContainerSelection,
 } from "./allocation/useAllocation";
+import { deleteContainer, deleteFeedback, updateContainer, updateFeedback, useInFlight, type Feedback } from "./allocation/containerWrites";
 
 /* أيقونة الباص — الفرق الأول الذي تراه العين بين الباص والمخيّم،
    والتمييز بها لا بلوحةِ ألوانٍ خاصّةٍ بالصفحة */
@@ -31,6 +33,15 @@ const BusIcon = () => (
     <circle cx="7" cy="18" r="2" /><circle cx="15" cy="18" r="2" />
   </svg>
 );
+
+/* السعة عددٌ صحيحٌ موجب كما كُتب بالضبط — `parseInt` كان يقبل «12.5» على أنها
+   12 و«1e2» على أنها 1 بصمت. */
+const parseCapacity = (raw: string): number | null => {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
+};
 
 const paxLabel = (n: number) => n === 1 ? "مسافر واحد" : n === 2 ? "مسافران" : n <= 10 ? `${n} مسافرين` : `${n} مسافراً`;
 const seatsLabel = (n: number) => n === 1 ? "مقعد واحد متبقٍ" : n === 2 ? "مقعدان متبقيان" : n <= 10 ? `${n} مقاعد متبقية` : `${n} مقعداً متبقياً`;
@@ -90,6 +101,13 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
 
   const sel = useContainerSelection();
   const selectedBus = buses.find(b => b.id === sel.selectedId) || null;
+  /* محرّرا الاسم والسعة يخصّان الباصَ المفتوح وحده: يُصفَّران عند كل فتحٍ
+     وإغلاق، فلا تُحفظ مسوّدةُ باصٍ على باصٍ آخر. */
+  const openBus = (id: number) => { setEditingName(false); setEditingCap(false); sel.open(id); };
+  /* مستقرٌّ عمداً: المودال يعيد تركيزه على نفسه كلّما تغيّر `onClose`،
+     ودالّةٌ جديدةٌ في كل رسمٍ كانت تسرق التركيز من حقل الاسم فتغلقه. */
+  const { close: selClose } = sel;
+  const closeBus = useCallback(() => { setEditingName(false); setEditingCap(false); selClose(); }, [selClose]);
 
   useEffect(() => {
     /* الفشل يُبلَّغ عنه بدل «لا يوجد باصات بعد» على بيانات لم تصل */
@@ -151,7 +169,9 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
     const blocked = seatBlock(bus, 1);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmMismatch(bus, [p])) return;
-    await writes.assign(pId, bus.id, "تعذر إضافة المسافر إلى الباص");
+    /* «إضافة» لغير الموزَّع وحده — إن وزّعه غيرُك في الأثناء لا يُنقل صامتاً */
+    const r = await writes.move(pId, null, bus.id, "تعذر إضافة المسافر إلى الباص");
+    if (r === "stale") showAlert("warning", `«${p.short_ar || p.name_ar}» وُزّع على باصٍ آخر من مكانٍ آخر — لم يُضَف، وحُدِّثت البيانات.`);
   };
 
   const addPicked = async (bus: Bus) => {
@@ -160,9 +180,20 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
     const blocked = seatBlock(bus, chosen.length);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmMismatch(bus, chosen)) return;
-    const done = await writes.assignMany(chosen.map(p => p.id), bus.id, "تعذر إضافة بعض المسافرين إلى الباص");
+    const done = await writes.assignMany(chosen.map(p => p.id), bus.id, "تعذر إضافة بعض المسافرين إلى الباص", null);
     if (done === chosen.length) sel.setPicked(new Set());
     else sel.setPicked(new Set(chosen.slice(done).map(p => p.id)));
+  };
+
+  /* النقل طلبٌ واحدٌ مشروطٌ بالباص الحاليّ — لا إخراجَ ثم إسناد، ولا كتابةَ
+     فوق نقلٍ أجراه غيرُك في الأثناء */
+  const staleMove = (p: Passenger) => showAlert("warning",
+    `«${p.short_ar || p.name_ar}» لم يعد في الباص المعروض — غيّر توزيعَه غيرُك في الأثناء. لم يُنقل، وحُدِّثت البيانات.`);
+
+  /* الإخراج مشروطٌ بالباص المعروض كذلك — لا يُخرَج من باصٍ نُقل إليه في الأثناء */
+  const removeP = async (p: Passenger, bus: Bus) => {
+    const r = await writes.unassign(p.id, bus.id, "تعذر إزالة المسافر من الباص");
+    if (r === "stale") showAlert("warning", `«${p.short_ar || p.name_ar}» لم يعد في الباص المعروض — غيّر توزيعَه غيرُك في الأثناء. لم يُزَل، وحُدِّثت البيانات.`);
   };
 
   const moveP = async (p: Passenger, toId: string) => {
@@ -172,7 +203,28 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
     const blocked = seatBlock(target, 1);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmMismatch(target, [p])) return;
-    await writes.assign(p.id, target.id, "تعذر نقل المسافر إلى الباص الآخر");
+    const r = await writes.move(p.id, p.bus_id ?? null, target.id, "تعذر نقل المسافر إلى الباص الآخر");
+    if (r === "stale") staleMove(p);
+  };
+
+  /* قبولُ اقتراح: غير الموزَّع يُضاف، والموزَّعُ على باصٍ آخر يُنقل بعد تأكيدٍ
+     صريحٍ يسمّي الحاجّ والباصين — ثم تأكيدُ VIP كما هو، منفصلاً. */
+  const acceptSuggestion = async (bus: Bus, pId: number) => {
+    const p = passengers.find(x => x.id === pId);
+    if (!p) return;
+    if (p.bus_id == null) { await addOne(bus, pId); return; }
+    if (p.bus_id === bus.id) return;
+    const from = buses.find(b => b.id === p.bus_id);
+    const blocked = seatBlock(bus, 1);
+    if (blocked) { showAlert("warning", blocked); return; }
+    const name = p.short_ar || p.name_ar;
+    if (!await confirmAction(
+      `نقل «${name}» من باص «${from?.name ?? "آخر"}» إلى باص «${bus.name}»؟`,
+      { title: "تأكيد النقل", confirmLabel: "نقل", cancelLabel: "إلغاء" },
+    )) return;
+    if (!await confirmMismatch(bus, [p])) return;
+    const r = await writes.move(p.id, p.bus_id, bus.id, "تعذر نقل المسافر إلى الباص");
+    if (r === "stale") staleMove(p);
   };
 
   const drag = useAllocationDrag({
@@ -183,13 +235,24 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
   // ══════════════════════════════════════════════════════════
   // الحاوية — إنشاء وتعديل وحذف
   // ══════════════════════════════════════════════════════════
-  const addBus = async () => {
+  /* طلبٌ جارٍ واحدٌ لكلّ عمليّة — النقرة المكرّرة لا تُرسَل */
+  const inFlight = useInFlight();
+
+  /* ما لم يقع كما أُريد: تُعرض الحقيقة وتُحدَّث الحالة منها */
+  const applyFeedback = (bus: Bus, fb: Feedback) => {
+    if (fb.apply?.kind === "remove") { setBuses(prev => prev.filter(b => b.id !== bus.id)); closeBus(); }
+    else if (fb.apply?.kind === "merge") { const row = fb.apply.row as Partial<Bus>; setBuses(prev => prev.map(b => b.id === bus.id ? { ...b, ...row } : b)); setEditingName(false); setEditingCap(false); }
+    showAlert(fb.type, fb.message);
+  };
+  const busLabel = (bus: Bus) => `الباص «${bus.name}»`;
+
+  const addBus = () => inFlight("add", async () => {
     if (!assertWritable()) return;
     const name = busName.trim();
-    const cap = parseInt(busCapacity, 10);
+    const cap = parseCapacity(busCapacity);
     if (!name) { setNameError("يرجى إدخال اسم الباص"); return; }
     if (buses.some(b => b.name.trim() === name)) { setNameError(`يوجد باص بالاسم "${name}" بالفعل`); return; }
-    if (!Number.isFinite(cap) || cap < 1) { setNameError("السعة يجب أن تكون عدداً أكبر من صفر"); return; }
+    if (cap === null) { setNameError("السعة يجب أن تكون عدداً صحيحاً أكبر من صفر"); return; }
     setNameError("");
     const { data, error } = await supabase.from("buses").insert([{ name, type: busType, capacity: cap }]).select();
     if (error) {
@@ -201,41 +264,45 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
       setBuses(prev => [...prev, data[0] as Bus]);
       setBusName(""); setBusType("عادي"); setBusCapacity("50"); setShowAdd(false);
     }
-  };
+  });
 
-  const deleteBus = async (bus: Bus) => {
+  /* الحذف ببرهان: لا يُزال الباص من الشاشة إلا إن حُذف فعلاً أو تبيّن أنه
+     لم يعد موجوداً */
+  const deleteBus = (bus: Bus) => inFlight(`delete:${bus.id}`, async () => {
     if (!assertWritable()) return;
     /* القاعدة ترفضه بالمفتاح الأجنبي كذلك — وهذا يشرح قبل المحاولة */
     if (riders(bus.id).length > 0) { showAlert("warning", `الباص «${bus.name}» يضمّ ${paxLabel(riders(bus.id).length)} — أخرِجهم قبل حذفه.`); return; }
-    const { error } = await supabase.from("buses").delete().eq("id", bus.id);
-    if (error) { console.error("فشل حذف الباص", error); showAlert("error", allocWriteError("فشل حذف الباص، يرجى المحاولة مرة أخرى", error.message)); return; }
-    setBuses(prev => prev.filter(b => b.id !== bus.id));
-    sel.close();
-  };
+    const r = await deleteContainer("buses", bus.id);
+    if (r.kind === "ok") { setBuses(prev => prev.filter(b => b.id !== bus.id)); closeBus(); return; }
+    console.error("فشل حذف الباص", r);
+    applyFeedback(bus, deleteFeedback(r, busLabel(bus), "فشل حذف الباص", allocWriteError));
+  });
 
-  const renameBus = async (bus: Bus, name: string) => {
+  /* التعديل ببرهان: صفٌّ واحدٌ عائدٌ من القاعدة، وإلا قيل لماذا */
+  const renameBus = (bus: Bus, name: string) => inFlight(`rename:${bus.id}`, async () => {
     if (!assertWritable()) return;
     const next = name.trim();
     if (!next || next === bus.name) { setEditingName(false); return; }
     if (buses.some(b => b.id !== bus.id && b.name.trim() === next)) { showAlert("warning", `يوجد باص بالاسم "${next}" بالفعل`); return; }
-    const { error } = await supabase.from("buses").update({ name: next }).eq("id", bus.id);
-    if (error) { console.error("تعذر تعديل اسم الباص", error); showAlert("error", allocWriteError("تعذر تعديل اسم الباص", error.message)); return; }
+    const r = await updateContainer("buses", bus.id, { name: next });
+    if (r.kind !== "ok") { console.error("تعذر تعديل اسم الباص", r); applyFeedback(bus, updateFeedback(r, busLabel(bus), "تعذر تعديل اسم الباص", allocWriteError)); return; }
     setBuses(prev => prev.map(b => b.id === bus.id ? { ...b, name: next } : b));
     setEditingName(false);
-  };
+  });
 
-  /* السعة تُعدَّل، ولا تنزل تحت الإشغال — هنا وفي القاعدة */
-  const saveCapacity = async (bus: Bus) => {
+  /* السعة تُعدَّل، ولا تنزل تحت الإشغال — هنا وفي القاعدة. والكتابة مشروطة
+     بالسعة التي رآها الموظّف: لا يُكتب فوق سعةٍ غيّرها غيرُه في الأثناء */
+  const saveCapacity = (bus: Bus) => inFlight(`capacity:${bus.id}`, async () => {
     if (!assertWritable()) return;
-    const cap = parseInt(capDraft, 10);
+    const cap = parseCapacity(capDraft);
     const occ = riders(bus.id).length;
-    if (!Number.isFinite(cap) || cap < 1) { showAlert("warning", "السعة يجب أن تكون عدداً أكبر من صفر"); return; }
+    if (cap === null) { showAlert("warning", "السعة يجب أن تكون عدداً صحيحاً أكبر من صفر"); return; }
     if (cap < occ) { showAlert("warning", `الباص «${bus.name}» يضمّ ${paxLabel(occ)}، فلا تُخفَّض سعته إلى ${cap}. أخرِج المسافرين أولاً.`); return; }
-    const { error } = await supabase.from("buses").update({ capacity: cap }).eq("id", bus.id);
-    if (error) { console.error("تعذر تعديل سعة الباص", error); showAlert("error", allocWriteError("تعذر تعديل سعة الباص", error.message)); return; }
+    const r = await updateContainer("buses", bus.id, { capacity: cap }, { capacity: bus.capacity });
+    if (r.kind !== "ok") { console.error("تعذر تعديل سعة الباص", r); applyFeedback(bus, updateFeedback(r, busLabel(bus), "تعذر تعديل سعة الباص", allocWriteError)); return; }
     setBuses(prev => prev.map(b => b.id === bus.id ? { ...b, capacity: cap } : b));
     setEditingCap(false);
-  };
+  });
 
   // ══════════════════════════════════════════════════════════
   // الاقتراحات الذكيّة — قرابة، ثم غرفة، ثم خيمة منى
@@ -269,11 +336,23 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
           s.kin ? x.family_id === p.family_id : s.room ? x.room_id === p.room_id : x.camp_mina_id === p.camp_mina_id);
         const name = withWhom?.short_ar || withWhom?.name_ar?.split(" ").slice(0, 2).join(" ") || "";
         const why = [s.kin && "صلة قرابة", s.room && "نفس الغرفة", s.mina && "نفس خيمة منى"].filter(Boolean).join(" · ");
+        const short = p.short_ar || p.name_ar;
+        const current = p.bus_id != null ? buses.find(b => b.id === p.bus_id) : null;
+        const moving = p.bus_id != null;
         return {
           id: p.id,
-          name: p.short_ar || p.name_ar,
+          name: short,
           tone: (s.kin ? "kin" : s.room ? "room" : "other") as SuggestionItem["tone"],
           reason: <>{why}{name ? <span style={{ color: "var(--primary)", fontWeight: 800 }}> مع {name}</span> : null}</>,
+          status: (
+            <span style={{ fontSize: 9, fontWeight: 800, padding: "1px 7px", borderRadius: 99, flexShrink: 0, whiteSpace: "nowrap",
+              background: moving ? "var(--info-bg)" : "var(--warning-bg)", color: moving ? "var(--info)" : "var(--warning)" }}>
+              {moving ? `في باص ${current?.name ?? "آخر"}` : "غير موزع"}
+            </span>
+          ),
+          action: moving
+            ? { label: "نقل", ariaLabel: `نقل ${short} من باص ${current?.name ?? "آخر"} إلى باص ${bus.name}` }
+            : { label: "إضافة", ariaLabel: `إضافة ${short} إلى باص ${bus.name}` },
         };
       });
   };
@@ -283,9 +362,17 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
   // ══════════════════════════════════════════════════════════
   /* خياراتُ العرض — حالٌ محليّةٌ للجلسة، وافتراضُها المظهرُ المعتمَد */
   const [printOpts, setPrintOpts] = useState(() => initialPrintOptions("bus"));
-  const busChrome = () => chromeFromOptions("bus", printOpts, { season: viewedSeason });
-  const printBus = (bus: Bus) => printInPage(busReportDocument(bus, passengers, branding, busChrome()));
-  const printAll = () => printInPage(busesReportDocument(buses, passengers, branding, busChrome()));
+  /* الختمُ والتوقيع يُحمَّلان قبل البناء إن طُلبا — وإن تعذّرا أُبلغ الموظّفُ ولم يُطبع شيء */
+  const { sealsFor, unavailable: sealsOff } = usePrintSeals(showAlert);
+  const busChrome = (seals: PrintSeals) => chromeFromOptions("bus", printOpts, { season: viewedSeason, seals });
+  const printBus = async (bus: Bus) => {
+    const seals = await sealsFor("bus", printOpts); if (!seals) return;
+    printInPage(busReportDocument(bus, passengers, branding, busChrome(seals)));
+  };
+  const printAll = async () => {
+    const seals = await sealsFor("bus", printOpts); if (!seals) return;
+    printInPage(busesReportDocument(buses, passengers, branding, busChrome(seals)));
+  };
 
   // ══════════════════════════════════════════════════════════
   const vipBadge = (light?: boolean) => (
@@ -306,7 +393,7 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
           style={{ ...roOff, display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 99, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--primary)", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "var(--font-body)", transition: "var(--transition)", boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
           <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg> باص جديد
         </button>
-        {buses.length > 0 && <PrintOptionsMenu report={"bus"} value={printOpts} onChange={setPrintOpts} />}
+        {buses.length > 0 && <PrintOptionsMenu report={"bus"} value={printOpts} onChange={setPrintOpts} disabled={sealsOff} />}
         {buses.length > 0 && <button onClick={printAll} style={btnS()}><svg aria-hidden width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" /></svg> طباعة الكل</button>}
       </div>
 
@@ -325,7 +412,7 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
               const occ = riders(bus.id).length;
               const left = bus.capacity - occ;
               return (
-                <AllocationCard key={bus.id} selected={sel.selectedId === bus.id} onClick={() => sel.open(bus.id)}
+                <AllocationCard key={bus.id} selected={sel.selectedId === bus.id} onClick={() => openBus(bus.id)}
                   icon={<BusIcon />} title={`باص ${bus.name}`} badge={bus.type === "VIP" ? vipBadge(true) : undefined}
                   occ={occ} cap={bus.capacity} emptyHint="＋ إضافة مسافر"
                   capacityNote={left > 0 ? seatsLabel(left) : left === 0 ? "مكتمل" : `تجاوز السعة بـ ${-left}`} />
@@ -359,14 +446,18 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
         const blockedReason = readOnly ? "موسم للعرض فقط" : left <= 0 ? "الباص مكتمل" : undefined;
 
         return (
-          <AllocationDialog onClose={sel.close} icon={<BusIcon />}
+          <AllocationDialog onClose={closeBus} icon={<BusIcon />}
             title={editingName ? (
               <input defaultValue={bus.name} autoFocus aria-label="اسم الباص"
                 onBlur={e => renameBus(bus, e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter") renameBus(bus, (e.target as HTMLInputElement).value); if (e.key === "Escape") setEditingName(false); }}
                 style={{ width: 140, fontSize: 18, fontWeight: 900, padding: "2px 8px", borderRadius: 8, border: "none", outline: "none", fontFamily: "var(--font-body)" }} />
             ) : (
-              <span onDoubleClick={() => !readOnly && setEditingName(true)} title="انقر نقرتين لتعديل الاسم">باص {bus.name}</span>
+              /* النقرتان كما هما، ولوحةُ المفاتيح تبلغه أيضاً: Tab ثم Enter أو F2 */
+              <span onDoubleClick={() => !readOnly && setEditingName(true)} title="انقر نقرتين لتعديل الاسم"
+                role={readOnly ? undefined : "button"} tabIndex={readOnly ? undefined : 0}
+                aria-label={readOnly ? undefined : `باص ${bus.name} — تعديل الاسم`}
+                onKeyDown={e => { if (!readOnly && (e.key === "Enter" || e.key === "F2")) { e.preventDefault(); setEditingName(true); } }}>باص {bus.name}</span>
             )}
             badges={bus.type === "VIP" ? vipBadge(true) : undefined}
             meta={
@@ -437,7 +528,7 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
                                 {others.map(b => <option key={b.id} value={b.id}>{b.name} ({remainingOf(b)} متاح)</option>)}
                               </select>
                             )}
-                            <button disabled={readOnly} onClick={() => void writes.unassign(p.id, "تعذر إزالة المسافر من الباص")}
+                            <button disabled={readOnly} onClick={() => void removeP(p, bus)}
                               aria-label={`إزالة ${p.short_ar || p.name_ar} من الباص`} title="إزالة من الباص"
                               style={{ ...roOff, width: 24, height: 24, borderRadius: 7, border: "1px solid var(--danger)", background: "var(--paper)", cursor: "pointer", color: "var(--danger)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                               <svg aria-hidden width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="9 14 4 9 9 4" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></svg>
@@ -447,7 +538,7 @@ function BusesPage({ passengers, setPassengers }: { passengers: Passenger[]; set
                     ))}
                 </div>
                 <SuggestionStrip items={busSuggestions(bus)} blockedReason={blockedReason}
-                  onAccept={pId => void addOne(bus, pId)}
+                  onAccept={pId => void acceptSuggestion(bus, pId)}
                   onDismiss={pId => setDismissed(prev => new Set([...prev, pId]))} />
               </>
             }

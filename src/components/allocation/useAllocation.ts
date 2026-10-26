@@ -42,6 +42,20 @@ export function allocWriteError(fallback: string, msg?: string): string {
 // تنفّذ ولا تسأل: المنادي فحص قواعده قبل أن يدعوها، والقاعدة هي
 // الحدّ الأخير. وترجع true عند النجاح فقط، فلا تُحدَّث الحالة
 // المحليّة على كتابةٍ لم تقع.
+//
+// ⚠️ برهانُ الكتابة صفُّ الحاجّ نفسُه عائداً من القاعدة: سياسةُ
+// `passengers_update` تحجب الصفَّ عمّن لا يملك صلاحيّته (حاجٌّ بلا
+// `manage_passengers`، أو إداريٌّ بلا `manage_admins`)، فيمرّ الطلب
+// بلا خطأ ولا يمسّ شيئاً. فالنجاحُ عودةُ صفّه بعينه، وصفرُ صفوفٍ فشل.
+
+/* نتيجة الكتابة المشروطة: «stale» = لم يعد الحاجّ في الحاوية المتوقَّعة
+   (غيّره غيرُك) — لم يُكتب شيء، وحُدِّثت الحالة المحليّة بقيمته الفعليّة.
+   «busy» = كتابةٌ سابقة للحاجّ نفسه من هذه الصفحة لم تنتهِ بعد (نقرةٌ
+   مكرّرة) — لم يُرسَل طلبٌ ثانٍ، ولا رسالة. */
+export type MoveOutcome = "ok" | "stale" | "failed" | "busy";
+
+const NO_ROWS = "لم يتغيّر شيء في قاعدة البيانات — قد لا تملك صلاحية تعديل هذا المسافر.";
+
 export function useAllocationWrites({
   column, orderColumn, setPassengers, readOnly, showAlert, onBlocked,
 }: {
@@ -57,66 +71,177 @@ export function useAllocationWrites({
     return true;
   }, [readOnly, onBlocked]);
 
-  /* إسناد واحد */
-  const assign = useCallback(async (passengerId: number, containerId: number, fallback: string): Promise<boolean> => {
-    if (!guard()) return false;
-    const { error } = await supabase.from("passengers")
-      .update({ [column]: containerId } as TablesUpdate<"passengers">).eq("id", passengerId);
-    if (error) { console.error(fallback, error); showAlert("error", allocWriteError(fallback, error.message)); return false; }
-    setPassengers(prev => prev.map(p => p.id === passengerId ? { ...p, [column]: containerId } : p));
+  /* كتابةٌ واحدة ببرهانها. `expectFrom` شرطٌ على القيمة الحاليّة داخل الطلب
+     نفسه: لا يُكتب إلا إن كان الحاجّ حيث يُظَنّ — `null` = غير موزَّع. */
+  const writeOne = useCallback(async (passengerId: number, value: number | null, expectFrom: number | null) => {
+    let q = supabase.from("passengers")
+      .update({ [column]: value } as TablesUpdate<"passengers">).eq("id", passengerId);
+    q = expectFrom === null ? q.is(column, null) : q.eq(column, expectFrom);
+    const { data, error } = await q.select("id");
+    if (error) return { ok: false as const, message: error.message };
+    if (!data || data.length !== 1 || data[0].id !== passengerId) return { ok: false as const, noRows: true };
+    return { ok: true as const };
+  }, [column]);
+
+  /* القيمة الفعليّة في القاعدة — لتمييز «تغيّر من مكانٍ آخر» من «حجبته الصلاحية» */
+  const readCurrent = useCallback(async (passengerId: number): Promise<{ found: boolean; value: number | null }> => {
+    const { data, error } = await supabase.from("passengers").select(column).eq("id", passengerId).maybeSingle();
+    if (error || !data) return { found: false, value: null };
+    return { found: true, value: (data as Record<string, number | null>)[column] ?? null };
+  }, [column]);
+
+  /* لا كتابتان معاً للحاجّ نفسه من هذه الصفحة. النقرةُ الثانية قبل انتهاء
+     الأولى كانت تُرسَل فتعود بصفر صفوف (الأولى غيّرت القيمة) فتبدو «غيّره
+     غيرُك» — وما غيّره إلا نحن. فتُحجَز الأرقامُ طوال الطلب وتُتجاهَل
+     المكرّرة. ولا يُستنتَج نجاحُنا من مطابقة القيمة للهدف: قد تكون كتابةَ
+     غيرِنا، فتبقى «stale». */
+  const inFlight = useRef(new Set<number>());
+  const claim = useCallback((ids: number[]) => {
+    if (ids.some(id => inFlight.current.has(id))) return false;
+    for (const id of ids) inFlight.current.add(id);
     return true;
-  }, [column, guard, setPassengers, showAlert]);
+  }, []);
+  const release = useCallback((ids: number[]) => { for (const id of ids) inFlight.current.delete(id); }, []);
+
+  /* كتابةٌ مشروطة لحاجٍّ واحد: من `expectFrom` إلى `value` في طلبٍ واحد —
+     لا إخراجَ ثم إسناد. فإن لم يعد الحاجّ حيث يُظَنّ لم يُكتب شيء، وتُحدَّث
+     الحالة المحليّة بقيمته الفعليّة، ويقرّر المنادي ما يقول («stale»). */
+  const writeIf = useCallback(async (passengerId: number, expectFrom: number | null, value: number | null, fallback: string): Promise<MoveOutcome> => {
+    if (!guard()) return "failed";
+    if (!claim([passengerId])) return "busy";
+    try {
+      const r = await writeOne(passengerId, value, expectFrom);
+      if (r.ok) {
+        setPassengers(prev => prev.map(p => p.id === passengerId ? { ...p, [column]: value } : p));
+        return "ok";
+      }
+      if (r.noRows) {
+        const cur = await readCurrent(passengerId);
+        if (cur.found && cur.value !== expectFrom) {
+          setPassengers(prev => prev.map(p => p.id === passengerId ? { ...p, [column]: cur.value } : p));
+          return "stale";
+        }
+      }
+      console.error(fallback, r);
+      showAlert("error", r.noRows ? `${fallback}: ${NO_ROWS}` : allocWriteError(fallback, r.message));
+      return "failed";
+    } finally {
+      release([passengerId]);
+    }
+  }, [claim, column, guard, readCurrent, release, setPassengers, showAlert, writeOne]);
+
+  /* نقلٌ أو إسنادٌ مشروط — `expectFrom = null` إسنادُ غيرِ الموزَّع وحده */
+  const move = useCallback((passengerId: number, expectFrom: number | null, containerId: number, fallback: string): Promise<MoveOutcome> =>
+    writeIf(passengerId, expectFrom, containerId, fallback), [writeIf]);
 
   /* إسناد دفعة — واحداً بعد واحد لا على التوازي: السقف في القاعدة
      يقفل صفّ الحاوية، وعشرون طلباً متوازياً على قفلٍ واحد يطيل
      الانتظار بلا فائدة. والتسلسل يجعل الرفض دقيقاً: نعرف من دخل
-     ومن ردّته السعة. */
-  const assignMany = useCallback(async (passengerIds: number[], containerId: number, fallback: string): Promise<number> => {
+     ومن ردّته السعة. و`expectFrom` شرطٌ على كلّ صفّ كما في `move` —
+     إلزاميّ، فلا إسنادَ دفعةٍ يكتب فوق توزيعٍ لم يره الموظّف. */
+  const assignMany = useCallback(async (passengerIds: number[], containerId: number, fallback: string, expectFrom: number | null): Promise<number> => {
     if (!guard()) return 0;
-    const done: number[] = [];
-    let firstError: string | undefined;
-    for (const id of passengerIds) {
-      const { error } = await supabase.from("passengers")
-        .update({ [column]: containerId } as TablesUpdate<"passengers">).eq("id", id);
-      if (error) { console.error(fallback, error); firstError = error.message; break; }
-      done.push(id);
+    /* دفعةٌ تتقاطع مع كتابةٍ جارية: إن كانت كلُّها جاريةً فهي تكرارٌ (نقرةٌ
+       مزدوجة) يُتجاهَل صامتاً، وإن تقاطعت ببعضها فلا يُرسَل شيء ويُقال لماذا
+       — لا تُبتلَع إضافةُ الباقين بلا تفسير. */
+    if (!claim(passengerIds)) {
+      const busy = passengerIds.filter(id => inFlight.current.has(id)).length;
+      if (busy < passengerIds.length) {
+        showAlert("warning", `${fallback}: عمليةٌ سابقة على ${busy === 1 ? "أحد المختارين" : `${busy} من المختارين`} ما زالت جارية — لم يُرسَل شيء. انتظر انتهاءها ثم أعد المحاولة.`);
+      }
+      return 0;
     }
-    if (done.length) {
-      const set = new Set(done);
-      setPassengers(prev => prev.map(p => set.has(p.id) ? { ...p, [column]: containerId } : p));
+    try {
+      const done: number[] = [];
+      let failure: string | undefined;
+      for (const id of passengerIds) {
+        const r = await writeOne(id, containerId, expectFrom);
+        if (!r.ok) {
+          console.error(fallback, r);
+          if (r.noRows) {
+            /* من تغيّر توزيعه تُحدَّث حالته المحليّة بقيمته الفعليّة */
+            const cur = await readCurrent(id);
+            if (cur.found && cur.value !== expectFrom) {
+              setPassengers(prev => prev.map(p => p.id === id ? { ...p, [column]: cur.value } : p));
+            }
+            failure = `${fallback}: تغيّر توزيع أحد المسافرين من مكانٍ آخر، أو ${NO_ROWS}`;
+          } else {
+            failure = allocWriteError(fallback, r.message);
+          }
+          break;
+        }
+        done.push(id);
+      }
+      if (done.length) {
+        const set = new Set(done);
+        setPassengers(prev => prev.map(p => set.has(p.id) ? { ...p, [column]: containerId } : p));
+      }
+      if (failure) showAlert("error", failure);
+      return done.length;
+    } finally {
+      release(passengerIds);
     }
-    if (firstError) showAlert("error", allocWriteError(fallback, firstError));
-    return done.length;
-  }, [column, guard, setPassengers, showAlert]);
+  }, [claim, column, guard, readCurrent, release, setPassengers, showAlert, writeOne]);
 
-  /* إخراج — لا يُفحص سقفٌ عند إخلاء مقعد */
-  const unassign = useCallback(async (passengerId: number, fallback: string): Promise<boolean> => {
-    if (!guard()) return false;
-    const { error } = await supabase.from("passengers")
-      .update({ [column]: null } as TablesUpdate<"passengers">).eq("id", passengerId);
-    if (error) { console.error(fallback, error); showAlert("error", allocWriteError(fallback, error.message)); return false; }
-    setPassengers(prev => prev.map(p => p.id === passengerId ? { ...p, [column]: null } : p));
-    return true;
-  }, [column, guard, setPassengers, showAlert]);
+  /* إخراجٌ مشروط بالحاوية المعروضة — لا يُفحص سقفٌ عند إخلاء مقعد، لكن لا
+     يُخرَج حاجٌّ نقله غيرُك إلى حاويةٍ أخرى في الأثناء («stale»). */
+  const unassign = useCallback((passengerId: number, expectFrom: number, fallback: string): Promise<MoveOutcome> =>
+    writeIf(passengerId, expectFrom, null, fallback), [writeIf]);
 
   /* الترتيب يكتب في عمود الحاوية وحده — `bus_sort_order` للباص،
      و`camp_mina_sort_order` لمنى، و`camp_arafa_sort_order` لعرفة.
      كانت الكتابة في `sort_order` العام فتسحق ترتيب كل حاويةٍ أخرى،
-     إذ يبدأ كلٌّ ترقيمه من ١. والعمود يأتي من المنادي فلا يُخطأ. */
+     إذ يبدأ كلٌّ ترقيمه من ١. والعمود يأتي من المنادي فلا يُخطأ.
+     والعرضُ تفاؤليّ (السحب يستجيب فوراً)، أمّا الكتابة فطابور:
+     كلُّ ترتيبٍ ينتظر سابقه حتى ينتهي، فلا يصل طلبٌ قديمٌ إلى القاعدة بعد
+     طلبٍ أحدث فيسحقه. ولكلّ ترتيبٍ رقم، ولكلّ صفٍّ آخرُ رقمٍ رتّبه: ما رفضته
+     القاعدة يُعاد إلى قيمته الفعليّة المقروءة منها — إلا صفّاً رتّبه ترتيبٌ
+     أحدث، فذاك يحكمه الأحدث. والقيمة المقروءة تُقارَن بالمقصودة: طلبٌ انقطع
+     ردُّه بعد أن حُفظ ليس فشلاً. */
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
+  const generation = useRef(0);
+  const rowGeneration = useRef(new Map<number, number>());
+
   const reorder = useCallback(async (ordered: { id: number }[], fallback: string): Promise<boolean> => {
     if (!guard()) return false;
+    const gen = ++generation.current;
+    for (const item of ordered) rowGeneration.current.set(item.id, gen);
     setPassengers(prev => applyReorder(prev, orderColumn, ordered));
-    const results = await Promise.all(reorderUpdates(orderColumn, ordered));
-    const failed = results.filter(r => r.error);
-    if (failed.length) {
-      console.error(fallback, failed.map(f => f.error));
-      showAlert("error", fallback);
+    const intended = new Map(ordered.map((item, i) => [item.id, (i + 1) * 10]));
+    const isLatest = (id: number) => rowGeneration.current.get(id) === gen;
+
+    const run = queue.current.then(async (): Promise<boolean> => {
+      const results = await Promise.all(reorderUpdates(orderColumn, ordered).map(q => q.select("id")));
+      const failedIds = ordered
+        .filter((item, i) => { const r = results[i]; return !!r.error || !r.data || r.data.length !== 1 || r.data[0].id !== item.id; })
+        .map(item => item.id);
+      if (!failedIds.length) return true;
+
+      const { data: actual, error } = await supabase.from("passengers").select(`id, ${orderColumn}`).in("id", failedIds);
+      if (error || !actual) {
+        console.error(fallback, { failedIds, errors: results.filter(r => r.error).map(r => r.error), readError: error });
+        if (failedIds.some(isLatest)) showAlert("error", `${fallback} — حدّث الصفحة لعرض الترتيب المحفوظ فعلاً`);
+        return false;
+      }
+      const stored = new Map((actual as unknown as Record<string, number | null>[]).map(row => [row.id as number, row[orderColumn] ?? null]));
+      /* صفوفٌ لم تبلغ قيمتَها المقصودة فعلاً — ما سواها حُفظ وإن ضاع ردُّه */
+      const wrong = failedIds.filter(id => stored.get(id) !== intended.get(id));
+      const revert = wrong.filter(id => isLatest(id) && stored.has(id));
+      if (revert.length) {
+        const ids = new Set(revert);
+        setPassengers(prev => prev.map(p => ids.has(p.id) ? { ...p, [orderColumn]: stored.get(p.id) } : p));
+      }
+      if (!wrong.length) return true;
+      console.error(fallback, { wrong, stored: Object.fromEntries(stored), errors: results.filter(r => r.error).map(r => r.error) });
+      /* ما تخطّاه ترتيبٌ أحدث لا يُعلَن فشلُه — الأحدثُ يحكمه ويُعلن عن نفسه */
+      if (wrong.some(isLatest)) showAlert("error", fallback);
       return false;
-    }
-    return true;
+    });
+    queue.current = run.catch(() => undefined);
+    return run;
   }, [guard, orderColumn, setPassengers, showAlert]);
 
-  return { assign, assignMany, unassign, reorder };
+  return { move, assignMany, unassign, reorder };
 }
 
 // ═══════════════════════════════════════════════════════════

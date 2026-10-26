@@ -1,10 +1,10 @@
-# Customer Release 1.0.7
+# Customer Release 1.1.0
 
 | | |
 |---|---|
 | Product | Hajj Management System |
-| Release version | `v1.0.7` |
-| Snapshot generated | 2026-10-07 |
+| Release version | `v1.1.0` |
+| Snapshot generated | 2026-10-26 |
 | Allowlist manifest | `customer-release.manifest.json` v1 (Master) |
 
 This repository is a **clean release snapshot**, not a fork or mirror of the
@@ -16,7 +16,8 @@ vendor's Master repository. It carries no Master development history.
 - The canonical Supabase migrations required to build a fresh customer database.
 - The Supabase Edge Functions and `supabase/config.toml`.
 - `package-lock.json` and the pinned Supabase CLI version.
-- The first-administrator bootstrap script.
+- The **Customer Backend Setup** workflow, which creates the first administrator
+  (Deployment, step 3).
 - The operational documentation required for this release.
 
 ## What it deliberately does not contain
@@ -54,8 +55,11 @@ Config: Read**. No other permission, secret or password is stored.
    stops without changing anything if not.
    It then applies the database, creates the First Administrator with every system permission,
    creates the first open season (an existing open season is kept unchanged),
-   configures the Edge Function secrets, deploys the six Edge Functions and
-   verifies the result. If a run fails, fix the reported
+   configures the Edge Function secrets, deploys the seven Edge Functions,
+   activates scheduled push notifications for this project (its own Vault
+   dispatch URL and token, never copied from elsewhere) and verifies the
+   result — including a probe that proves scheduled push reaches its function.
+   If a run fails, fix the reported
    cause and run it again — it continues safely.
 4. **Vercel** — set `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` and the
    `VITE_VAPID_PUBLIC_KEY` shown in the workflow's summary, then deploy.

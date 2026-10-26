@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { supabase } from "./supabase";
 import { pagePerm } from "./navigation/nav";
-import { useSidebarPrefs, useIsNarrow, useIsCompactViewport } from "./navigation/useSidebar";
+import { useSidebarPrefs, useSidebarPeek, useIsNarrow, useIsCompactViewport } from "./navigation/useSidebar";
 import { useStaffRoute } from "./navigation/useStaffRoute";
 import type { Passenger, User } from "./types";
 import { mapPassenger, upsertPassenger, isHajj } from "./utils/passenger";
@@ -18,7 +18,7 @@ import { PassengersPage } from "./components/PassengersPage";
 import { BusesPage } from "./components/BusesPage";
 import { FlightsPage } from "./components/FlightsPage";
 import { CampsPage } from "./components/CampsPage";
-import { HotelPage } from "./components/HotelPage";
+import { HotelsPage } from "./components/HotelsPage";
 import { ReportsPage } from "./components/ReportsPage";
 import { SeasonManagerPage } from "./components/SeasonManagerPage";
 import { UsersPage } from "./components/UsersPage";
@@ -106,6 +106,10 @@ function AppShell({ currentUser, onLogout }: { currentUser: User; onLogout: () =
   const narrow = useIsNarrow();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const drawerVisible = narrow && drawerOpen;
+  /* صفحة الحجاج: الجدولُ والملفّ يحتاجان العرض، فالسايدبار أيقوناتٌ
+     يتّسع مؤقّتاً فوقهما — دون مسّ التفضيل المحفوظ أو الصفحات الأخرى. */
+  const rail = !narrow && page === "passengers";
+  const peek = useSidebarPeek(rail);
   useEffect(() => {
     if (!drawerVisible) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setDrawerOpen(false); };
@@ -197,7 +201,7 @@ function AppShell({ currentUser, onLogout }: { currentUser: User; onLogout: () =
       case "flights":    return <FlightsPage passengers={passengers} setPassengers={setPassengers} />;
       case "mina":       return <CampsPage pageType="منى" passengers={passengers} setPassengers={setPassengers} />;
       case "arafa":      return <CampsPage pageType="عرفة" passengers={passengers} setPassengers={setPassengers} />;
-      case "hotel":      return <HotelPage passengers={passengers} setPassengers={setPassengers} />;
+      case "hotel":      return <HotelsPage passengers={passengers} setPassengers={setPassengers} />;
       case "reports":    return <ReportsPage passengers={passengers} resetKey={reportsResetKey} currentUser={currentUser!} />;
       case "archive":    return <SeasonManagerPage currentUser={currentUser} />;
       case "users":      return <UsersPage currentUser={currentUser} />;
@@ -223,6 +227,19 @@ function AppShell({ currentUser, onLogout }: { currentUser: User; onLogout: () =
       <div style={{ flex: 1, display: "flex", alignItems: "flex-start" }}>
         {/* السايدبار ثابت — على العرض الضيّق يصير درجاً فوق المحتوى */}
         {!narrow && (
+          rail ? (
+            <div data-sidebar-rail {...peek.handlers} style={{ position: "sticky", top: 0, height: "100vh", flexShrink: 0, width: 56, zIndex: 60 }}>
+              <div style={{ position: "absolute", top: 0, right: 0, height: "100%", display: "flex", boxShadow: peek.open ? "-8px 0 24px rgba(0,0,0,.25)" : "none", transition: "box-shadow .2s ease" }}>
+                <Sidebar
+                  page={page} setPage={setPage}
+                  count={passengers.filter(p => isHajj(p)).length}
+                  currentUser={currentUser}
+                  onReportsClick={() => setReportsResetKey(k => k + 1)}
+                  compact={!peek.open} onToggleCompact={peek.toggle} onNavigate={peek.close}
+                />
+              </div>
+            </div>
+          ) : (
           <div style={{ position: "sticky", top: 0, height: "100vh", flexShrink: 0 }}>
             <Sidebar
               page={page} setPage={setPage}
@@ -232,6 +249,7 @@ function AppShell({ currentUser, onLogout }: { currentUser: User; onLogout: () =
               compact={compact} onToggleCompact={toggleCompact}
             />
           </div>
+          )
         )}
         {drawerVisible && (
           <div style={{ position: "fixed", inset: 0, zIndex: 10000 }}>

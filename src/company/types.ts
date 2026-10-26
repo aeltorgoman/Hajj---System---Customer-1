@@ -1,4 +1,5 @@
 import type { Json } from "../types/database";
+import type { PhotoVisibility } from "./portalSettings";
 
 /* ⚠️ لا `seasonLabel` هنا. اسمُ الموسم يملكه `seasons.name` وحده،
    ويُقرأ من `useSeason()` لا من هويّة الشركة. وبقاؤه في هذا العقد
@@ -6,6 +7,14 @@ import type { Json } from "../types/database";
 export interface CompanyIdentity { nameAr: string; nameEn: string; tagline: string; logoUrl: string | null }
 export interface CompanyContact { phone: string; email: string; country: string; city: string }
 export interface CompanyFinancial { bankName: string; accountName: string; accountNumber: string; iban: string; swift: string; commercialRegistration: string; paymentQrUrl: string | null }
+/* ═══ البنك والسداد — الحقولُ الستّة ═══
+   مالكُها في الواجهة «الحسابات ← إعدادات الحسابات» وحدها، وبابُها في القاعدة
+   `update_company_bank_settings` وحده (الترحيلة 20261022090000). والسجلُّ
+   التجاريّ منها عن قصد: يُستعمَل معرِّفاً للتحويل والسداد. */
+export const BANK_SETTINGS_FIELDS = [
+  "bank_name", "bank_account_name", "bank_account_number", "bank_iban", "bank_swift", "commercial_registration",
+] as const;
+export type BankSettingsField = typeof BANK_SETTINGS_FIELDS[number];
 export interface CompanyBranding { primaryColor: string; accentColor: string; sidebarColor: string; bannerUrl: string | null; bannerPosition: string; bannerPositionX: string }
 export interface ReportBranding { logoUrl: string; companyName: string; tagline: string; primaryColor: string; accentColor: string; headerUrl: string | null; footerText: string }
 /* ⚠️ ولا فندقَ هنا. الفندقُ بيانُ موسمٍ يملكه صفُّ الموسم،
@@ -13,7 +22,7 @@ export interface ReportBranding { logoUrl: string; companyName: string; tagline:
 export interface CompanyPortal {
   welcomeMessage: string; helpMessage: string;
   supportPhone: string;
-  visibility: { flights: boolean; rooms: boolean; buses: boolean; financialBalance: boolean; qrCodes: boolean; documents: boolean; notifications: boolean; pdfDownloads: boolean; roommates: boolean; lostCard: boolean };
+  visibility: { flights: boolean; rooms: boolean; buses: boolean; financialBalance: boolean; qrCodes: boolean; documents: boolean; roommates: boolean; lostCard: boolean; arafatCountdown: boolean; photoVisibility: PhotoVisibility };
 }
 export type CompanyAssetKey =
   | "logo"
@@ -59,10 +68,10 @@ export interface CompanyProfile {
 /* ═══ بياناتُ الموسم الرئيسة ═══
    ما يملكه صفُّ الموسم نفسُه. تُقرأ من `useSeason()` — من
    `viewedSeason` في المطبوعات والأرشيف، ومن `activeSeason` في
-   التحرير. والسنةُ هويّةٌ لا تُعدَّل بهذا الباب. */
+   التحرير. والسنةُ هويّةٌ لا تُعدَّل بهذا الباب.
+   MOD-001: لا فندقَ هنا — الفنادقُ صفوفُ `hotels` تُدار من صفحتها. */
 export interface SeasonMasterData {
   name: string;
-  hotelName: string; hotelAddress: string; hotelUrl: string;
   minaAddress: string; minaUrl: string;
   arafaAddress: string; arafaUrl: string;
 }

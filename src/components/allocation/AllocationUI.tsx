@@ -309,7 +309,14 @@ export function PassengerPicker({
 // ووزنُها ليس وزنَها. هنا الشريط فقط — مضغوطاً كما كان، فالقائمة
 // هي المهمّة والاقتراح معونة.
 export type SuggestionTone = "kin" | "room" | "other";
-export type SuggestionItem = { id: number; name: string; reason: React.ReactNode; tone: SuggestionTone };
+export type SuggestionItem = {
+  id: number; name: string; reason: React.ReactNode; tone: SuggestionTone;
+  /* اختياريّان — صفحةٌ لا تمرّرهما ترى الشريطَ كما كان (أيقونة «＋»):
+     `status` حالُ المقترَح الآن (غير موزّع / في حاويةٍ أخرى)،
+     و`action` زرٌّ بنصٍّ صريح بدل الأيقونة («إضافة» أو «نقل»). */
+  status?: React.ReactNode;
+  action?: { label: string; ariaLabel: string };
+};
 
 const TONE_BG: Record<SuggestionTone, string> = {
   kin:   "color-mix(in srgb, var(--success) 12%, var(--paper))",
@@ -344,12 +351,13 @@ export function SuggestionStrip({ items, onAccept, onDismiss, blockedReason }: {
           <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 10px", borderRadius: 8, border: `1.5px solid ${TONE_LINE[s.tone]}`, background: TONE_BG[s.tone] }}>
             <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "baseline", gap: 5, flexWrap: "wrap" }}>
               <span style={{ fontSize: 11.5, fontWeight: 900, color: "var(--ink)" }}>{s.name}</span>
+              {s.status}
               <span style={{ fontSize: 9.5, fontWeight: 700, color: "var(--muted)" }}>· {s.reason}</span>
             </div>
             <button onClick={() => onAccept(s.id)} disabled={!!blockedReason}
-              title={blockedReason || "إضافة"} aria-label={`إضافة ${s.name}`}
-              style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: blockedReason ? "var(--line)" : "var(--success)", color: blockedReason ? "var(--muted)" : "var(--text-inverse)", display: "flex", alignItems: "center", justifyContent: "center", cursor: blockedReason ? "not-allowed" : "pointer", flexShrink: 0, opacity: blockedReason ? .6 : 1 }}>
-              <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+              title={blockedReason || s.action?.label || "إضافة"} aria-label={s.action?.ariaLabel ?? `إضافة ${s.name}`}
+              style={{ ...(s.action ? { minWidth: 46, padding: "0 10px", fontSize: 11, fontWeight: 800, fontFamily: "var(--font-body)" } : { width: 26 }), height: 26, borderRadius: 8, border: "none", background: blockedReason ? "var(--line)" : "var(--success)", color: blockedReason ? "var(--muted)" : "var(--text-inverse)", display: "flex", alignItems: "center", justifyContent: "center", cursor: blockedReason ? "not-allowed" : "pointer", flexShrink: 0, opacity: blockedReason ? .6 : 1 }}>
+              {s.action ? s.action.label : <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>}
             </button>
             <button onClick={() => onDismiss(s.id)} aria-label={`تجاهل اقتراح ${s.name}`}
               style={{ width: 22, height: 22, borderRadius: 6, border: "none", background: "var(--bg-input)", cursor: "pointer", color: "var(--muted)", fontSize: 11, flexShrink: 0 }}>✕</button>
@@ -371,9 +379,12 @@ export function SuggestionStrip({ items, onAccept, onDismiss, blockedReason }: {
 // والباص يسع خمسين — قائمةٌ بهذا الطول في عمودٍ بهذا الضيق، إلى
 // جانب منتقٍ، غيرُ قابلةٍ للاستعمال.
 export function AllocationDialog({
-  onClose, icon, title, badges, meta, actions, roster, picker, labelledBy = "alloc-dialog-title",
+  onClose, onEscape, icon, title, badges, meta, actions, roster, picker, labelledBy = "alloc-dialog-title",
 }: {
   onClose: () => void;
+  /* Escape يُعرض أوّلاً على الصفحة: إن ألغت به تعديلاً جارياً (true) بقي
+     المودال مفتوحاً — أيّاً كان موضع البؤرة داخله، لا داخل الحقل وحده */
+  onEscape?: () => boolean;
   icon: React.ReactNode;
   title: React.ReactNode;
   badges?: React.ReactNode;
@@ -385,13 +396,27 @@ export function AllocationDialog({
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
 
+  /* أحدثُ `onClose` في مرجع: كان المستمع يُعاد تسجيله والبؤرةُ تُسحب إلى
+     المودال كلّما تغيّرت هويّة `onClose` — أي مع كلّ رسمٍ في صفحةٍ تبنيها
+     من جديد — فيفقد حقلُ الكتابة بؤرته بعد أوّل حرف */
+  const onCloseRef = useRef(onClose);
+  const onEscapeRef = useRef(onEscape);
+  useEffect(() => { onCloseRef.current = onClose; onEscapeRef.current = onEscape; }, [onClose, onEscape]);
+
   useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      /* تعديلٌ أُلغي: تعود البؤرة إلى المودال (كان الحقل نفسه قد زال) فتغلقه
+         Escape التالية */
+      if (onEscapeRef.current?.()) { cardRef.current?.focus(); return; }
+      onCloseRef.current();
+    };
     document.addEventListener("keydown", h);
-    /* البؤرة تدخل المودال فلا تبقى خلف الحجاب */
-    cardRef.current?.focus();
     return () => document.removeEventListener("keydown", h);
-  }, [onClose]);
+  }, []);
+
+  /* البؤرة تدخل المودال مرّةً عند فتحه فلا تبقى خلف الحجاب — لا عند كلّ رسم */
+  useEffect(() => { cardRef.current?.focus(); }, []);
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.55)", zIndex: 500, display: "flex", alignItems: "center", justifyContent: "center", padding: 12 }}>

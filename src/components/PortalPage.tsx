@@ -8,6 +8,7 @@ import { createWriteHelpers } from "../utils/write";
 import { useSeason } from "../season/useSeason";
 import { companyService } from "../company/companyService";
 import { isSaved, saveErrorText } from "../company/saveResult";
+import { effectivePortalSettings, type PhotoVisibility, type PortalFlagKey, type PortalSettings } from "../company/portalSettings";
 
 /* ═══════════════════════════════════════════════════════════════
    صفحة "بوابة الحاج" الإدارية
@@ -70,6 +71,11 @@ function PortalPage({ currentUser }: { currentUser: User }) {
   const [audienceError, setAudienceError] = useState(false);
   const [enabledError, setEnabledError] = useState(false);
   const [reportFor, setReportFor] = useState<Announcement | null>(null);
+  /* M6 — تنبيهاتٌ بدأ تسليمُها ولم يكتمل (محاولةٌ مؤجَّلة أو استدعاءٌ انقطع) */
+  const [pendingPush, setPendingPush] = useState<Set<number>>(new Set());
+  /* M5 — تنبيهاتٌ ظاهرةٌ لم يبدأ تسليمُها قطّ (مجدوَلٌ قبل المُجدوِل، أو فاته) */
+  const [unsentPush, setUnsentPush] = useState<Set<number>>(new Set());
+  const [resuming, setResuming] = useState<number | null>(null);
   const [when, setWhen] = useState<"now" | "scheduled">("now");
   const [showAt, setShowAt] = useState(() => toLocalInput(new Date(Date.now() + 3600000)));
   const [duration, setDuration] = useState("24h");
@@ -95,6 +101,26 @@ function PortalPage({ currentUser }: { currentUser: User }) {
       setItems(data as Announcement[]);
       setNowMs(Date.now());
       setItemsError(false);
+      /* M6 — `push_sent_at` يُختم عند اكتمال التسليم لا عند بدئه. فالقائمُ بلا
+         ختم وله حجّاجٌ «قيد الإرسال» تسليمُه معلَّق، ويُستأنف من هنا. والعدُّ
+         لتنبيهاتٍ قائمةٍ قليلة، لا لكلّ القائمة. */
+      const now = Date.now();
+      const open = (data as Announcement[]).filter(a =>
+        !a.push_sent_at && new Date(a.show_at).getTime() <= now && (!a.expires_at || new Date(a.expires_at).getTime() > now));
+      const counts = await Promise.all(open.map(a =>
+        supabase.from("notification_deliveries").select("id", { count: "exact", head: true })
+          .eq("announcement_id", a.id).eq("status", "pending")
+          .then(({ count, error: e }) => (!e && (count ?? 0) > 0 ? a.id : null))));
+      setPendingPush(new Set(counts.filter((id): id is number => id !== null)));
+      /* M5 — بلا ختمٍ ولا سجلِّ تسليمٍ واحد: لم يُهيَّأ قطّ، فيُعرض «إرسال إلى الأجهزة».
+         والحالاتُ هي شرطُ التهيئة نفسه في push_prepare_announcement: سجلُّ `read` يكتبه
+         الحاجُّ حين يفتح التنبيه في البوابة، وليس دليلاً على دفعٍ إلى جهاز.
+         وفشلُ العدّ لا يُظهر الزرّ (لا يُعرض إرسالٌ لم يُتحقَّق أنه لم يقع). */
+      const never = await Promise.all(open.map(a =>
+        supabase.from("notification_deliveries").select("id", { count: "exact", head: true })
+          .eq("announcement_id", a.id).in("status", ["sent", "failed", "expired", "disabled", "pending"])
+          .then(({ count, error: e }) => (!e && count === 0 ? a.id : null))));
+      setUnsentPush(new Set(never.filter((id): id is number => id !== null)));
     }
     setItemsLoading(false);
   }, [activeSeason.id]);
@@ -182,58 +208,114 @@ function PortalPage({ currentUser }: { currentUser: User }) {
     if (!body.trim()) { showAlert("warning", "يرجى كتابة نص التنبيه."); return; }
     if (targetKind !== "all" && targetIds.length === 0) { showAlert("warning", "يرجى اختيار جهة واحدة على الأقل، أو تحديد جميع الحجاج."); return; }
     const show = when === "now" ? new Date() : new Date(showAt);
+    /* L3 — موعدٌ مجدوَلٌ ممسوحٌ أو فاسد لا يُرسَل، ولا يتحوّل نشراً فوريّاً من
+       تلقاء نفسه: `new Date("")` تاريخٌ غير صالح، و`toISOString` عليه ترمي بعد
+       أن صار الزرّ «جارٍ الإرسال…» فيبقى عالقاً بلا حفظ. فالفحصُ قبل كلّ شيء. */
+    if (Number.isNaN(show.getTime())) {
+      showAlert("warning", "يرجى اختيار تاريخ ووقت صحيحين لموعد الظهور، أو اختيار «الآن» للنشر الفوري.");
+      return;
+    }
     let expires: Date | null = null;
     const dur = DURATIONS.find(d => d.key === duration)!;
     if (dur.key === "custom") expires = new Date(expiresAt);
     else if (dur.ms > 0) expires = new Date(show.getTime() + dur.ms);
-    if (expires && expires <= show) { showAlert("warning", "وقت الانتهاء يجب أن يكون بعد وقت الظهور."); return; }
-    setSending(true);
-    const { data: created, error } = await supabase.from("announcements").insert({
-      title: title.trim() || null,
-      body: body.trim(), priority,
-      /* «الآن» تعني ساعة القاعدة لا ساعة المتصفّح.
-         العمود افتراضه `now()`، فإسقاطه يجعل الخادم يختم الوقت.
-         وإرسال ساعة الجهاز كان يضع `show_at` في المستقبل كلّما
-         تقدّمت ساعة الموظّف — فيصل الدفع إلى الحاجّ فوراً، وتُرشِّح
-         البوابة الإعلانَ بـ`show_at <= now()` فلا يجده في قائمته
-         حتى يمرّ الفارق. أمّا الموعد المجدوَل فيبقى كما اختاره
-         الموظّف: هو وقتٌ مقصود لا لحظة إرسال. */
-      ...(when === "now" ? {} : { show_at: show.toISOString() }),
-      expires_at: expires ? expires.toISOString() : null,
-      created_by: currentUser.name,
-      target_type: targetKind,
-      target_ids: targetKind === "all" ? [] : targetIds,
-    }).select("id").single();
-    if (error || !created) {
-      setSending(false);
-      showAlert("error", "تعذر إرسال التنبيه، يرجى المحاولة مرة أخرى.");
+    /* والوقتُ المحدَّد للانتهاء مثلُه: ممسوحاً كان يرمي الخطأَ نفسَه */
+    if (expires && Number.isNaN(expires.getTime())) {
+      showAlert("warning", "يرجى اختيار تاريخ ووقت صحيحين لانتهاء التنبيه.");
       return;
     }
-
-    /* التنبيه محفوظ الآن ولن يضيع، ودفعه إلى الأجهزة طبقة إضافية فوقه */
-    let pushNote = "";
-    if (when === "now") {
-      try {
-        const { data: res, error: fnErr } = await supabase.functions.invoke("send-pilgrim-push", {
-          body: { announcement_id: created.id },
-        });
-        if (fnErr || (res as { error?: unknown })?.error) {
-          pushNote = " تعذّر دفع التنبيه إلى الأجهزة، لكنه سيظهر للحجاج عند فتح البوابة.";
-        } else {
-          const r = res as { sent: number; disabled: number };
-          pushNote = ` وصل إلى ${r.sent} من الأجهزة المفعّلة.`;
-          if (r.disabled > 0) pushNote += ` و${r.disabled} من الحجاج غير مفعّلين، وسيرونه عند فتح البوابة.`;
-        }
-      } catch {
-        pushNote = " تعذّر دفع التنبيه إلى الأجهزة، لكنه سيظهر للحجاج عند فتح البوابة.";
+    if (expires && expires <= show) { showAlert("warning", "وقت الانتهاء يجب أن يكون بعد وقت الظهور."); return; }
+    setSending(true);
+    /* الزرّ لا يبقى «جارٍ الإرسال…» مهما حدث بعد هذا السطر */
+    try {
+      const { data: created, error } = await supabase.from("announcements").insert({
+        title: title.trim() || null,
+        body: body.trim(), priority,
+        /* «الآن» تعني ساعة القاعدة لا ساعة المتصفّح.
+           العمود افتراضه `now()`، فإسقاطه يجعل الخادم يختم الوقت.
+           وإرسال ساعة الجهاز كان يضع `show_at` في المستقبل كلّما
+           تقدّمت ساعة الموظّف — فيصل الدفع إلى الحاجّ فوراً، وتُرشِّح
+           البوابة الإعلانَ بـ`show_at <= now()` فلا يجده في قائمته
+           حتى يمرّ الفارق. أمّا الموعد المجدوَل فيبقى كما اختاره
+           الموظّف: هو وقتٌ مقصود لا لحظة إرسال. */
+        ...(when === "now" ? {} : { show_at: show.toISOString() }),
+        expires_at: expires ? expires.toISOString() : null,
+        created_by: currentUser.name,
+        target_type: targetKind,
+        target_ids: targetKind === "all" ? [] : targetIds,
+      }).select("id").single();
+      if (error || !created) {
+        setSending(false);
+        showAlert("error", "تعذر إرسال التنبيه، يرجى المحاولة مرة أخرى.");
+        return;
       }
-    }
 
-    setSending(false);
-    showAlert("success", (when === "now" ? "تم إرسال التنبيه." : "تمت جدولة التنبيه بنجاح.") + pushNote);
-    setTitle(""); setBody(""); setPriority("عام"); setWhen("now"); setDuration("24h");
-    setTargetKind("all"); setTargetIds([]);
-    load();
+      /* التنبيه محفوظ الآن ولن يضيع، ودفعه إلى الأجهزة طبقة إضافية فوقه */
+      const pushNote = when === "now" ? (await pushToDevices(created.id)).note : "";
+
+      setSending(false);
+      showAlert("success", (when === "now" ? "تم إرسال التنبيه." : "تمت جدولة التنبيه بنجاح.") + pushNote);
+      setTitle(""); setBody(""); setPriority("عام"); setWhen("now"); setDuration("24h");
+      setTargetKind("all"); setTargetIds([]);
+      load();
+    } catch (e) {
+      console.error("تعذر إرسال التنبيه", e);
+      showAlert("error", "تعذر إرسال التنبيه، يرجى المحاولة مرة أخرى.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  /* دفعُ تنبيهٍ إلى الأجهزة وملاحظتُه للموظّف. الدالةُ لا تعيد الإرسال إلى من
+     وصله، فاستدعاؤها ثانيةً يستأنف المعلَّق وحده (M6). */
+  async function pushToDevices(id: number): Promise<{ note: string; done: boolean }> {
+    const failed = { note: " تعذّر دفع التنبيه إلى الأجهزة، لكنه سيظهر للحجاج عند فتح البوابة.", done: false };
+    try {
+      const { data: res, error: fnErr } = await supabase.functions.invoke("send-pilgrim-push", {
+        body: { announcement_id: id },
+      });
+      if (fnErr || (res as { error?: unknown })?.error) return failed;
+      const r = res as { sent: number; disabled: number; pending?: number };
+      let note = ` وصل إلى ${r.sent} من الأجهزة المفعّلة.`;
+      if (r.disabled > 0) note += ` و${r.disabled} من الحجاج غير مفعّلين، وسيرونه عند فتح البوابة.`;
+      if ((r.pending ?? 0) > 0) note += ` ولم يكتمل الإرسال إلى ${r.pending} بعد؛ يمكن استكماله من قائمة التنبيهات.`;
+      return { note, done: (r.pending ?? 0) === 0 };
+    } catch {
+      return failed;
+    }
+  }
+
+  async function resumePush(a: Announcement) {
+    setResuming(a.id);
+    try {
+      /* لا يُعلَن الاكتمال إلا إن اكتمل: فشلُ الاستدعاء، أو أجهزةٌ ما زالت
+         محجوزةً لعاملٍ آخر أو تنتظر موعدها، يبقى تنبيهاً لا نجاحاً */
+      const { note, done } = await pushToDevices(a.id);
+      showAlert(done ? "success" : "warning", (done ? "تم استكمال إرسال التنبيه." : "لم يكتمل إرسال التنبيه بعد.") + note);
+    } finally {
+      setResuming(null);
+      load();
+    }
+  }
+
+  /* M5 — الإرسالُ اليدويّ لتنبيهٍ ظاهرٍ لم يُرسَل: الطريقُ نفسه (send-pilgrim-push
+     بصلاحية manage_portal)، والقاعدةُ تمنع تهيئةً ثانية، فالضغطُ مرّتين لا يُرسل مرّتين.
+     ⚠️ للتنبيه ذي العنوان وحده: send-pilgrim-push يضع لغير المعنوَن عنواناً ثابتاً لا اسمَ
+     الشركة المضبوط، فلا يُعرَض هنا طريقٌ يدفع إلى الحجّاج اسماً غيرَ اسمها. وغيرُ المعنوَن
+     يدفعه المُجدوِل (push-dispatch، باسم الشركة من company_config) إلى أن يُصلَح ذاك. */
+  const manualSendable = (a: Announcement) => !!a.title?.trim();
+  async function sendUnsent(a: Announcement) {
+    if (!manualSendable(a)) return;
+    const ok = await confirmAction("سيُدفع هذا التنبيه الآن إلى أجهزة الحجاج المستهدفين المفعّلة. هل أنت متأكد؟", { title: "إرسال إلى الأجهزة", confirmLabel: "إرسال" });
+    if (!ok) return;
+    setResuming(a.id);
+    try {
+      const { note, done } = await pushToDevices(a.id);
+      showAlert(done ? "success" : "warning", (done ? "تم إرسال التنبيه إلى الأجهزة." : "لم يكتمل إرسال التنبيه بعد.") + note);
+    } finally {
+      setResuming(null);
+      load();
+    }
   }
 
   async function endNow(a: Announcement) {
@@ -259,7 +341,7 @@ function PortalPage({ currentUser }: { currentUser: User }) {
   const [adminName, setAdminName] = useState("");
   const [adminPhone, setAdminPhone] = useState("");
   const [adminWa, setAdminWa] = useState("");
-  const [portalSettings, setPortalSettings] = useState<Record<string, boolean>>({});
+  const [portalSettings, setPortalSettings] = useState<PortalSettings>(() => effectivePortalSettings(null));
   const [welcomeMessage, setWelcomeMessage] = useState("");
   const [helpMessage, setHelpMessage] = useState("");
   const [savingCfg, setSavingCfg] = useState(false);
@@ -279,7 +361,7 @@ function PortalPage({ currentUser }: { currentUser: User }) {
         setAdminName(data.admin_name || "");
         setAdminPhone(data.admin_phone || "");
         setAdminWa(data.admin_whatsapp || "");
-        setPortalSettings((data.portal_settings as Record<string, boolean>) || {});
+        setPortalSettings(effectivePortalSettings(data.portal_settings));
         setWelcomeMessage(data.portal_welcome_message || "");
         setHelpMessage(data.portal_help_message || "");
       }
@@ -316,15 +398,23 @@ function PortalPage({ currentUser }: { currentUser: User }) {
 
   const portalUrl = `${window.location.origin}/hajj`;
 
-  const TOGGLES = [
+  /* M1 — الإعداداتُ الثمانية بترتيبها. التنبيهاتُ ليست إعداداً: تظهر للحاجّ
+     دائماً مستقلّةً عن تفعيل الدفع، والتنزيلُ يتبع «المستندات». */
+  const TOGGLES: ({ key: PortalFlagKey; label: string; desc: string } | { key: "photo_visibility"; label: string; desc: string })[] = [
     { key: "flights", label: "معلومات الرحلات", desc: "إظهار بيانات رحلة الذهاب والعودة" },
     { key: "rooms", label: "معلومات الغرفة", desc: "إظهار رقم الغرفة والدور والنوع" },
     { key: "buses", label: "معلومات الباص", desc: "إظهار بيانات باص الحاج" },
-    { key: "documents", label: "المستندات", desc: "عرض تصريح الحج وتذكرة الطيران" },
-    { key: "pdf_downloads", label: "تنزيل الملفات", desc: "إظهار زر تنزيل المستند المفتوح" },
-    { key: "notifications", label: "التنبيهات", desc: "إظهار تبويب التنبيهات وخيارات التفعيل" },
-    { key: "roommates", label: "رفقاء الغرفة", desc: "إظهار أسماء زملاء الغرفة" },
+    { key: "documents", label: "المستندات", desc: "عرض تصريح الحج وتذكرة الطيران وتنزيلهما" },
+    { key: "roommates", label: "رفقاء الغرفة", desc: "إظهار أسماء زملاء الغرفة في الفندق" },
     { key: "lost_card", label: "بطاقة أنا تائه", desc: "إظهار بطاقة تعريف الطوارئ" },
+    { key: "photo_visibility", label: "صورة الحاج", desc: "عند الإخفاء تظهر الأيقونة بدل الصورة" },
+    { key: "arafat_countdown", label: "عدّاد يوم عرفة", desc: "إظهار العدّ التنازلي للوقوف بعرفات" },
+  ];
+  const PHOTO_OPTIONS: { key: PhotoVisibility; label: string }[] = [
+    { key: "all", label: "الجميع" },
+    { key: "men", label: "الرجال فقط" },
+    { key: "women", label: "النساء فقط" },
+    { key: "none", label: "إخفاء الكل" },
   ];
 
   const annCard = (a: Announcement, kind: "live" | "scheduled" | "ended") => {
@@ -344,7 +434,11 @@ function PortalPage({ currentUser }: { currentUser: User }) {
         <div style={{ display: "flex", gap: 8, marginTop: 9 }}>
           {kind !== "ended" && kind === "live" && <button onClick={() => endNow(a)} style={{ ...btnS(), fontSize: 11, padding: "5px 14px" }}>إنهاء الآن</button>}
           {kind !== "ended" && <button onClick={() => removeItem(a)} style={{ ...btnS(), fontSize: 11, padding: "5px 14px", color: "var(--primary)" }}>حذف</button>}
-          {a.push_sent_at && <button onClick={() => setReportFor(a)} style={{ ...btnS(), fontSize: 11, padding: "5px 14px" }}>تقرير الوصول</button>}
+          {kind === "live" && !a.push_sent_at && unsentPush.has(a.id) && !pendingPush.has(a.id) && (manualSendable(a)
+            ? <button disabled={resuming !== null} onClick={() => sendUnsent(a)} style={{ ...btnS(), fontSize: 11, padding: "5px 14px" }}>{resuming === a.id ? "جارٍ الإرسال…" : "إرسال إلى الأجهزة"}</button>
+            : <span style={{ fontSize: 10.5, color: "var(--text-muted)", alignSelf: "center" }}>لم يُرسَل إلى الأجهزة — يُرسَل يدوياً التنبيهُ ذو العنوان وحده</span>)}
+          {kind === "live" && pendingPush.has(a.id) && <button disabled={resuming !== null} onClick={() => resumePush(a)} style={{ ...btnS(), fontSize: 11, padding: "5px 14px" }}>{resuming === a.id ? "جارٍ الاستكمال…" : "استكمال الإرسال"}</button>}
+          {(a.push_sent_at || pendingPush.has(a.id)) && <button onClick={() => setReportFor(a)} style={{ ...btnS(), fontSize: 11, padding: "5px 14px" }}>تقرير الوصول</button>}
         </div>
       </div>
     );
@@ -548,14 +642,34 @@ function PortalPage({ currentUser }: { currentUser: User }) {
             <div><div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", marginBottom: 5 }}>رسالة المساعدة</div><textarea value={helpMessage} onChange={e => setHelpMessage(e.target.value)} style={{ ...inp, width: "100%", boxSizing: "border-box", minHeight: 64 }} /></div>
           </div>
           {TOGGLES.map((t, i) => {
-            const on = portalSettings[t.key] !== false;
+            if (t.key === "photo_visibility") return (
+              <div key={t.key} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 2px", borderBottom: i < TOGGLES.length - 1 ? "1px dashed var(--border)" : "none", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 160 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text-main)" }}>{t.label}</div>
+                  <div style={{ fontSize: 10.5, color: "var(--text-muted)", marginTop: 2 }}>{t.desc}</div>
+                </div>
+                <div role="radiogroup" aria-label={t.label} style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {PHOTO_OPTIONS.map(o => {
+                    const sel = portalSettings.photo_visibility === o.key;
+                    return (
+                      <button key={o.key} role="radio" aria-checked={sel} onClick={() => setPortalSettings(f => ({ ...f, photo_visibility: o.key }))}
+                        style={{ border: sel ? "2px solid var(--primary)" : "1px solid var(--border)", background: sel ? "var(--primary)" : "var(--bg-card)", color: sel ? "var(--text-inverse)" : "var(--text-main)", borderRadius: 99, fontSize: 11.5, fontWeight: 800, padding: "5px 13px", cursor: "pointer", fontFamily: "inherit" }}>
+                        {o.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+            const key = t.key;
+            const on = portalSettings[key];
             return (
               <div key={t.key} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 2px", borderBottom: i < TOGGLES.length - 1 ? "1px dashed var(--border)" : "none" }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text-main)" }}>{t.label}</div>
                   <div style={{ fontSize: 10.5, color: "var(--text-muted)", marginTop: 2 }}>{t.desc}</div>
                 </div>
-                <div onClick={() => setPortalSettings(f => ({ ...f, [t.key]: !(f[t.key] !== false) }))}
+                <div role="switch" aria-checked={on} aria-label={t.label} onClick={() => setPortalSettings(f => ({ ...f, [key]: !f[key] }))}
                   style={{ width: 42, height: 23, borderRadius: 99, background: on ? "var(--primary)" : "var(--border)", position: "relative", cursor: "pointer", transition: "background .2s", flexShrink: 0 }}>
                   <div style={{ position: "absolute", top: 2.5, insetInlineStart: on ? 21 : 3, width: 18, height: 18, borderRadius: "50%", background: "#fff", transition: "inset-inline-start .2s", boxShadow: "0 1px 4px rgba(0,0,0,.2)" }} />
                 </div>

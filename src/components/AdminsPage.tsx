@@ -1,15 +1,23 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
+import { PrintOptionsMenu } from "./PrintOptionsMenu";
+import { usePrintSeals } from "../company/printSeals";
+import { initialPrintOptions, chromeFromOptions } from "../print";
 import { isHajj, mapPassenger, upsertPassenger, byOrder, reorderUpdates, applyReorder } from "../utils/passenger";
 import { supabase } from "../supabase";
 import type { TablesUpdate } from "../types/database";
-import type { Passenger, Bus, Camp, Room, Flight, User } from "../types";
+import type { Passenger, Bus, Camp, Room, Flight, User, Hotel } from "../types";
+import { roomLabel } from "../utils/hotels";
 import { useSeasonWrite } from "../season/useSeasonWrite";
 import { allocWriteError } from "./allocation/useAllocation";
 import { useSeason } from "../season/useSeason";
 import { Avatar } from "./Avatar";
 import { Modal } from "./Modal";
 import { AlertModal, useAlert, ConfirmModal, useConfirm } from "./AlertModal";
-import { inp, btnP, btnS, makeShort, scanDocument, DocumentScanError, uploadDoc, removeDoc, docKey, downloadFile, ROOM_TYPE_CAP, makeHTML, printInPage, useSignedDoc } from "../utils";
+import { inp, btnP, btnS, makeShort, scanDocument, uploadDoc, removeDoc, docKey, downloadFile, ROOM_TYPE_CAP, makeHTML, printInPage, useSignedDoc, storedDocAsFile, storedDocMime } from "../utils";
+import { useDocSlots, type DocSlotKey } from "./registration/useDocSlots";
+import { DocumentViewer } from "./registration/DocumentViewer";
+import { RegistrationShell } from "./registration/RegistrationShell";
+import { FieldSection, IdentityFields, ScanStatusBar } from "./registration/RegistrationFields";
 import { useReportBranding } from "../company/CompanyContext";
 
 // ============================================================
@@ -90,9 +98,14 @@ function AdminsPage({
   // بيانات التعيين
   const [buses, setBuses]     = useState<Bus[]>([]);
   const [rooms, setRooms]     = useState<Room[]>([]);
+  /* MOD-001 — رقمُ الغرفة قد يتكرّر بين فنادق الموسم: كلُّ تسميةٍ تحمل فندقها */
+  const [hotels, setHotels]   = useState<Hotel[]>([]);
   const [camps, setCamps]     = useState<Camp[]>([]);
   const [flights, setFlights] = useState<Flight[]>([]);
-  const [dataLoaded, setDataLoaded] = useState<number | null>(null);
+  /* الموسمُ المحمَّلُ بنجاح، والطلبُ الجاري — مرجعان لا حالة: يُقرآن
+     لحظةَ الحاجة، فلا يسبق ردٌّ قديمٌ أو فاشلٌ ردّاً ناجحاً. */
+  const loadedSeason = useRef<number | null>(null);
+  const inflight = useRef<{ season: number; req: ReturnType<typeof fetchAssignData> } | null>(null);
 
   // مودال الإضافة / التعديل
   const [showModal, setShowModal]   = useState(false);
@@ -100,14 +113,13 @@ function AdminsPage({
   const [form, setForm]             = useState({ ...DEFAULT_FORM });
   const [saving, setSaving]         = useState(false);
 
-  // مسح المستندات
-  const [scanning, setScanning]         = useState(false);
-  const [passportImg, setPassportImg]   = useState<string | null>(null);
-  const [passportFile, setPassportFile] = useState<File | null>(null);
-  const [idImg, setIdImg]               = useState<string | null>(null);
-  const [idFile, setIdFile]             = useState<File | null>(null);
-  const passportInputRef = useRef<HTMLInputElement>(null);
-  const idInputRef       = useRef<HTMLInputElement>(null);
+  /* ما فُتحت عليه النافذة — المقارنةُ به تقول إن كان فيها ما يضيع بإغلاقها */
+  const [initialForm, setInitialForm] = useState({ ...DEFAULT_FORM });
+
+  // مسح المستندات — لكلّ مستندٍ حالتُه وقراءتُه، ولا تملأ قراءةٌ متأخّرة نافذةً لاحقة
+  const docs = useDocSlots();
+  const [activeDoc, setActiveDoc] = useState<DocSlotKey>("passport");
+  const scanning = docs.scanning;
 
   // مودال التعيين
   const [assignTarget, setAssignTarget] = useState<Passenger | null>(null);
@@ -147,7 +159,11 @@ function AdminsPage({
   // ============================================================
   // طباعة الإداريين
   // ============================================================
-  const printAdmins = () => {
+  /* الختمُ والتوقيع — خياران وحدهما على هذا الكشف، وحواشيه كما هي */
+  const [printOpts, setPrintOpts] = useState(() => initialPrintOptions("lists"));
+  const { sealsFor, unavailable: sealsOff } = usePrintSeals(showAlert);
+  const printAdmins = async () => {
+    const seals = await sealsFor("lists", printOpts); if (!seals) return;
     const rows = admins.map((p, i) => {
       const type = p.passenger_type || "إداري";
       const bus    = buses.find(b => b.id === (p as any).bus_id);
@@ -165,7 +181,7 @@ function AdminsPage({
         <td style="text-align:center;padding:5pt;font-size:9pt">${flight ? (flight.airline+" — "+flight.name) : "—"}</td>
         <td style="text-align:center;padding:5pt;font-size:9pt">${campM ? campM.name : "—"}</td>
         <td style="text-align:center;padding:5pt;font-size:9pt">${campA ? campA.name : "—"}</td>
-        <td style="text-align:center;padding:5pt;font-size:9pt">${room ? (room.floor+"/"+(room as any).number) : "—"}</td>
+        <td style="text-align:center;padding:5pt;font-size:9pt">${room ? roomLabel(room, hotels) : "—"}</td>
       </tr>`;
     }).join("");
     const body = `<table style="width:100%;border-collapse:collapse">
@@ -183,7 +199,8 @@ function AdminsPage({
       </tr>
       ${rows}
     </table>`;
-    const html = makeHTML("كشف الإداريين", body, branding, { landscape: true });
+    const html = makeHTML("كشف الإداريين", body, branding,
+      { landscape: true, chrome: chromeFromOptions("lists", printOpts, { seals }) });
     printInPage(html);
   };
 
@@ -193,59 +210,65 @@ function AdminsPage({
   /* الذاكرة مربوطة بالموسم المعروض: كان `dataLoaded` علماً أبدياً،
      فمن بدّل الموسم بلا مغادرة الصفحة ظلّ يرى غرف الموسم السابق
      ويُسنِد إليها. */
-  const loadAssignData = async () => {
-    if (dataLoaded === viewedSeason.id) return;
-    const [{ data: b }, { data: r }, { data: c }, { data: f }] = await Promise.all([
-      supabase.from("buses").select("*").eq("season_id", viewedSeason.id).order("created_at"),
-      supabase.from("rooms").select("*").eq("season_id", viewedSeason.id).order("floor").order("number"),
-      supabase.from("camps").select("*").eq("season_id", viewedSeason.id).order("name"),
-      supabase.from("flights").select("*").eq("season_id", viewedSeason.id).order("date"),
-    ]);
-    if (b) setBuses(b as Bus[]);
-    if (r) setRooms(r as Room[]);
-    if (c) setCamps(c as Camp[]);
-    if (f) setFlights(f as Flight[]);
-    setDataLoaded(viewedSeason.id);
+  /* طلبٌ واحدٌ جارٍ لكلّ موسم: الصفحةُ ونافذةُ التعيين تتشاركانه */
+  const fetchShared = (seasonId: number) => {
+    if (inflight.current?.season === seasonId) return inflight.current.req;
+    const req = fetchAssignData(seasonId).finally(() => { if (inflight.current?.req === req) inflight.current = null; });
+    inflight.current = { season: seasonId, req };
+    return req;
   };
+  /* ما فشل طلبُه يُفرَّغ (لا تبقى بياناتُ موسمٍ سابق)، ولا يُعَدّ الموسمُ
+     محمَّلاً إلا إذا نجحت الطلباتُ الخمسة — فنافذةُ التعيين تعيد المحاولة.
+     وردٌّ فاشلٌ لا يمحو ما حُمِّل بنجاحٍ للموسم نفسه. */
+  const applyAssignData = (seasonId: number, [b, r, c, f, h]: Awaited<ReturnType<typeof fetchAssignData>>) => {
+    const failed = [b, r, c, f, h].filter(x => x.error || !x.data);
+    if (failed.length && loadedSeason.current === seasonId) return true;
+    setBuses((b.data ?? []) as Bus[]);
+    setRooms((r.data ?? []) as Room[]);
+    setCamps((c.data ?? []) as Camp[]);
+    setFlights((f.data ?? []) as Flight[]);
+    setHotels((h.data ?? []) as Hotel[]);
+    if (failed.length) { console.error("تعذّر تحميل بيانات التعيين", failed.map(x => x.error)); return false; }
+    loadedSeason.current = seasonId;
+    return true;
+  };
+  const loadAssignData = async () => {
+    const seasonId = viewedSeason.id;
+    if (loadedSeason.current === seasonId) return true;
+    return applyAssignData(seasonId, await fetchShared(seasonId));
+  };
+  /* وسومُ التعيين في القائمة والطباعةُ تقرأ الغرفَ والفنادق — فتُحمَّل
+     عند عرض الصفحة (ولكلّ موسمٍ يُعرض)، لا عند فتح نافذة التعيين وحدها. */
+  useEffect(() => {
+    let live = true;
+    const seasonId = viewedSeason.id;
+    fetchShared(seasonId).then(res => { if (live) applyAssignData(seasonId, res); });
+    return () => { live = false; };
+  }, [viewedSeason.id]);
 
   // ============================================================
   // مسح جواز
   // ============================================================
-  /* القراءة تستغرق ثوانٍ، وكانت الصورة تظهر فور اختيار الملف
-     والحقول فارغة — فيقرأ المستخدم المشهد على أنه «انتهى ولم يقرأ».
-     فصار المؤشّر على الصورة نفسها: ضبابٌ وطبقةٌ ودوّار، وهو نمط
-     صفحة الحجاج نفسه لا نمط موازٍ. والخطأ يُعلَن ولا يُبتلع. */
-  const handleScanPassport = async (file: File) => {
-    setScanning(true);
-    const reader = new FileReader();
-    reader.onload = async ev => {
-      setPassportImg(ev.target?.result as string);
-      setPassportFile(file);
-      try {
-        const parsed = await scanDocument(file, "passport");
-        setForm(prev => ({
-          ...prev,
-          name_en:    parsed.name_en    || prev.name_en,
-          short_en:   parsed.name_en    ? makeShort(parsed.name_en)  : prev.short_en,
-          name_ar:    parsed.name_ar    || prev.name_ar,
-          short_ar:   parsed.name_ar    ? makeShort(parsed.name_ar)  : prev.short_ar,
-          passport:   parsed.passport   || prev.passport,
-          national_id:parsed.national_id|| prev.national_id,
-          nat:        parsed.nationality|| prev.nat,
-          dob:        parsed.dob        || prev.dob,
-          expiry:     parsed.expiry     || prev.expiry,
-          gender:     parsed.gender     || prev.gender,
-        }));
-      } catch (e) {
-        console.error("تعذّرت قراءة جواز الإداري", e);
-        showAlert("error", e instanceof DocumentScanError ? e.message : "تعذّرت قراءة الجواز — أدخل البيانات يدوياً");
-      } finally {
-        setScanning(false);
-      }
-    };
-    /* فشل القراءة من القرص لا يترك المؤشّر دائراً */
-    reader.onerror = () => { setScanning(false); showAlert("error", "تعذّرت قراءة الملف"); };
-    reader.readAsDataURL(file);
+  /* القراءة تستغرق ثوانٍ: المعاينةُ تظهر فوراً ومعها مؤشّرُ القراءة في
+     العارض وفي رأس الحقول، والحفظُ معطَّلٌ حتى تنتهي. والخطأ يُعلَن في
+     النافذة نفسها ولا يمسّ ما أُدخل. */
+  const handleScanPassport = (file: File) => {
+    setActiveDoc("passport");
+    void docs.scan("passport", file, f => scanDocument(f, "passport"), parsed => {
+      setForm(prev => ({
+        ...prev,
+        name_en:    parsed.name_en    || prev.name_en,
+        short_en:   parsed.name_en    ? makeShort(parsed.name_en)  : prev.short_en,
+        name_ar:    parsed.name_ar    || prev.name_ar,
+        short_ar:   parsed.name_ar    ? makeShort(parsed.name_ar)  : prev.short_ar,
+        passport:   parsed.passport   || prev.passport,
+        national_id:parsed.national_id|| prev.national_id,
+        nat:        parsed.nationality|| prev.nat,
+        dob:        parsed.dob        || prev.dob,
+        expiry:     parsed.expiry     || prev.expiry,
+        gender:     parsed.gender     || prev.gender,
+      }));
+    }, "تعذّرت قراءة الجواز — أدخل البيانات يدوياً");
   };
 
   // ============================================================
@@ -261,39 +284,26 @@ function AdminsPage({
      بدل `id_expiry`، فتخرج الصلاحية فارغة دائماً.)
      أما استكمال بطاقة إداري قائم فمسار آخر لا يلمس بياناته
      الأساسية: مودال المستندات أدناه. */
-  const handleScanId = async (file: File) => {
-    setScanning(true);
-    const reader = new FileReader();
-    reader.onload = async ev => {
-      setIdImg(ev.target?.result as string);
-      setIdFile(file);
-      try {
-        const parsed = await scanDocument(file, "auto");
-        if (parsed.doc_type !== "idcard") {
-          showAlert("warning", "المستند لا يبدو بطاقة شخصية — راجع الملف أو استعمل زرّ مسح الجواز");
-          return;
-        }
-        setForm(prev => ({
-          ...prev,
-          name_ar:     parsed.name_ar     || prev.name_ar,
-          short_ar:    parsed.name_ar     ? makeShort(parsed.name_ar) : prev.short_ar,
-          name_en:     parsed.name_en     || prev.name_en,
-          short_en:    parsed.name_en     ? makeShort(parsed.name_en) : prev.short_en,
-          national_id: parsed.national_id || prev.national_id,
-          id_expiry:   parsed.id_expiry   || prev.id_expiry,
-          nat:         parsed.nationality || prev.nat,
-          dob:         parsed.dob         || prev.dob,
-          gender:      parsed.gender      || prev.gender,
-        }));
-      } catch (e) {
-        console.error("تعذّرت قراءة بطاقة الإداري", e);
-        showAlert("error", e instanceof DocumentScanError ? e.message : "تعذّرت قراءة البطاقة — أدخل البيانات يدوياً");
-      } finally {
-        setScanning(false);
+  const handleScanId = (file: File) => {
+    setActiveDoc("idcard");
+    void docs.scan("idcard", file, f => scanDocument(f, "auto"), parsed => {
+      if (parsed.doc_type !== "idcard") {
+        showAlert("warning", "المستند لا يبدو بطاقة شخصية — راجع الملف أو استعمل زرّ مسح الجواز");
+        return;
       }
-    };
-    reader.onerror = () => { setScanning(false); showAlert("error", "تعذّرت قراءة الملف"); };
-    reader.readAsDataURL(file);
+      setForm(prev => ({
+        ...prev,
+        name_ar:     parsed.name_ar     || prev.name_ar,
+        short_ar:    parsed.name_ar     ? makeShort(parsed.name_ar) : prev.short_ar,
+        name_en:     parsed.name_en     || prev.name_en,
+        short_en:    parsed.name_en     ? makeShort(parsed.name_en) : prev.short_en,
+        national_id: parsed.national_id || prev.national_id,
+        id_expiry:   parsed.id_expiry   || prev.id_expiry,
+        nat:         parsed.nationality || prev.nat,
+        dob:         parsed.dob         || prev.dob,
+        gender:      parsed.gender      || prev.gender,
+      }));
+    }, "تعذّرت قراءة البطاقة — أدخل البيانات يدوياً");
   };
 
   // ============================================================
@@ -301,9 +311,9 @@ function AdminsPage({
   // ============================================================
   const resetModal = () => {
     setForm({ ...DEFAULT_FORM });
-    setPassportImg(null); setPassportFile(null);
-    setIdImg(null); setIdFile(null);
-    setScanning(false);
+    setInitialForm({ ...DEFAULT_FORM });
+    docs.reset();
+    setActiveDoc("passport");
     setEditTarget(null);
   };
 
@@ -311,16 +321,23 @@ function AdminsPage({
   const openEdit = (p: Passenger) => {
     resetModal();
     setEditTarget(p);
-    setForm({
+    const values = {
       name_ar: p.name_ar || "", name_en: p.name_en || "",
       short_ar: p.short_ar || "", short_en: p.short_en || "",
       passport: p.passport || "", national_id: p.national_id || "",
       nat: p.nat || "قطري", dob: p.dob || "", expiry: p.expiry || "",
       id_expiry: p.id_expiry || "", gender: p.gender || "ذكر", phone: p.phone || "",
       passenger_type: (p.passenger_type as AdminType) || "مشرف",
-    });
+    };
+    setForm(values);
+    setInitialForm(values);
+    /* المستندان المحفوظان يُعرضان للمراجعة — ولا يُمسّان إلا باستبدالٍ
+       أو تدويرٍ يُحفظ صراحةً */
+    docs.reset({ passport: p.passport_url ?? null, idcard: p.national_id_url ?? null });
     setShowModal(true);
   };
+  const closeModal = () => { setShowModal(false); resetModal(); };
+  const modalDirty = docs.docsDirty || (Object.keys(form) as (keyof typeof form)[]).some(k => form[k] !== initialForm[k]);
 
   // ============================================================
   // حفظ الإداري
@@ -359,10 +376,25 @@ function AdminsPage({
     /* الجواز والبطاقة المرفوعان من مودال الإنشاء/التعديل يمرّان بنفس
        ضمانات مودال المستندات: حفظ مُتحقَّق منه، وتنظيف الكائن إن فشل
        الحفظ، وحذف القديم بعد نجاح الجديد لا قبله. */
+    /* والتدويرُ يمرّ من هنا نفسه: ملفٌّ جديد يُرفع مدوَّراً، ومستندٌ
+       محفوظٌ دُوِّر يُقرأ ويُرفع **كائناً جديداً** — الأصلُ لا يُعدَّل في
+       مكانه، ولا يُحذف إلا بعد نجاح حفظ مرجع البديل. */
+    const docSource = async (slot: typeof docs.slots.passport): Promise<File | null> => {
+      if (slot.file) return slot.file;
+      if (!slot.turns || !slot.stored || storedDocMime(slot.stored) === "application/pdf") return null;
+      try { return await storedDocAsFile(slot.stored); }
+      catch (e) {
+        console.error("تعذّر تجهيز المستند المحفوظ لتدويره", e);
+        showAlert("warning", "تعذّر حفظ تدوير المستند المحفوظ — بقي كما كان");
+        return null;
+      }
+    };
     const commitScannedDocs = async (id: number, prev: Passenger | null): Promise<Record<string, string>> => {
       const uploaded: Record<string, string> = {};
-      if (passportFile) { const k = await uploadDoc(passportFile, id, "passport_doc"); if (k) uploaded.passport_url = k; }
-      if (idFile)       { const k = await uploadDoc(idFile,       id, "idcard");       if (k) uploaded.national_id_url = k; }
+      const passportSrc = await docSource(docs.slots.passport);
+      const idSrc = await docSource(docs.slots.idcard);
+      if (passportSrc) { const k = await uploadDoc(passportSrc, id, "passport_doc", docs.slots.passport.turns); if (k) uploaded.passport_url = k; }
+      if (idSrc)       { const k = await uploadDoc(idSrc,       id, "idcard",       docs.slots.idcard.turns);   if (k) uploaded.national_id_url = k; }
       const keys = Object.keys(uploaded);
       if (!keys.length) return {};
       if (!await writeOk(
@@ -413,8 +445,7 @@ function AdminsPage({
         setPassengers(prev => upsertPassenger(prev, newP));
         showAlert("success", "تمت إضافة الإداري بنجاح");
       }
-      setShowModal(false);
-      resetModal();
+      closeModal();
     } catch {
       showAlert("error", "حدث خطأ أثناء الحفظ");
     } finally {
@@ -602,7 +633,10 @@ function AdminsPage({
     camps.filter(c => c.page_type === pageType && (!assignTarget || c.gender === assignTarget.gender));
 
   const openAssign = async (p: Passenger) => {
-    await loadAssignData();
+    /* نافذةُ التعيين تقرأ الغرفَ والفنادقَ من جديد عند كلّ فتح — غرفةٌ
+       أُضيفت أو حُذفت أو فندقٌ أُعيدت تسميتُه من شاشةٍ أخرى يظهر هنا */
+    loadedSeason.current = null;
+    if (!await loadAssignData()) { showAlert("error", "تعذّر تحميل بيانات التعيين — يرجى المحاولة مرة أخرى"); return; }
     setAssign({
       bus_id:           p.bus_id           ? String(p.bus_id)           : "",
       room_id:          p.room_id          ? String(p.room_id)          : "",
@@ -621,7 +655,7 @@ function AdminsPage({
   // مساعدات عرض التعيينات
   // ============================================================
   const busName    = (p: Passenger) => buses.find(b => b.id === p.bus_id)?.name || "—";
-  const roomName   = (p: Passenger) => { const r = rooms.find(r => r.id === p.room_id); return r ? `${r.number}${r.floor ? ` (ط${r.floor})` : ""}` : "—"; };
+  const roomName   = (p: Passenger) => { const r = rooms.find(r => r.id === p.room_id); return r ? roomLabel(r, hotels) : "—"; };
   const minaName   = (p: Passenger) => camps.find(c => c.id === p.camp_mina_id)?.name  || "—";
   const arafaName  = (p: Passenger) => camps.find(c => c.id === p.camp_arafa_id)?.name || "—";
   const flightName = (p: Passenger) => flights.find(f => f.id === p.flight_id)?.name   || "—";
@@ -643,6 +677,7 @@ function AdminsPage({
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           إضافة إداري
         </button>
+        {admins.length > 0 && <PrintOptionsMenu report="lists" value={printOpts} onChange={setPrintOpts} disabled={sealsOff} />}
         {admins.length > 0 && (
           <button onClick={printAdmins} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 99, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--em7)", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "var(--font-body)" }}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
@@ -717,116 +752,64 @@ function AdminsPage({
       {/* ============================================================ */}
       {/* مودال الإضافة / التعديل */}
       {/* ============================================================ */}
-      <Modal show={showModal} onClose={() => { if (!scanning) { setShowModal(false); resetModal(); } }} title={editTarget ? "تعديل بيانات الإداري" : "إضافة إداري"} maxWidth={(passportImg || idImg) ? 820 : 500}>
-        {/* المؤشّر على رأس المودال ومستقلّ عن الصورة عن قصد: كان
-            معلّقاً بظهور المعاينة، والمعاينة لا تظهر إلا بعد أن تنتهي
-            `FileReader` من قراءة الملف — ثوانٍ في صور الهاتف الكبيرة.
-            فكانت أطول لحظة انتظار هي بالضبط اللحظة التي لا مؤشّر
-            فيها. الآن يظهر مع أوّل نقرة ويبقى حتى نجاح أو خطأ. */}
-        {scanning && (
-          <div style={{ display: "flex", alignItems: "center", gap: 10, background: "var(--warning-bg)", border: "1px solid var(--warning)", borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
-            <div style={{ width: 20, height: 20, border: "2.5px solid var(--line)", borderTopColor: "var(--warning)", borderRadius: "50%", animation: "hajjSpin 0.8s linear infinite", flexShrink: 0 }} />
-            <div>
-              <div style={{ fontSize: 12.5, fontWeight: 700, color: "var(--warning)" }}>جارٍ قراءة المستند…</div>
-              <div style={{ fontSize: 10.5, color: "var(--text-muted)" }}>قد تستغرق القراءة بضع ثوانٍ — لا تغلق النافذة</div>
-            </div>
+      <RegistrationShell
+        show={showModal}
+        title={editTarget ? "تعديل بيانات الإداري" : "إضافة إداري"}
+        subtitle={editTarget ? "المستندات المحفوظة معروضة للمراجعة — الاستبدال والتدوير يُحفظان مع التعديل" : "ارفع الجواز أو البطاقة لقراءة البيانات تلقائياً، أو أدخلها يدوياً"}
+        dirty={modalDirty}
+        onDiscard={closeModal}
+        busy={saving}
+        status={(() => {
+          const s = docs.slots[activeDoc];
+          const other = docs.slots[activeDoc === "passport" ? "idcard" : "passport"];
+          const scanningLabel = docs.slots.passport.status === "scanning" ? "جارٍ قراءة الجواز…" : docs.slots.idcard.status === "scanning" ? "جارٍ قراءة البطاقة…" : null;
+          const failed = s.status === "failed" ? s : other.status === "failed" ? other : null;
+          const failedKey: DocSlotKey = failed === s ? activeDoc : (activeDoc === "passport" ? "idcard" : "passport");
+          return (scanningLabel || failed) ? (
+            <ScanStatusBar scanning={scanningLabel} error={failed?.error ?? null}
+              onRetry={failed?.file ? () => (failedKey === "passport" ? handleScanPassport : handleScanId)(failed.file!) : undefined} />
+          ) : null;
+        })()}
+        primary={{
+          label: saving ? "جاري الحفظ..." : scanning ? "جارٍ القراءة…" : (editTarget ? "حفظ التعديل" : "إضافة"),
+          onClick: saveAdmin,
+          disabled: saving || scanning,
+        }}
+        viewer={
+          <DocumentViewer active={activeDoc} onActiveChange={k => setActiveDoc(k as DocSlotKey)} docs={([
+            ["passport", "جواز السفر", "لا توجد صورة جواز", "رفع صورة الجواز", handleScanPassport],
+            ["idcard", "البطاقة", "لا توجد صورة بطاقة", "رفع صورة البطاقة", handleScanId],
+          ] as const).map(([key, label, emptyText, uploadLabel, scanFn]) => {
+            const slot = docs.slots[key];
+            return {
+              key, label, emptyText, uploadLabel,
+              file: slot.file, stored: slot.stored, version: slot.version, turns: slot.turns, status: slot.status,
+              onRotate: (d: 1 | -1) => docs.rotate(key, d),
+              /* الإنشاء: الملفّ يُقرأ كما كان. التعديل: استبدالٌ بلا قراءة —
+                 فلا تُكتب بيانات الإداري المحفوظة بما قرأه المستند. */
+              onReplace: editTarget ? (f: File) => docs.setFile(key, f) : scanFn,
+              accept: editTarget ? "image/*,application/pdf" : "image/*",
+            };
+          })} />
+        }
+      >
+        <IdentityFields form={form} onChange={(k, v) => setForm(prev => ({ ...prev, [k]: v }))} />
+        <FieldSection title="بيانات التسجيل">
+          <div style={{ fontSize: 10.5, color: "var(--text-muted)", marginBottom: 6 }}>نوع الإداري</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {ADMIN_TYPES.map(t => {
+              const [bg, clr] = TYPE_COLORS[t];
+              const sel = form.passenger_type === t;
+              return (
+                <button type="button" key={t} aria-pressed={sel} onClick={() => setForm(f => ({ ...f, passenger_type: t }))}
+                  style={{ flex: 1, padding: "7px", borderRadius: 8, border: `1.5px solid ${sel ? clr : "var(--border)"}`, background: sel ? bg : "transparent", cursor: "pointer", textAlign: "center", fontSize: 12, color: sel ? clr : "var(--text-muted)", fontWeight: sel ? 700 : 400, fontFamily: "inherit" }}>
+                  {t}
+                </button>
+              );
+            })}
           </div>
-        )}
-        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
-          {/* البيانات */}
-          <div style={{ flex: 1 }}>
-            {/* أزرار المسح */}
-            {!editTarget && (
-              <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-                <label style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px", borderRadius: 8, border: "1.5px dashed var(--border)", cursor: "pointer", fontSize: 12, color: "var(--text-muted)" }}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
-                  {scanning ? "جاري المسح..." : "مسح جواز السفر"}
-                  <input ref={passportInputRef} type="file" accept="image/*" style={{ display: "none" }} disabled={scanning} onChange={e => { const f = e.target.files?.[0]; if (f) handleScanPassport(f); e.target.value = ""; }} />
-                </label>
-                <label style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px", borderRadius: 8, border: "1.5px dashed var(--border)", cursor: "pointer", fontSize: 12, color: "var(--text-muted)" }}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
-                  {scanning ? "جاري المسح..." : "مسح البطاقة"}
-                  <input ref={idInputRef} type="file" accept="image/*" style={{ display: "none" }} disabled={scanning} onChange={e => { const f = e.target.files?.[0]; if (f) handleScanId(f); e.target.value = ""; }} />
-                </label>
-              </div>
-            )}
-
-            {/* نوع الإداري */}
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 6 }}>نوع الإداري</div>
-              <div style={{ display: "flex", gap: 8 }}>
-                {ADMIN_TYPES.map(t => {
-                  const [bg, clr] = TYPE_COLORS[t];
-                  const sel = form.passenger_type === t;
-                  return (
-                    <div key={t} onClick={() => setForm(f => ({ ...f, passenger_type: t }))}
-                      style={{ flex: 1, padding: "7px", borderRadius: 8, border: `1.5px solid ${sel ? clr : "var(--border)"}`, background: sel ? bg : "transparent", cursor: "pointer", textAlign: "center", fontSize: 12, color: sel ? clr : "var(--text-muted)", fontWeight: sel ? 700 : 400 }}>
-                      {t}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* الحقول */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
-              {([
-                ["الاسم بالعربي *", "name_ar"],
-                ["الاسم بالإنجليزي", "name_en"],
-                ["المختصر عربي", "short_ar"],
-                ["المختصر إنجليزي", "short_en"],
-                ["رقم الجواز", "passport"],
-                ["رقم البطاقة", "national_id"],
-                ["الجنسية", "nat"],
-                ["رقم الهاتف", "phone"],
-                ["تاريخ الميلاد", "dob"],
-                ["انتهاء الجواز", "expiry"],
-                ["انتهاء البطاقة", "id_expiry"],
-              ] as [string, string][]).map(([label, key]) => (
-                <div key={key}>
-                  <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>{label}</div>
-                  <input style={inp} value={(form as any)[key]} onChange={e => setForm(prev => ({ ...prev, [key]: e.target.value }))} />
-                </div>
-              ))}
-              <div>
-                <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>الجنس</div>
-                <select style={inp} value={form.gender} onChange={e => setForm(prev => ({ ...prev, gender: e.target.value }))}>
-                  <option value="ذكر">ذكر</option>
-                  <option value="أنثى">أنثى</option>
-                </select>
-              </div>
-            </div>
-
-            {/* أزرار الحفظ */}
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={saveAdmin} disabled={saving || scanning} style={{ ...btnP({ flex: 1, opacity: (saving || scanning) ? 0.6 : 1 }) }}>
-                {saving ? "جاري الحفظ..." : scanning ? "جارٍ القراءة…" : (editTarget ? "حفظ التعديل" : "إضافة")}
-              </button>
-              <button onClick={() => { setShowModal(false); resetModal(); }} style={btnS()}>إلغاء</button>
-            </div>
-          </div>
-
-          {/* صور المستندات */}
-          {(passportImg || idImg) && (
-            <div style={{ width: 300, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
-              {([["صورة الجواز", passportImg], ["صورة البطاقة", idImg]] as [string, string | null][]).map(([label, src]) => src && (
-                <div key={label}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--em7)", marginBottom: 6 }}>{label}</div>
-                  <div style={{ position: "relative", borderRadius: 8, overflow: "hidden" }}>
-                    <img src={src} alt={label} style={{ width: "100%", display: "block", border: "1px solid var(--border)", borderRadius: 8, filter: scanning ? "blur(2px)" : "none", transition: "filter 0.3s" }} />
-                    {scanning && (
-                      <div style={{ position: "absolute", inset: 0, background: "rgba(125,31,60,0.15)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                        <div style={{ width: 36, height: 36, border: "3px solid rgba(255,255,255,0.35)", borderTopColor: "var(--em7)", borderRadius: "50%", animation: "hajjSpin 0.8s linear infinite" }} />
-                        <span style={{ fontSize: 12, color: "var(--em7)", fontWeight: 600, background: "rgba(255,255,255,0.9)", padding: "4px 10px", borderRadius: 99 }}>جاري القراءة...</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </Modal>
+        </FieldSection>
+      </RegistrationShell>
 
       {/* ============================================================ */}
       {/* مودال التعيين */}
@@ -841,11 +824,16 @@ function AdminsPage({
               return { id: String(b.id), label: `${b.name} (${b.type}) — ${occ}/${cap}${occ >= cap ? " مكتمل" : ` · متبقٍّ ${cap - occ}`}` };
             })]} />
           <AssignSelect label="غرفة الفندق"  value={assign.room_id}          onChange={v => setAssign(a => ({ ...a, room_id: v }))}
-            options={[{ id: "", label: "— بدون —" }, ...rooms.map(r => {
-              const cap = ROOM_TYPE_CAP[r.type] || 0, occ = occupantsOf("room_id", r.id);
-              const state = cap === 0 ? "" : ` — ${occ}/${cap}${occ >= cap ? " مكتملة" : ` · متبقٍّ ${cap - occ}`}`;
-              return { id: String(r.id), label: `${r.number} — ${r.type}${r.floor ? ` (ط${r.floor})` : ""}${state}` };
-            })]} />
+            /* مجموعةٌ لكلّ فندق، والفندقُ في نصّ الخيار نفسِه أيضاً — فلا
+               تلتبس «101» في فندقٍ بـ«101» في آخر حتى في القائمة المغلقة */
+            options={[{ id: "", label: "— بدون —" }, ...[...rooms]
+              .sort((a, b) => (hotels.findIndex(x => x.id === a.hotel_id) - hotels.findIndex(x => x.id === b.hotel_id)) || 0)
+              .map(r => {
+                const cap = ROOM_TYPE_CAP[r.type] || 0, occ = occupantsOf("room_id", r.id);
+                const state = cap === 0 ? "" : ` — ${occ}/${cap}${occ >= cap ? " مكتملة" : ` · متبقٍّ ${cap - occ}`}`;
+                return { id: String(r.id), label: `${roomLabel(r, hotels)} — ${r.type}${state}`,
+                  group: hotels.find(x => x.id === r.hotel_id)?.name ?? "بلا فندق" };
+              })]} />
           {/* المخيّمات مفصولة بالجنس في صفحة المخيّمات، وكانت هنا
               مفتوحة للجميع — «خاص» وحده يقبل الجنسين */}
           <AssignSelect label="مخيم منى"     value={assign.camp_mina_id}     onChange={v => setAssign(a => ({ ...a, camp_mina_id: v }))}
@@ -991,12 +979,30 @@ function AssignTag({ label, val, color }: { label: string; val: string; color: s
   );
 }
 
-function AssignSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (v: string) => void; options: { id: string; label: string }[] }) {
+/* بياناتُ التعيين لموسمٍ واحد — مصدرٌ واحدٌ لنافذة التعيين ولعرض الصفحة */
+function fetchAssignData(seasonId: number) {
+  return Promise.all([
+    supabase.from("buses").select("*").eq("season_id", seasonId).order("created_at"),
+    supabase.from("rooms").select("*").eq("season_id", seasonId).order("floor").order("number"),
+    supabase.from("camps").select("*").eq("season_id", seasonId).order("name"),
+    supabase.from("flights").select("*").eq("season_id", seasonId).order("date"),
+    supabase.from("hotels").select("*").eq("season_id", seasonId).order("id"),
+  ]);
+}
+
+function AssignSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (v: string) => void; options: { id: string; label: string; group?: string }[] }) {
+  /* `group` اختياريّ: الخياراتُ المجمَّعة تُعرض في optgroup بترتيب ظهورها */
+  const groups = [...new Set(options.filter(o => o.group).map(o => o.group as string))];
   return (
     <div>
       <label style={{ fontSize: 11, color: "var(--text-muted)", display: "block", marginBottom: 4 }}>{label}</label>
-      <select style={inp} value={value} onChange={e => onChange(e.target.value)}>
-        {options.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+      <select style={inp} value={value} onChange={e => onChange(e.target.value)} aria-label={label}>
+        {options.filter(o => !o.group).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+        {groups.map(g => (
+          <optgroup key={g} label={g}>
+            {options.filter(o => o.group === g).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </optgroup>
+        ))}
       </select>
     </div>
   );

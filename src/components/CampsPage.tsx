@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { isHajj, byOrder } from "../utils/passenger";
 import type { Dispatch, SetStateAction } from "react";
 import { supabase } from "../supabase";
@@ -9,7 +9,8 @@ import { StatsRow, type StatCardData } from "./StatCard";
 import { useReportBranding } from "../company/CompanyContext";
 import { inp, btnP, btnS, printInPage } from "../utils";
 import { campDwellers, campReportDocument, campsReportDocument,
-         initialPrintOptions, chromeFromOptions } from "../print";
+         initialPrintOptions, chromeFromOptions, type PrintSeals } from "../print";
+import { usePrintSeals } from "../company/printSeals";
 import { PrintOptionsMenu } from "./PrintOptionsMenu";
 import { useSeasonWrite } from "../season/useSeasonWrite";
 import { useSeason } from "../season/useSeason";
@@ -21,6 +22,7 @@ import {
 import {
   allocWriteError, matchesPassenger, useAllocationDrag, useAllocationWrites, useContainerReorder, useContainerSelection,
 } from "./allocation/useAllocation";
+import { deleteContainer, deleteFeedback, useInFlight } from "./allocation/containerWrites";
 
 /* مفاتيح الأعمدة والخدمة — حرفيّة لا string عام، فالفهرسة بها آمنة
    نوعياً. ومنى وعرفة يفترقان هنا وحدهما: عمودُ إسنادٍ وعمودُ ترتيبٍ
@@ -38,6 +40,15 @@ const ArafaIcon = () => (
     <path d="m8 3 4 8 5-5 5 15H2L8 3z" />
   </svg>
 );
+
+/* السعة عددٌ صحيحٌ موجب كما كُتب بالضبط — `parseInt` كان يقبل «12.5» على أنها
+   12 و«1e2» على أنها 1 بصمت. */
+const parseCapacity = (raw: string): number | null => {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
+};
 
 const paxLabel = (n: number) => n === 1 ? "نازل واحد" : n === 2 ? "نازلان" : n <= 10 ? `${n} نازلين` : `${n} نازلاً`;
 const placesLabel = (n: number) => n === 1 ? "مكان واحد متبقٍ" : n === 2 ? "مكانان متبقيان" : n <= 10 ? `${n} أماكن متبقية` : `${n} مكاناً متبقياً`;
@@ -103,6 +114,12 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
 
   const sel = useContainerSelection();
   const selectedCamp = camps.find(c => c.id === sel.selectedId) || null;
+  /* محرّرا الاسم والسعة يخصّان المخيّمَ المفتوح وحده: يُصفَّران عند كل فتحٍ
+     وإغلاق، فلا تُحفظ مسوّدةُ مخيّمٍ على مخيّمٍ آخر. والإغلاقُ مستقرٌّ عمداً:
+     المودال يعيد تركيزه على نفسه كلّما تغيّر `onClose`. */
+  const openCamp = (id: number) => { setEditingName(false); setEditingCap(false); sel.open(id); };
+  const { close: selClose } = sel;
+  const closeCamp = useCallback(() => { setEditingName(false); setEditingCap(false); selClose(); }, [selClose]);
 
   useEffect(() => {
     setCampsLoading(true);
@@ -141,25 +158,56 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
   const inGroup = (gender: "ذكر" | "أنثى") => camps.filter(c => c.gender === gender).sort(byContainerOrder);
 
   /* إعادة الترقيم بفجوة عشرة — نفس عُرف `reorderUpdates` للنازلين،
-     وفي القاعدة نفسها في التعبئة الرجعيّة. */
+     وفي القاعدة نفسها في التعبئة الرجعيّة.
+     والعرضُ تفاؤليّ (البطاقات تستقرّ فوراً)، أمّا الكتابة فطابور: كلُّ ترتيبٍ
+     ينتظر سابقه، فلا يصل طلبٌ قديمٌ بعد أحدث فيسحقه. وبرهانُ كلّ صفٍّ عودتُه
+     من القاعدة؛ وما لم يثبت يُقرأ من القاعدة ويُقارَن بالمقصود — لا تُستعاد
+     لقطةٌ قديمة: صفوفٌ نجحت تبقى، والمرفوضُ يعود إلى قيمته الفعليّة، إلا
+     بطاقةً رتّبها ترتيبٌ أحدث فذاك يحكمها. */
+  const orderQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const orderGeneration = useRef(0);
+  const cardGeneration = useRef(new Map<number, number>());
+
   const saveContainerOrder = async (gender: string, ordered: Camp[]) => {
     if (!assertWritable()) return;
     /* الحدّ الأخير على النطاق: لا يُكتب إلا لمن هم فعلاً في مجموعة
        الجنس المسحوب فيها — فبطاقةٌ من مجموعةٍ أخرى لا تُرقَّم هنا. */
     if (ordered.some(c => c.gender !== gender)) { console.error("محاولة ترتيب عبر مجموعتَي الجنس — أُلغيت"); return; }
-    const before = camps;
-    const pos = new Map(ordered.map((c, i) => [c.id, (i + 1) * 10]));
-    /* تفاؤليّ مع تراجعٍ آمن: البطاقات تستقرّ فوراً، وإن رفضت
-       القاعدة عادت الحالة كما كانت بدل أن تبقى كذبةً على الشاشة. */
-    setCamps(prev => prev.map(c => pos.has(c.id) ? { ...c, sort_order: pos.get(c.id)! } : c));
-    const results = await Promise.all(
-      ordered.map((c, i) => supabase.from("camps").update({ sort_order: (i + 1) * 10 }).eq("id", c.id)));
-    const failed = results.filter(r => r.error);
-    if (failed.length) {
-      console.error("تعذر حفظ ترتيب المخيمات", failed.map(f => f.error));
-      setCamps(before);
-      showAlert("error", allocWriteError("تعذر حفظ ترتيب المخيمات", failed[0].error?.message));
-    }
+    const gen = ++orderGeneration.current;
+    for (const c of ordered) cardGeneration.current.set(c.id, gen);
+    const isLatest = (id: number) => cardGeneration.current.get(id) === gen;
+    const intended = new Map(ordered.map((c, i) => [c.id, (i + 1) * 10]));
+    setCamps(prev => prev.map(c => intended.has(c.id) ? { ...c, sort_order: intended.get(c.id)! } : c));
+
+    const run = orderQueue.current.then(async () => {
+      const results = await Promise.all(
+        ordered.map((c, i) => supabase.from("camps").update({ sort_order: (i + 1) * 10 }).eq("id", c.id).select("id")));
+      const failedIds = ordered
+        .filter((c, i) => { const r = results[i]; return !!r.error || !r.data || r.data.length !== 1 || r.data[0].id !== c.id; })
+        .map(c => c.id);
+      if (!failedIds.length) return;
+      const firstError = results.find(r => r.error)?.error?.message;
+      const { data: actual, error } = await supabase.from("camps").select("id, sort_order").in("id", failedIds);
+      if (error || !actual) {
+        console.error("تعذر حفظ ترتيب المخيمات", { failedIds, firstError, readError: error });
+        if (failedIds.some(isLatest)) showAlert("error", "تعذر حفظ ترتيب المخيمات — حدّث الصفحة لعرض الترتيب المحفوظ فعلاً");
+        return;
+      }
+      const stored = new Map(actual.map(r => [r.id, r.sort_order]));
+      /* ما بلغ قيمته المقصودة حُفظ وإن ضاع ردُّه؛ وما غاب عن القراءة حُذف من مكانٍ آخر */
+      const wrong = failedIds.filter(id => stored.get(id) !== intended.get(id));
+      const revert = wrong.filter(id => isLatest(id) && stored.has(id));
+      if (revert.length) {
+        const ids = new Set(revert);
+        setCamps(prev => prev.map(c => ids.has(c.id) ? { ...c, sort_order: stored.get(c.id) ?? null } : c));
+      }
+      if (wrong.length) {
+        console.error("تعذر حفظ ترتيب المخيمات", { wrong, firstError });
+        if (wrong.some(isLatest)) showAlert("error", allocWriteError("تعذر حفظ ترتيب المخيمات", firstError));
+      }
+    });
+    orderQueue.current = run.catch(() => undefined);
+    await run;
   };
 
   const cardDrag = useContainerReorder<Camp>({ onReorder: saveContainerOrder });
@@ -217,7 +265,9 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
     const blocked = hardBlock(camp, [p]);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmMismatch(camp, [p])) return;
-    await writes.assign(pId, camp.id, "تعذر إضافة المسافر إلى المخيم");
+    /* «إضافة» لغير الموزَّع وحده — إن وزّعه غيرُك في الأثناء لا يُنقل صامتاً */
+    const r = await writes.move(pId, null, camp.id, "تعذر إضافة المسافر إلى المخيم");
+    if (r === "stale") showAlert("warning", `«${p.short_ar || p.name_ar}» وُزّع على مخيّمٍ آخر من مكانٍ آخر — لم يُضَف، وحُدِّثت البيانات.`);
   };
 
   const addPicked = async (camp: Camp) => {
@@ -226,7 +276,7 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
     const blocked = hardBlock(camp, chosen);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmMismatch(camp, chosen)) return;
-    const done = await writes.assignMany(chosen.map(p => p.id), camp.id, "تعذر إضافة بعض النازلين إلى المخيم");
+    const done = await writes.assignMany(chosen.map(p => p.id), camp.id, "تعذر إضافة بعض النازلين إلى المخيم", null);
     if (done === chosen.length) sel.setPicked(new Set());
     else sel.setPicked(new Set(chosen.slice(done).map(p => p.id)));
   };
@@ -240,7 +290,41 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
     const blocked = hardBlock(target, [p]);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmMismatch(target, [p])) return;
-    await writes.assign(p.id, target.id, "تعذر نقل المسافر إلى المخيم الآخر");
+    const r = await writes.move(p.id, p[campIdKey] ?? null, target.id, "تعذر نقل المسافر إلى المخيم الآخر");
+    if (r === "stale") staleMove(p);
+  };
+
+  /* النقل طلبٌ واحدٌ مشروطٌ بالمخيّم الحاليّ — لا إخراجَ ثم إسناد، ولا كتابةَ
+     فوق نقلٍ أجراه غيرُك في الأثناء */
+  function staleMove(p: Passenger) {
+    showAlert("warning", `«${p.short_ar || p.name_ar}» لم يعد في المخيّم المعروض — غيّر توزيعَه غيرُك في الأثناء. لم يُنقل، وحُدِّثت البيانات.`);
+  }
+
+  /* الإخراج مشروطٌ بالمخيّم المعروض كذلك — لا يُخرَج من مخيّمٍ نُقل إليه في الأثناء */
+  const removeP = async (p: Passenger, camp: Camp) => {
+    const r = await writes.unassign(p.id, camp.id, "تعذر إزالة المسافر من المخيم");
+    if (r === "stale") showAlert("warning", `«${p.short_ar || p.name_ar}» لم يعد في المخيّم المعروض — غيّر توزيعَه غيرُك في الأثناء. لم يُزَل، وحُدِّثت البيانات.`);
+  };
+
+  /* قبولُ اقتراحٍ في منى: غير الموزَّع يُضاف، والموزَّعُ على مخيّمٍ آخر يُنقل بعد
+     تأكيدٍ صريحٍ يسمّي النازل والمخيّمين — ثم تأكيدُ عادي/خاص كما هو، منفصلاً. */
+  const acceptSuggestion = async (camp: Camp, pId: number) => {
+    const p = passengers.find(x => x.id === pId);
+    if (!p) return;
+    const fromId = p[campIdKey];
+    if (fromId == null) { await addOne(camp, pId); return; }
+    if (fromId === camp.id) return;
+    const from = camps.find(c => c.id === fromId);
+    const blocked = hardBlock(camp, [p]);
+    if (blocked) { showAlert("warning", blocked); return; }
+    const name = p.short_ar || p.name_ar;
+    if (!await confirmAction(
+      `نقل «${name}» من مخيم «${from?.name ?? "آخر"}» إلى مخيم «${camp.name}»؟`,
+      { title: "تأكيد النقل", confirmLabel: "نقل", cancelLabel: "إلغاء" },
+    )) return;
+    if (!await confirmMismatch(camp, [p])) return;
+    const r = await writes.move(p.id, fromId, camp.id, "تعذر نقل المسافر إلى المخيم");
+    if (r === "stale") staleMove(p);
   };
 
   const drag = useAllocationDrag({
@@ -251,17 +335,20 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
   // ══════════════════════════════════════════════════════════
   // الحاوية — إنشاء وتعديل وحذف
   // ══════════════════════════════════════════════════════════
-  const addCamp = async () => {
+  /* طلبٌ جارٍ واحدٌ لكلّ عمليّة — النقرة المكرّرة لا تُرسَل */
+  const inFlight = useInFlight();
+
+  const addCamp = () => inFlight("add", async () => {
     if (!assertWritable()) return;
     const name = campName.trim();
-    const cap = parseInt(campCapacity, 10);
+    const cap = parseCapacity(campCapacity);
     if (!name) { setFormError("يرجى إدخال اسم المخيم"); return; }
     /* الجنس جزءٌ من هويّة المخيّم: «منى ٢ رجال» و«منى ٢ نساء»
        مخيّمان مختلفان — وهو حدّ التميُّز في القاعدة كذلك. */
     if (camps.some(c => c.name.trim() === name && c.gender === campGender)) {
       setFormError(`يوجد مخيم ${campGender === "ذكر" ? "رجال" : "نساء"} بالاسم "${name}" بالفعل`); return;
     }
-    if (!Number.isFinite(cap) || cap < 1) { setFormError("السعة مطلوبة، ويجب أن تكون عدداً أكبر من صفر"); return; }
+    if (cap === null) { setFormError("السعة مطلوبة، ويجب أن تكون عدداً صحيحاً أكبر من صفر"); return; }
     setFormError("");
     const { data, error } = await supabase.from("camps")
       .insert([{ name, gender: campGender, type: campType, page_type: pageType, capacity: cap }]).select();
@@ -274,41 +361,51 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
       setCamps(prev => [...prev, data[0] as Camp]);
       setCampName(""); setCampGender("ذكر"); setCampType("عادي"); setCampCapacity(""); setShowAdd(false);
     }
-  };
+  });
 
-  const deleteCamp = async (camp: Camp) => {
+  /* الحذف ببرهان: لا يُزال المخيّم من الشاشة إلا إن حُذف فعلاً أو تبيّن أنه
+     لم يعد موجوداً */
+  const deleteCamp = (camp: Camp) => inFlight(`delete:${camp.id}`, async () => {
     if (!assertWritable()) return;
     if (dwellers(camp.id).length > 0) { showAlert("warning", `المخيّم «${camp.name}» يضمّ ${paxLabel(dwellers(camp.id).length)} — أخرِجهم قبل حذفه.`); return; }
-    const { error } = await supabase.from("camps").delete().eq("id", camp.id);
-    if (error) { console.error("فشل حذف المخيم", error); showAlert("error", allocWriteError("فشل حذف المخيم، يرجى المحاولة مرة أخرى", error.message)); return; }
-    setCamps(prev => prev.filter(c => c.id !== camp.id));
-    sel.close();
-  };
+    const r = await deleteContainer("camps", camp.id);
+    if (r.kind === "ok") { setCamps(prev => prev.filter(c => c.id !== camp.id)); closeCamp(); return; }
+    console.error("فشل حذف المخيم", r);
+    const fb = deleteFeedback(r, `المخيّم «${camp.name}»`, "فشل حذف المخيم", allocWriteError);
+    if (fb.apply?.kind === "remove") { setCamps(prev => prev.filter(c => c.id !== camp.id)); closeCamp(); }
+    showAlert(fb.type, fb.message);
+  });
 
-  const renameCamp = async (camp: Camp, name: string) => {
+  /* تحديثٌ لم يمسّ صفّ المخيّم: حُذف من مكانٍ آخر أو حجبته الصلاحية — لا نجاح */
+  const campGone = (camp: Camp, what: string) =>
+    `${what}: لم يتغيّر شيء — قد يكون المخيّم «${camp.name}» حُذف من مكانٍ آخر أو لا تملك صلاحية تعديله. حدّث الصفحة.`;
+
+  const renameCamp = (camp: Camp, name: string) => inFlight(`rename:${camp.id}`, async () => {
     if (!assertWritable()) return;
     const next = name.trim();
     if (!next || next === camp.name) { setEditingName(false); return; }
     if (camps.some(c => c.id !== camp.id && c.name.trim() === next && c.gender === camp.gender)) {
       showAlert("warning", `يوجد مخيم ${camp.gender === "ذكر" ? "رجال" : "نساء"} بالاسم "${next}" بالفعل`); return;
     }
-    const { error } = await supabase.from("camps").update({ name: next }).eq("id", camp.id);
+    const { data, error } = await supabase.from("camps").update({ name: next }).eq("id", camp.id).select("id");
     if (error) { console.error("تعذر تعديل اسم المخيم", error); showAlert("error", allocWriteError("تعذر تعديل اسم المخيم", error.message)); return; }
+    if (!data || data.length !== 1) { showAlert("error", campGone(camp, "تعذر تعديل اسم المخيم")); return; }
     setCamps(prev => prev.map(c => c.id === camp.id ? { ...c, name: next } : c));
     setEditingName(false);
-  };
+  });
 
-  const saveCapacity = async (camp: Camp) => {
+  const saveCapacity = (camp: Camp) => inFlight(`capacity:${camp.id}`, async () => {
     if (!assertWritable()) return;
-    const cap = parseInt(capDraft, 10);
+    const cap = parseCapacity(capDraft);
     const occ = dwellers(camp.id).length;
-    if (!Number.isFinite(cap) || cap < 1) { showAlert("warning", "السعة يجب أن تكون عدداً أكبر من صفر"); return; }
+    if (cap === null) { showAlert("warning", "السعة يجب أن تكون عدداً صحيحاً أكبر من صفر"); return; }
     if (cap < occ) { showAlert("warning", `المخيّم «${camp.name}» يضمّ ${paxLabel(occ)}، فلا تُخفَّض سعته إلى ${cap}. أخرِج النازلين أولاً.`); return; }
-    const { error } = await supabase.from("camps").update({ capacity: cap }).eq("id", camp.id);
+    const { data, error } = await supabase.from("camps").update({ capacity: cap }).eq("id", camp.id).select("id");
     if (error) { console.error("تعذر تعديل سعة المخيم", error); showAlert("error", allocWriteError("تعذر تعديل سعة المخيم", error.message)); return; }
+    if (!data || data.length !== 1) { showAlert("error", campGone(camp, "تعذر تعديل سعة المخيم")); return; }
     setCamps(prev => prev.map(c => c.id === camp.id ? { ...c, capacity: cap } : c));
     setEditingCap(false);
-  };
+  });
 
   // ══════════════════════════════════════════════════════════
   // الاقتراحات الذكيّة — منى وحدها
@@ -347,11 +444,23 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
           s.kin ? x.family_id === p.family_id : s.room ? x.room_id === p.room_id : x.bus_id === p.bus_id);
         const name = withWhom?.short_ar || withWhom?.name_ar?.split(" ").slice(0, 2).join(" ") || "";
         const why = [s.kin && "صلة قرابة", s.room && "نفس الغرفة", s.bus && "نفس الباص"].filter(Boolean).join(" · ");
+        const short = p.short_ar || p.name_ar;
+        const moving = p[campIdKey] != null;
+        const current = moving ? camps.find(c => c.id === p[campIdKey]) : null;
         return {
           id: p.id,
-          name: p.short_ar || p.name_ar,
+          name: short,
           tone: (s.kin ? "kin" : s.room ? "room" : "other") as SuggestionItem["tone"],
           reason: <>{why}{name ? <span style={{ color: "var(--primary)", fontWeight: 800 }}> مع {name}</span> : null}</>,
+          status: (
+            <span style={{ fontSize: 9, fontWeight: 800, padding: "1px 7px", borderRadius: 99, flexShrink: 0, whiteSpace: "nowrap",
+              background: moving ? "var(--info-bg)" : "var(--warning-bg)", color: moving ? "var(--info)" : "var(--warning)" }}>
+              {moving ? `في مخيم ${current?.name ?? "آخر"}` : "غير موزع"}
+            </span>
+          ),
+          action: moving
+            ? { label: "نقل", ariaLabel: `نقل ${short} من مخيم ${current?.name ?? "آخر"} إلى مخيم ${camp.name}` }
+            : { label: "إضافة", ariaLabel: `إضافة ${short} إلى مخيم ${camp.name}` },
         };
       });
   };
@@ -428,9 +537,16 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
   /* منى وعرفةُ يشتركان في المواصفة نفسها — والحالُ لكلّ صفحةٍ على حدة */
   const optKey = pageType === "منى" ? "mina" as const : "arafa" as const;
   const [printOpts, setPrintOpts] = useState(() => initialPrintOptions(optKey));
-  const campChrome = () => chromeFromOptions(optKey, printOpts, { season: viewedSeason });
-  const printCamp = (camp: Camp) => printInPage(campReportDocument(camp, passengers, pageType, branding, campChrome()));
-  const printAll = () => printInPage(campsReportDocument(camps, passengers, pageType, branding, campChrome()));
+  const { sealsFor, unavailable: sealsOff } = usePrintSeals(showAlert);
+  const campChrome = (seals: PrintSeals) => chromeFromOptions(optKey, printOpts, { season: viewedSeason, seals });
+  const printCamp = async (camp: Camp) => {
+    const seals = await sealsFor(optKey, printOpts); if (!seals) return;
+    printInPage(campReportDocument(camp, passengers, pageType, branding, campChrome(seals)));
+  };
+  const printAll = async () => {
+    const seals = await sealsFor(optKey, printOpts); if (!seals) return;
+    printInPage(campsReportDocument(camps, passengers, pageType, branding, campChrome(seals)));
+  };
 
   const specialBadge = (light?: boolean) => (
     <span style={{ fontSize: 9.5, fontWeight: 800, padding: "2px 8px", borderRadius: 99, flexShrink: 0, background: light ? "color-mix(in srgb, var(--text-inverse) 22%, transparent)" : "var(--warning-bg)", color: light ? "var(--text-inverse)" : "var(--warning)" }}>خاص</span>
@@ -462,7 +578,7 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
           ? <div style={{ fontSize: 11, color: "var(--muted)", padding: "6px 0" }}>{campSearch ? "لا نتائج لهذا البحث" : "لا يوجد مخيمات بعد"}</div>
           : <div style={{ display: "grid", gridTemplateColumns: ALLOC_GRID, gap: ALLOC_GAP }}>
             {shown.map(camp => (
-              <AllocationCard key={camp.id} selected={sel.selectedId === camp.id} onClick={() => sel.open(camp.id)}
+              <AllocationCard key={camp.id} selected={sel.selectedId === camp.id} onClick={() => openCamp(camp.id)}
                 icon={<Icon />} title={`مخيم ${camp.name}`} badge={camp.type === "خاص" ? specialBadge(true) : undefined}
                 subtitle={camp.gender === "ذكر" ? "رجال" : "نساء"}
                 occ={dwellers(camp.id).length} cap={camp.capacity ?? null}
@@ -491,7 +607,7 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
           style={{ ...roOff, display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 99, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--primary)", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "var(--font-body)", transition: "var(--transition)", boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
           <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg> مخيم جديد
         </button>
-        {camps.length > 0 && <PrintOptionsMenu report={optKey} value={printOpts} onChange={setPrintOpts} />}
+        {camps.length > 0 && <PrintOptionsMenu report={optKey} value={printOpts} onChange={setPrintOpts} disabled={sealsOff} />}
         {camps.length > 0 && <button onClick={printAll} style={btnS()}><svg aria-hidden width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" /></svg> طباعة الكل</button>}
       </div>
 
@@ -534,14 +650,22 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
           : (left ?? 0) <= 0 ? "المخيّم مكتمل" : undefined;
 
         return (
-          <AllocationDialog onClose={sel.close} icon={<Icon />}
+          <AllocationDialog onClose={closeCamp} icon={<Icon />}
             title={editingName ? (
               <input defaultValue={camp.name} autoFocus aria-label="اسم المخيم"
                 onBlur={e => renameCamp(camp, e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") renameCamp(camp, (e.target as HTMLInputElement).value); if (e.key === "Escape") setEditingName(false); }}
+                onKeyDown={e => {
+                  if (e.key === "Enter") renameCamp(camp, (e.target as HTMLInputElement).value);
+                  /* Escape يلغي التعديل وحده — لا يصل إلى مستمع المودال فيغلقه */
+                  if (e.key === "Escape") { e.stopPropagation(); setEditingName(false); }
+                }}
                 style={{ width: 140, fontSize: 18, fontWeight: 900, padding: "2px 8px", borderRadius: 8, border: "none", outline: "none", fontFamily: "var(--font-body)" }} />
             ) : (
-              <span onDoubleClick={() => !readOnly && setEditingName(true)} title="انقر نقرتين لتعديل الاسم">مخيم {camp.name}</span>
+              /* النقرتان كما هما، ولوحةُ المفاتيح تبلغه أيضاً: Tab ثم Enter أو F2 */
+              <span onDoubleClick={() => !readOnly && setEditingName(true)} title="انقر نقرتين لتعديل الاسم"
+                role={readOnly ? undefined : "button"} tabIndex={readOnly ? undefined : 0}
+                aria-label={readOnly ? undefined : `مخيم ${camp.name} — تعديل الاسم`}
+                onKeyDown={e => { if (!readOnly && (e.key === "Enter" || e.key === "F2")) { e.preventDefault(); setEditingName(true); } }}>مخيم {camp.name}</span>
             )}
             badges={
               <>
@@ -627,7 +751,7 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
                                 {others.map(c => <option key={c.id} value={c.id}>{c.name} ({c.capacity == null ? "بلا سعة" : `${remainingOf(c)} متاح`})</option>)}
                               </select>
                             )}
-                            <button disabled={readOnly} onClick={() => void writes.unassign(p.id, "تعذر إزالة المسافر من المخيم")}
+                            <button disabled={readOnly} onClick={() => void removeP(p, camp)}
                               aria-label={`إزالة ${p.short_ar || p.name_ar} من المخيم`} title="إزالة من المخيم"
                               style={{ ...roOff, width: 24, height: 24, borderRadius: 7, border: "1px solid var(--danger)", background: "var(--paper)", cursor: "pointer", color: "var(--danger)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                               <svg aria-hidden width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="9 14 4 9 9 4" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></svg>
@@ -639,7 +763,7 @@ function CampsPage({ pageType, passengers, setPassengers }: { pageType: "منى"
                 {/* عرفة بلا اقتراحات — قرار منتج، لا نقصٌ في التنفيذ */}
                 {isMina && (
                   <SuggestionStrip items={minaSuggestions(camp)} blockedReason={blockedReason}
-                    onAccept={pId => void addOne(camp, pId)}
+                    onAccept={pId => void acceptSuggestion(camp, pId)}
                     onDismiss={pId => setDismissed(prev => new Set([...prev, pId]))} />
                 )}
               </>

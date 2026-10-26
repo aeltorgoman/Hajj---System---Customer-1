@@ -1,10 +1,11 @@
 import type { AppConfig } from "../config/AppConfig";
 import type { Database, Json } from "../types/database";
-import type { CompanyAsset, CompanyAssetKey, CompanyProfile, SeasonMasterData } from "./types";
+import type { BankSettingsField, CompanyAsset, CompanyAssetKey, CompanyProfile, SeasonMasterData } from "./types";
 import { isPrivateCompanyAssetKey } from "./types";
 import { supabase } from "../supabase";
 import { normalizeCompanyAssetUrl, normalizeCompanyColor } from "./safety";
 import { classifyPostgrestError, type SaveResult } from "./saveResult";
+import { effectivePortalSettings, type PortalSettings } from "./portalSettings";
 
 type ConfigRow = Database["public"]["Tables"]["company_config"]["Row"];
 type PublicConfigRow = Database["public"]["Views"]["company_profile_public"]["Row"];
@@ -56,6 +57,7 @@ export function normalizeCompanyProfile(config: AppConfig | ConfigRow | PublicCo
      البوابة فلا يظهر شيء، ولا واجهةَ تكتب `features` أصلاً ليُطفئ
      الناقض. فصار لظهور أقسام البوابة مصدرٌ واحد. */
   const portal = (raw.portal_settings && typeof raw.portal_settings === "object" && !Array.isArray(raw.portal_settings) ? raw.portal_settings : {}) as Record<string, unknown>;
+  const settings = effectivePortalSettings(portal);
   /* ⚠️ لا مرتدَّ إلى `company_config.logo_url` ولا إلى
      `banner_image_url` بعد اليوم: `company_assets` هي مرجعُ الأصول
      وحدها، والعمودان يسقطان في ترحيل التنظيف. وصفُّ `logo` مقروءٌ
@@ -77,12 +79,13 @@ export function normalizeCompanyProfile(config: AppConfig | ConfigRow | PublicCo
       welcomeMessage: text(raw.portal_welcome_message), helpMessage: text(raw.portal_help_message),
       supportPhone: raw.admin_phone || "",
       visibility: {
-        flights: enabled(portal.flights), rooms: enabled(portal.rooms), buses: enabled(portal.buses),
+        flights: settings.flights, rooms: settings.rooms, buses: settings.buses,
         financialBalance: enabled(portal.financial_balance, false), qrCodes: enabled(portal.qr_codes),
-        documents: enabled(portal.documents),
-        notifications: enabled(portal.notifications), pdfDownloads: enabled(portal.pdf_downloads),
-        roommates: enabled(portal.roommates),
-        lostCard: enabled(portal.lost_card),
+        documents: settings.documents,
+        roommates: settings.roommates,
+        lostCard: settings.lost_card,
+        arafatCountdown: settings.arafat_countdown,
+        photoVisibility: settings.photo_visibility,
       },
     },
     assets,
@@ -154,7 +157,7 @@ export const companyService = {
      وحدها تملك التفويض، فلا يستطيع `manage_portal` أن يصل إلى عمودٍ
      آخر مهما صيغ الطلب. والصفُّ المعاد برهانُ الأثر. */
   async updatePortalSettings(values: {
-    portal_settings: Record<string, boolean>;
+    portal_settings: PortalSettings;
     portal_welcome_message: string | null;
     portal_help_message: string | null;
     admin_name: string | null;
@@ -174,6 +177,18 @@ export const companyService = {
     return { status: "saved", data: data as unknown as ConfigRow };
   },
 
+  /* ═══ البنك والسداد — البابُ الضيّق ═══
+     الحقولُ الستّة وحدها (البنك والحساب والرقم وIBAN وSWIFT والسجلّ
+     التجاريّ)، برقعةٍ بما تغيّر. لـ`manage_payments` أو `manage_users`،
+     والحارسُ والقائمةُ في الدالّة لا هنا: مفتاحٌ آخر يُرفض كلُّه. */
+  /* والردُّ الحقولُ الستّة وحدها — لا صفُّ الإعدادات كلُّه */
+  async updateBankSettings(patch: Partial<Record<BankSettingsField, string | null>>): Promise<SaveResult<Record<BankSettingsField, string | null>>> {
+    const { data, error } = await supabase.rpc("update_company_bank_settings", { p_patch: patch as unknown as Json });
+    if (error) return classifyPostgrestError(error);
+    if (!data) return { status: "not_found", message: "تعذّر الوصول إلى صفّ إعدادات الحملة، لم يُحفظ شيء." };
+    return { status: "saved", data: data as unknown as Record<BankSettingsField, string | null> };
+  },
+
   /* ═══ بياناتُ الموسم الرئيسة — بابُ الموسم النشط ═══
      على `seasons` سياسةُ `select` وحدها: لا `update` ولا `insert`.
      فلا سبيلَ إلى الكتابة إلا بهذه الدالّة، وحارسُها في جسدها لا
@@ -181,12 +196,12 @@ export const companyService = {
      وحده يُعدَّل، والمؤرشفُ لا يُمَسّ.
 
      و`hijri_year` ليست في التوقيع — هويّةُ الموسم لا تُبدَّل من
-     شاشةِ تحرير بياناته. */
+     شاشةِ تحرير بياناته.
+
+     MOD-001: النسخةُ ذاتُ الوسائط الخمسة — بلا الفندق. الفنادقُ تُدار
+     من صفحتها، ولا تمسّ هذه الدالّةُ أعمدةَ `hotel_*` ولا جدولَ `hotels`. */
   async updateActiveSeason(values: {
     name: string;
-    hotel_name: string | null;
-    hotel_address: string | null;
-    hotel_url: string | null;
     mina_address: string | null;
     mina_url: string | null;
     arafa_address: string | null;
@@ -194,9 +209,6 @@ export const companyService = {
   }): Promise<SaveResult<SeasonRow>> {
     const { data, error } = await supabase.rpc("update_active_season", {
       p_name: values.name,
-      p_hotel_name: values.hotel_name,
-      p_hotel_address: values.hotel_address,
-      p_hotel_url: values.hotel_url,
       p_mina_address: values.mina_address,
       p_mina_url: values.mina_url,
       p_arafa_address: values.arafa_address,
@@ -214,13 +226,11 @@ export const companyService = {
    والأرشيف، وبـ`activeSeason` في التحرير. */
 export function seasonMasterData(season: {
   name: string;
-  hotel_name?: string | null; hotel_address?: string | null; hotel_url?: string | null;
   mina_address?: string | null; mina_url?: string | null;
   arafa_address?: string | null; arafa_url?: string | null;
 }): SeasonMasterData {
   return {
     name: season.name || "",
-    hotelName: season.hotel_name || "", hotelAddress: season.hotel_address || "", hotelUrl: season.hotel_url || "",
     minaAddress: season.mina_address || "", minaUrl: season.mina_url || "",
     arafaAddress: season.arafa_address || "", arafaUrl: season.arafa_url || "",
   };

@@ -2,10 +2,10 @@
 // شاشة تفاصيل حساب الحاج الفردي — مكوّن عرض فقط
 // لا يستورد Supabase ولا ينفّذ استعلامات ولا يحفظ ولا يحذف
 // ============================================================
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { Passenger } from "../../types";
-import type { PricingMap, Payment, CustomCharge, FinancialGroup, AllocTypeMaps } from "./finance.types";
-import { getPriceInfo, chargesFor, paymentsFor, calcTotalDue, calcTotalPaid, paidFlightService, fmtAmt, financeStatus } from "./finance.utils";
+import type { PricingMap, HotelPackagePrices, FinanceHotel, Payment, CustomCharge, FinancialGroup, AllocTypeMaps } from "./finance.types";
+import { getPriceInfo, viewSurcharge, requestedHotelName, chargesFor, paymentsFor, calcTotalDue, calcTotalPaid, paidFlightService, fmtAmt, financeStatus } from "./finance.utils";
 import { serviceContextRows } from "./finance.context";
 import { FINANCE_RESPONSIVE_CSS } from "./finance.responsive";
 
@@ -13,6 +13,9 @@ export type PassengerFinanceViewProps = {
   // بيانات الحاج
   passenger: Passenger;
   pricing: PricingMap;
+  /* أسعارُ الباقات لكلّ فندق (MOD-001 PR 8) وفنادقُ الموسم لاسم المطلوب */
+  hotelPrices: HotelPackagePrices;
+  hotels: FinanceHotel[];
   passengerPayments: Payment[];
   passengerCharges: CustomCharge[];
   group: FinancialGroup | null;
@@ -31,6 +34,8 @@ export type PassengerFinanceViewProps = {
   // التنقّل والطباعة
   onBack: () => void;
   onPrintStatement: () => void;
+  /** «خيارات الطباعة» لكشف الحساب — بجوار زرّ الطباعة. */
+  statementOptions?: ReactNode;
 
   // السعر الخاص
   onEditCustomPrice: () => void;
@@ -56,25 +61,26 @@ export type PassengerFinanceViewProps = {
 };
 
 export function PassengerFinanceView({
-  passenger, pricing, passengerPayments, passengerCharges, group, groups, allocTypes,
+  passenger, pricing, hotelPrices, hotels, passengerPayments, passengerCharges, group, groups, allocTypes,
   canManage,
   editingCustomPrice, customPriceInput, savingCustomPrice,
-  onBack, onPrintStatement,
+  onBack, onPrintStatement, statementOptions,
   onEditCustomPrice, onCustomPriceInputChange, onSaveCustomPrice, onCancelEditCustomPrice,
   onAddPayment, onAddCharge, onOpenPayment, onDeletePayment, onDeleteCharge,
   onOpenGroup, onRemoveFromGroup, onCreateGroup, onAddToExistingGroup,
   tdStyle,
 }: PassengerFinanceViewProps) {
   const s=passenger.services;
-  const priceInfo = getPriceInfo(s, pricing), pkgAmt = priceInfo.amount;
+  const priceInfo = getPriceInfo(passenger, pricing, hotelPrices), pkgAmt = priceInfo.amount;
   const isSpecial = s.hotel_type === "خاص";
+  const reqHotel = isSpecial ? null : requestedHotelName(passenger, hotels);
   const pPayments=[...paymentsFor(passenger.id, passengerPayments)].sort((a,b)=>new Date(a.payment_date).getTime()-new Date(b.payment_date).getTime());
   const pCustom=chargesFor(passenger.id, passengerCharges);
-  const totalDue=calcTotalDue(passenger,pricing,passengerCharges), totalPaid=calcTotalPaid(passenger.id,passengerPayments), balance=totalDue-totalPaid;
+  const totalDue=calcTotalDue(passenger,pricing,hotelPrices,passengerCharges), totalPaid=calcTotalPaid(passenger.id,passengerPayments), balance=totalDue-totalPaid;
   const st=financeStatus(totalDue,totalPaid);
   type AR={label:string;amount:number;isDiscount?:boolean};
   const addonRows:AR[]=[];
-  if (s.hotel_view==="مطلة") addonRows.push({label:"إضافة مطلة",amount:pricing["addon_view"]?.amount||0});
+  if (s.hotel_view==="مطلة") addonRows.push({label:reqHotel?`إضافة مطلة — ${reqHotel}`:"إضافة مطلة",amount:viewSurcharge(passenger, hotelPrices)});
   if (s.camp_mina==="خاص")  addonRows.push({label:"خيمة خاصة - منى",amount:pricing["addon_mina"]?.amount||0});
   if (s.camp_arafa==="خاص") addonRows.push({label:"خيمة خاصة - عرفة",amount:pricing["addon_arafa"]?.amount||0});
   if (s.bus==="VIP")         addonRows.push({label:"باص VIP",amount:pricing["addon_bus_vip"]?.amount||0});
@@ -94,6 +100,7 @@ export function PassengerFinanceView({
           <div style={{ fontSize:11, color:"var(--text-muted)", marginTop:2 }}>{priceInfo.label}{addonRows.filter(a=>!a.isDiscount).map(a=>` · ${a.label}`).join("")}</div>
         </div>
         <span style={{ marginRight:"auto", fontSize:12, padding:"4px 14px", borderRadius:99, background:st.bg, color:st.color, fontWeight:700 }}>{st.label}</span>
+        {statementOptions}
         <button onClick={()=>onPrintStatement()} style={{ padding:"6px 12px", background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:8, fontSize:12, cursor:"pointer", display:"inline-flex", alignItems:"center", gap:5, fontFamily:"var(--font-body)" }}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>طباعة</button>
       </div>
       <div className="fin-trio" style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:20 }}>
@@ -120,7 +127,13 @@ export function PassengerFinanceView({
           <tbody>
             <tr>
               <td style={tdStyle}>
-                {priceInfo.label}
+                {priceInfo.label}{reqHotel && <span data-testid="pkg-hotel" style={{ color:"var(--text-muted)" }}> — {reqHotel}</span>}
+                {priceInfo.noHotel && (
+                  <span data-testid="pkg-no-hotel" style={{ fontSize:10, padding:"1px 6px", borderRadius:99, marginRight:6, background:"var(--danger-bg)", color:"var(--danger)" }}>لا فندق مطلوب — السعر صفر</span>
+                )}
+                {priceInfo.missingPrice && (
+                  <span data-testid="pkg-missing-price" style={{ fontSize:10, padding:"1px 6px", borderRadius:99, marginRight:6, background:"var(--warning-bg)", color:"var(--warning)" }}>لا سعر لهذه الباقة في الفندق — صفر</span>
+                )}
                 {priceInfo.unpriced && (
                   <span style={{ fontSize:10, padding:"1px 6px", borderRadius:99, marginRight:6, background:"var(--danger-bg)", color:"var(--danger)" }}>يلزم مراجعة الحساب</span>
                 )}

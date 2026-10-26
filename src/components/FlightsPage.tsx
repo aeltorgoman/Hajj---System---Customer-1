@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { isHajj, orderHajjThenAdmins } from "../utils/passenger";
 import type { Dispatch, SetStateAction } from "react";
 import { supabase } from "../supabase";
@@ -9,15 +9,19 @@ import { StatsRow, type StatCardData } from "./StatCard";
 import { useReportBranding } from "../company/CompanyContext";
 import { inp, btnP, btnS, printInPage } from "../utils";
 import { flightPassengers, flightReportDocument, flightsReportDocument,
-         initialPrintOptions, chromeFromOptions } from "../print";
+         initialPrintOptions, chromeFromOptions, type PrintSeals } from "../print";
+import { usePrintSeals } from "../company/printSeals";
 import { PrintOptionsMenu } from "./PrintOptionsMenu";
 import { useSeasonWrite } from "../season/useSeasonWrite";
 import { useSeason } from "../season/useSeason";
 import {
-  AllocationDialog, AllocationStates, AssignedRow, CapacityBar,
+  AllocationDialog, AllocationSearch, AllocationStates, AssignedRow, CapacityBar,
   DialogAction, PassengerPicker, RosterHeader, type PickerItem,
 } from "./allocation/AllocationUI";
 import { allocWriteError, matchesPassenger, useAllocationWrites } from "./allocation/useAllocation";
+import { AirlineMark, RoutePlane, ROUTE_CSS } from "./flights/flightVisuals";
+import { AIRLINE_OPTIONS, AIRLINE_OTHER, airlineOption } from "./flights/flightAirlines";
+import { deleteContainer, deleteFeedback, updateContainer, updateFeedback, useInFlight, type Feedback } from "./allocation/containerWrites";
 
 /* الاتجاه والعمود — رحلة الذهاب تسكن `flight_id`، والإياب
    `return_flight_id`. والقاعدة تحرس المطابقة الآن فلا تبقى اتفاقاً
@@ -37,15 +41,23 @@ const PlaneIcon = ({ size = 16, flip = false, animation }: { size?: number; flip
   <span style={{ fontSize: size, lineHeight: 1, display: "block", transform: flip ? "scaleX(-1)" : undefined, animation }}>✈</span>
 );
 
-// ===== شعارات شركات الطيران =====
-const AIRLINE_LOGOS: Record<string, string> = {
-  qatar: "https://upload.wikimedia.org/wikipedia/en/thumb/9/9b/Qatar_Airways_Logo.svg/120px-Qatar_Airways_Logo.svg.png",
+/* السعة عددٌ صحيحٌ موجبٌ بالأرقام وحدها — لا «12.5» ولا «1e2» ولا سالب.
+   كان `parseInt` يقبل «12.5» فيحفظ 12، و«1e2» فيحفظ 1. */
+const parseCapacity = (raw: string): number | null => {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
 };
 
-const getAirlineLogoUrl = (airline: string): string | null => {
-  const a = airline.toLowerCase();
-  if (a.includes("qatar")) return AIRLINE_LOGOS.qatar;
-  return null;
+/* البحث في الصفحة عن مسافر: اسمه العربيّ (كما في المنتقي) أو الإنجليزيّ
+   أو رقم جوازه — والمنتقي نفسه لا يتغيّر */
+const matchesFlightSearch = (p: Passenger, q: string) => {
+  const t = q.trim();
+  if (!t) return true;
+  if (matchesPassenger(p, t)) return true;
+  const low = t.toLowerCase();
+  return (p.name_en || "").toLowerCase().includes(low) || (p.passport || "").toLowerCase().includes(low);
 };
 
 const paxLabel = (n: number) => n === 1 ? "مسافر واحد" : n === 2 ? "مسافران" : n <= 10 ? `${n} مسافرين` : `${n} مسافراً`;
@@ -114,10 +126,17 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
   const [editFlightModal, setEditFlightModal] = useState<Flight | null>(null);
   const [editForm, setEditForm] = useState({ name: "", type: "ذهاب" as "ذهاب" | "إياب", airline: "", date: "", time: "", arrival_time: "", arrival_date: "", from_airport: "", to_airport: "", capacity: "" });
   const [activeTab, setActiveTab] = useState<"ذهاب" | "إياب" | "الكل">("ذهاب");
+  /* البحث عن مسافر في الصفحة: يشمل الذهاب والإياب معاً أيّاً كان التبويب،
+     وتفريغُه يعيد التبويب كما كان */
+  const [flightSearch, setFlightSearch] = useState("");
 
   const [showAdd, setShowAdd] = useState(false);
-  const [addForm, setAddForm] = useState({ name: "", type: "ذهاب" as "ذهاب" | "إياب", airline: "", date: "", time: "", arrival_time: "", arrival_date: "", from_airport: "", to_airport: "", capacity: "" });
+  const [addForm, setAddForm] = useState(emptyFlightForm);
   const [formError, setFormError] = useState("");
+  /* كلُّ جلسة «رحلة جديدة» تبدأ بنموذجٍ فارغ: الإلغاء والإغلاق يمحوان
+     المسودّة، والفتح يبدأ من الفراغ — فلا تعود بياناتٌ أُلغيت */
+  const openAdd = () => { setAddForm(emptyFlightForm()); setFormError(""); setShowAdd(true); };
+  const closeAdd = () => { setShowAdd(false); setFormError(""); setAddForm(emptyFlightForm()); };
 
   const [openFlightId, setOpenFlightId] = useState<number | null>(null);
   const [pSearch, setPSearch] = useState("");
@@ -152,7 +171,8 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
   const occOf = (f: Flight) => passengers.filter(p => p[legOf(f.type)] === f.id).length;
   const remainingOf = (f: Flight) => f.capacity == null ? null : Math.max(0, f.capacity - occOf(f));
 
-  const closeDialog = () => { setOpenFlightId(null); setPSearch(""); setPicked(new Set()); setEditingCap(false); setShowLink(false); setLinkSourceId(null); };
+  const closeDialog = useCallback(() => { setOpenFlightId(null); setPSearch(""); setPicked(new Set()); setEditingCap(false); setShowLink(false); setLinkSourceId(null); }, []);
+  const openFlightDialog = (id: number) => { setOpenFlightId(id); setPSearch(""); setPicked(new Set()); setEditingCap(false); };
 
   // ══════════════════════════════════════════════════════════
   // قواعد الطيران — هنا، ظاهرةً
@@ -208,29 +228,42 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
   // ══════════════════════════════════════════════════════════
   // مسارات الكتابة — كلّها تمرّ بالحدود الصلبة ثم تحذير الأسرة
   // ══════════════════════════════════════════════════════════
+  /* الحدود الصلبة ثم تحذير الأسرة — قبل أي كتابة */
+  const precheck = async (f: Flight, chosen: Passenger[]): Promise<boolean> => {
+    const opt = optOutBlock(chosen);
+    if (opt) { showAlert("warning", opt); return false; }
+    const blocked = seatBlock(f, chosen.length);
+    if (blocked) { showAlert("warning", blocked); return false; }
+    return confirmFamily(f, chosen);
+  };
+
+  /* الدرجة المحجوزة تتبع المدفوعة — والقاعدة ترفض غير ذلك */
+  const markClass = (ids: Set<number>) =>
+    setPassengers(prev => prev.map(x => ids.has(x.id) ? { ...x, flight_class: paidClass(x) } : x));
+
+  /* الإضافة لمن لا رحلة له في هذا الاتجاه وحده، شرطاً في الطلب نفسه: من
+     حُجز على رحلةٍ أخرى من مكانٍ آخر في الأثناء لا يُنقل صامتاً */
   const assignMany = async (f: Flight, chosen: Passenger[]) => {
     if (!chosen.length) return 0;
-    const opt = optOutBlock(chosen);
-    if (opt) { showAlert("warning", opt); return 0; }
-    const blocked = seatBlock(f, chosen.length);
-    if (blocked) { showAlert("warning", blocked); return 0; }
-    if (!await confirmFamily(f, chosen)) return 0;
-    /* الدرجة المحجوزة تتبع المدفوعة — والقاعدة ترفض غير ذلك */
-    const done = await writesFor(f).assignMany(chosen.map(p => p.id), f.id, "تعذر إضافة بعض المسافرين إلى الرحلة");
-    if (done) {
-      const ids = new Set(chosen.slice(0, done).map(p => p.id));
-      setPassengers(prev => prev.map(x => ids.has(x.id) ? { ...x, flight_class: paidClass(x) } : x));
-    }
+    if (!await precheck(f, chosen)) return 0;
+    const done = await writesFor(f).assignMany(chosen.map(p => p.id), f.id, "تعذر إضافة بعض المسافرين إلى الرحلة", null);
+    if (done) markClass(new Set(chosen.slice(0, done).map(p => p.id)));
     return done;
   };
 
   const addOne = async (f: Flight, pId: number) => {
     const p = passengers.find(x => x.id === pId);
-    if (p) await assignMany(f, [p]);
+    if (!p || !await precheck(f, [p])) return;
+    const r = await writesFor(f).move(p.id, null, f.id, "تعذر إضافة المسافر إلى الرحلة");
+    if (r === "ok") markClass(new Set([p.id]));
+    else if (r === "stale") showAlert("warning", `«${p.short_ar || p.name_ar}» حُجز على رحلة ${f.type} أخرى من مكانٍ آخر — لم يُضَف، وحُدِّثت البيانات.`);
   };
 
   const addPicked = async (f: Flight) => {
-    const chosen = passengers.filter(p => picked.has(p.id));
+    /* من حُجز في الأثناء (إضافةٌ فرديّة أو تحديثٌ لحظيّ) يبقى في التحديد وقد
+       خرج من القائمة — لا يُرسَل، وإلا ردّه الشرط فأوقف إضافة الباقين */
+    const leg = legOf(f.type);
+    const chosen = passengers.filter(p => picked.has(p.id) && p[leg] == null);
     const done = await assignMany(f, chosen);
     if (done === chosen.length) setPicked(new Set());
     else setPicked(new Set(chosen.slice(done).map(p => p.id)));
@@ -245,7 +278,18 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
     const blocked = seatBlock(target, 1);
     if (blocked) { showAlert("warning", blocked); return; }
     if (!await confirmFamily(target, [p])) return;
-    await writesFor(target).assign(p.id, target.id, "تعذر نقل المسافر إلى الرحلة الأخرى");
+    /* نقلٌ مشروطٌ بالرحلة المعروضة — لا كتابةَ فوق نقلٍ أجراه غيرُك في الأثناء */
+    const r = await writesFor(target).move(p.id, from.id, target.id, "تعذر نقل المسافر إلى الرحلة الأخرى");
+    if (r === "stale") staleOn(p, "لم يُنقل");
+  };
+
+  const staleOn = (p: Passenger, what: string) => showAlert("warning",
+    `«${p.short_ar || p.name_ar}» لم يعد على الرحلة المعروضة — غيّر حجزَه غيرُك في الأثناء. ${what}، وحُدِّثت البيانات.`);
+
+  /* الإخراج مشروطٌ بالرحلة المعروضة كذلك — لا يُلغى حجزٌ على رحلةٍ نُقل إليها في الأثناء */
+  const removeP = async (f: Flight, p: Passenger) => {
+    const r = await writesFor(f).unassign(p.id, f.id, "تعذر إزالة المسافر من الرحلة");
+    if (r === "stale") staleOn(p, "لم يُزَل");
   };
 
   // ══════════════════════════════════════════════════════════
@@ -304,14 +348,32 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
     flights.some(x => x.id !== ignoreId && x.type === f.type
       && x.name.trim() === f.name.trim() && (x.date || "").trim() === f.date.trim() && (x.time || "").trim() === f.time.trim());
 
-  const addFlight = async () => {
+  /* طلبٌ جارٍ واحدٌ لكلّ عمليّة — النقرة المكرّرة لا تُرسَل */
+  const inFlight = useInFlight();
+
+  /* ما لم يقع كما أُريد: تُعرض الحقيقة وتُحدَّث الحالة منها */
+  const applyFeedback = (f: Flight, fb: Feedback) => {
+    if (fb.apply?.kind === "remove") {
+      setFlights(prev => prev.filter(x => x.id !== f.id));
+      if (openFlightId === f.id) closeDialog();
+      setEditFlightModal(null);
+    } else if (fb.apply?.kind === "merge") {
+      const row = fb.apply.row as Partial<Flight>;
+      setFlights(prev => prev.map(x => x.id === f.id ? { ...x, ...row } : x));
+      setEditFlightModal(null); setEditingCap(false);
+    }
+    showAlert(fb.type, fb.message);
+  };
+  const flightLabel = (f: Flight) => `الرحلة «${f.name}»`;
+
+  const addFlight = () => inFlight("add", async () => {
     if (!assertWritable()) return;
     const f = { ...addForm, name: addForm.name.trim(), airline: addForm.airline.trim(), from_airport: addForm.from_airport.trim(), to_airport: addForm.to_airport.trim() };
-    const cap = parseInt(addForm.capacity, 10);
+    const cap = parseCapacity(addForm.capacity);
     if (!f.name) { setFormError("يرجى إدخال رقم الرحلة أو اسمها"); return; }
     if (!f.date || !f.time) { setFormError("التاريخ ووقت المغادرة مطلوبان — وهما جزءٌ من هويّة الرحلة"); return; }
     if (identityClash(f)) { setFormError(`رحلة ${f.type} بالرقم «${f.name}» في ${f.date} الساعة ${f.time} موجودة بالفعل`); return; }
-    if (!Number.isFinite(cap) || cap < 1) { setFormError("عدد المقاعد المخصَّصة للحملة مطلوب، ويجب أن يكون أكبر من صفر"); return; }
+    if (cap === null) { setFormError("عدد المقاعد المخصَّصة للحملة مطلوب، ويجب أن يكون عدداً صحيحاً أكبر من صفر"); return; }
     setFormError("");
     const { data, error } = await supabase.from("flights").insert([{
       name: f.name, type: f.type, airline: f.airline, date: f.date, time: f.time,
@@ -321,61 +383,78 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
     if (error) { console.error("فشل إضافة الرحلة", error); showAlert("error", allocWriteError("فشل إضافة الرحلة، يرجى المحاولة مرة أخرى", error.message)); return; }
     if (data?.[0]) {
       setFlights(prev => [...prev, data[0] as Flight]);
-      setAddForm({ name: "", type: "ذهاب", airline: "", date: "", time: "", arrival_time: "", arrival_date: "", from_airport: "", to_airport: "", capacity: "" });
-      setShowAdd(false);
+      closeAdd();
     }
-  };
+  });
 
   const openEditFlight = (f: Flight) => {
     setEditFlightModal(f);
     setEditForm({ name: f.name, type: f.type, airline: f.airline || "", date: f.date || "", time: f.time || "", arrival_time: f.arrival_time || "", arrival_date: f.arrival_date || "", from_airport: f.from_airport || "", to_airport: f.to_airport || "", capacity: f.capacity != null ? String(f.capacity) : "" });
   };
 
-  const saveEditFlight = async () => {
+  const saveEditFlight = () => inFlight("edit", async () => {
     if (!editFlightModal || !assertWritable()) return;
     const occ = occOf(editFlightModal);
-    const cap = editForm.capacity.trim() === "" ? null : parseInt(editForm.capacity, 10);
-    if (cap !== null && (!Number.isFinite(cap) || cap < 1)) { showAlert("warning", "عدد المقاعد يجب أن يكون أكبر من صفر"); return; }
+    /* الفارغ مقبولٌ لرحلةٍ لم تُحدَّد مقاعدها أصلاً (لا تغيير)، ولا يمحو
+       عدداً قائماً */
+    const capRaw = editForm.capacity.trim();
+    const cap = capRaw === "" && editFlightModal.capacity == null ? null : parseCapacity(capRaw);
+    if (cap === null && !(capRaw === "" && editFlightModal.capacity == null)) { showAlert("warning", "عدد المقاعد يجب أن يكون عدداً صحيحاً أكبر من صفر"); return; }
     if (cap !== null && cap < occ) { showAlert("warning", `الرحلة «${editFlightModal.name}» تضمّ ${paxLabel(occ)}، فلا تُخفَّض مقاعد الحملة إلى ${cap}. أخرِج المسافرين أولاً.`); return; }
     if (occ > 0 && editForm.type !== editFlightModal.type) { showAlert("warning", `الرحلة «${editFlightModal.name}» تضمّ ${paxLabel(occ)} — لا يُقلب اتجاهها. أخرِجهم أولاً.`); return; }
     if (!editForm.name.trim() || !editForm.date.trim() || !editForm.time.trim()) { showAlert("warning", "الرقم والتاريخ ووقت المغادرة مطلوبة"); return; }
     if (identityClash({ name: editForm.name, type: editForm.type, date: editForm.date, time: editForm.time }, editFlightModal.id)) {
       showAlert("warning", "رحلة بهذه الهويّة (الاتجاه والرقم والتاريخ والوقت) موجودة بالفعل"); return;
     }
+    const orig = editFlightModal;
     const upd = {
       name: editForm.name.trim(), type: editForm.type, airline: editForm.airline.trim(),
       date: editForm.date, time: editForm.time, arrival_time: editForm.arrival_time, arrival_date: editForm.arrival_date,
       from_airport: editForm.from_airport.trim(), to_airport: editForm.to_airport.trim(), capacity: cap,
     };
-    const { error } = await supabase.from("flights").update(upd).eq("id", editFlightModal.id);
-    if (error) { console.error("تعذر حفظ تعديلات الرحلة", error); showAlert("error", allocWriteError("تعذر حفظ تعديلات الرحلة", error.message)); return; }
-    setFlights(prev => prev.map(f => f.id === editFlightModal.id ? { ...f, ...upd } as Flight : f));
+    /* لا يُكتب إلا ما غيّره الموظّف، وكلُّ حقلٍ منه مشروطٌ بقيمته حين فُتح
+       النموذج: فلا تمحو نسخةٌ قديمة ما غيّره غيرُه في حقلٍ آخر، ولا يُكتب
+       فوق حقلٍ غيّره غيرُه هو نفسه */
+    const before = orig as unknown as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    const expect: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(upd)) {
+      const was = before[k] ?? null;
+      if (v === (was ?? (k === "capacity" ? null : ""))) continue;
+      patch[k] = v; expect[k] = was;
+    }
+    if (!Object.keys(patch).length) { setEditFlightModal(null); return; }
+    const r = await updateContainer("flights", orig.id, patch, expect);
+    if (r.kind !== "ok") { console.error("تعذر حفظ تعديلات الرحلة", r); applyFeedback(orig, updateFeedback(r, flightLabel(orig), "تعذر حفظ تعديلات الرحلة", allocWriteError, true)); return; }
+    setFlights(prev => prev.map(f => f.id === orig.id ? { ...f, ...patch } as Flight : f));
     setEditFlightModal(null);
-  };
+  });
 
-  const saveCapacity = async (f: Flight) => {
+  const saveCapacity = (f: Flight) => inFlight(`capacity:${f.id}`, async () => {
     if (!assertWritable()) return;
-    const cap = parseInt(capDraft, 10);
+    const cap = parseCapacity(capDraft);
     const occ = occOf(f);
-    if (!Number.isFinite(cap) || cap < 1) { showAlert("warning", "عدد المقاعد يجب أن يكون أكبر من صفر"); return; }
+    if (cap === null) { showAlert("warning", "عدد المقاعد يجب أن يكون عدداً صحيحاً أكبر من صفر"); return; }
     if (cap < occ) { showAlert("warning", `الرحلة «${f.name}» تضمّ ${paxLabel(occ)}، فلا تُخفَّض مقاعد الحملة إلى ${cap}. أخرِج المسافرين أولاً.`); return; }
-    const { error } = await supabase.from("flights").update({ capacity: cap }).eq("id", f.id);
-    if (error) { console.error("تعذر تعديل مقاعد الرحلة", error); showAlert("error", allocWriteError("تعذر تعديل مقاعد الرحلة", error.message)); return; }
+    /* مشروطةٌ بالمقاعد التي رآها الموظّف — لا يُكتب فوق عددٍ غيّره غيرُه */
+    const r = await updateContainer("flights", f.id, { capacity: cap }, { capacity: f.capacity ?? null });
+    if (r.kind !== "ok") { console.error("تعذر تعديل مقاعد الرحلة", r); applyFeedback(f, updateFeedback(r, flightLabel(f), "تعذر تعديل مقاعد الرحلة", allocWriteError, true)); return; }
     setFlights(prev => prev.map(x => x.id === f.id ? { ...x, capacity: cap } : x));
     setEditingCap(false);
-  };
+  });
 
-  const deleteFlight = async (f: Flight) => {
+  const deleteFlight = (f: Flight) => inFlight(`delete:${f.id}`, async () => {
     if (!assertWritable()) return;
     /* القاعدة ترفضه بالمفتاح الأجنبي كذلك — وهذا يشرح قبل المحاولة.
        والعدّ على الساقين معاً لا على ساقٍ واحدة كما كان. */
     const occ = passengers.filter(p => p.flight_id === f.id || p.return_flight_id === f.id).length;
     if (occ > 0) { showAlert("warning", `الرحلة «${f.name}» تضمّ ${paxLabel(occ)} — أخرِجهم قبل حذفها.`); return; }
-    const { error } = await supabase.from("flights").delete().eq("id", f.id);
-    if (error) { console.error("تعذر حذف الرحلة", error); showAlert("error", allocWriteError("تعذر حذف الرحلة", error.message)); return; }
+    /* لا تُزال من الشاشة إلا إن حُذفت فعلاً أو تبيّن أنها لم تعد موجودة */
+    const r = await deleteContainer("flights", f.id);
+    if (r.kind !== "ok") { console.error("تعذر حذف الرحلة", r); applyFeedback(f, deleteFeedback(r, flightLabel(f), "تعذر حذف الرحلة", allocWriteError, true)); return; }
     setFlights(prev => prev.filter(x => x.id !== f.id));
     if (openFlightId === f.id) closeDialog();
-  };
+  });
 
   // ══════════════════════════════════════════════════════════
   // الطباعة — بلا تغيير في المحتوى، والترتيب هو ترتيب الكشوف
@@ -384,9 +463,16 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
      صفحةٌ بعارضٍ دون أخرى. وهذه الهيئةُ هي المرجع ولم تتغيّر. */
   /* الجامعُ يستعيد ترويستَه؛ والهيئةُ الداخليّة وترتيبُها كما أُقرّت */
   const [printOpts, setPrintOpts] = useState(() => initialPrintOptions("flights"));
-  const flightChrome = () => chromeFromOptions("flights", printOpts, { season: viewedSeason });
-  const printFlight = (f: Flight) => printInPage(flightReportDocument(f, passengers, branding, flightChrome()));
-  const printAll = () => printInPage(flightsReportDocument(flights, passengers, branding, flightChrome()));
+  const { sealsFor, unavailable: sealsOff } = usePrintSeals(showAlert);
+  const flightChrome = (seals: PrintSeals) => chromeFromOptions("flights", printOpts, { season: viewedSeason, seals });
+  const printFlight = async (f: Flight) => {
+    const seals = await sealsFor("flights", printOpts); if (!seals) return;
+    printInPage(flightReportDocument(f, passengers, branding, flightChrome(seals)));
+  };
+  const printAll = async () => {
+    const seals = await sealsFor("flights", printOpts); if (!seals) return;
+    printInPage(flightsReportDocument(flights, passengers, branding, flightChrome(seals)));
+  };
 
   // ══════════════════════════════════════════════════════════
   const dirBadge = (type: string, light?: boolean) => (
@@ -403,7 +489,11 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
 
   const goFlights = flights.filter(f => f.type === "ذهاب");
   const retFlights = flights.filter(f => f.type === "إياب");
-  const visibleFlights = activeTab === "ذهاب" ? goFlights : activeTab === "إياب" ? retFlights : flights;
+  const searching = flightSearch.trim() !== "";
+  /* في البحث: كلُّ رحلةٍ — ذهاباً وإياباً — فيها مسافرٌ يطابق */
+  const visibleFlights = searching
+    ? flights.filter(f => onFlight(f).some(p => matchesFlightSearch(p, flightSearch)))
+    : activeTab === "ذهاب" ? goFlights : activeTab === "إياب" ? retFlights : flights;
 
   // ===== بطاقة الصعود =====
   const renderBoardingPass = (flight: Flight) => {
@@ -431,7 +521,12 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
 
     return (
       <div key={flight.id} style={{ marginBottom: 12 }}>
-        <div className="fl-card" onClick={() => { setOpenFlightId(flight.id); setPSearch(""); setPicked(new Set()); }}
+        {/* البطاقة تُفتح بالنقر وبلوحة المفاتيح (Enter/مسافة) — ولا تُفتح حين
+            يُضغط زرٌّ داخلها (تعديل · طباعة · حذف) */}
+        <div className="fl-card" role="button" tabIndex={0}
+          aria-label={`رحلة ${flight.name} — ${flight.type} — ${fp.length} من ${flight.capacity ?? "—"} مقعداً`}
+          onClick={() => openFlightDialog(flight.id)}
+          onKeyDown={e => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openFlightDialog(flight.id); } }}
           style={{ background: "var(--paper)", border: "1.5px solid var(--line)", borderRadius: 18, overflow: "hidden", boxShadow: "0 2px 8px rgba(0,0,0,.06)", transition: "all .2s", cursor: "pointer" }}
           onMouseEnter={e => { e.currentTarget.style.boxShadow = "0 6px 20px color-mix(in srgb, var(--primary) 16%, transparent)"; e.currentTarget.style.transform = "translateY(-1px)"; }}
           onMouseLeave={e => { e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,.06)"; e.currentTarget.style.transform = "none"; }}>
@@ -440,9 +535,7 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
           <div className="fl-pass" style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <div style={{ width: 68, height: 68, borderRadius: 14, background: "var(--paper)", border: "2.5px solid var(--accent)", boxShadow: "0 2px 12px color-mix(in srgb, var(--accent) 25%, transparent)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, overflow: "hidden", padding: 5, color: "var(--accent)" }}>
-                {flight.airline && getAirlineLogoUrl(flight.airline) ? (
-                  <img src={getAirlineLogoUrl(flight.airline)!} alt={flight.airline} style={{ width: "100%", height: "100%", objectFit: "contain" }} onError={e => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
-                ) : <PlaneIcon size={26} />}
+                <AirlineMark airline={flight.airline} size={26} />
               </div>
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 15, fontWeight: 800, color: "var(--ink)" }}>{flight.airline || "شركة الطيران"}</div>
@@ -454,23 +547,23 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
               </div>
             </div>
 
-            {/* المسار — المغادرة يمين، الوصول يسار */}
-            <div style={{ display: "flex", alignItems: "center" }}>
-              <div style={{ flexShrink: 0, textAlign: "center", minWidth: 58 }}>
-                <div style={{ fontFamily: "monospace", fontSize: 28, fontWeight: 900, color: "var(--primary)", lineHeight: 1 }}>{toIATA || "—"}</div>
-                <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 2 }}>{extractCity(flight.to_airport || "")}</div>
-                {flight.arrival_time && <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 900, color: "var(--primary)", marginTop: 4 }}>{flight.arrival_time}</div>}
-              </div>
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", padding: "0 8px" }}>
-                <div style={{ width: "100%", height: 2, background: "linear-gradient(90deg, var(--line), var(--accent), var(--line))", borderRadius: 99, position: "relative" }}>
-                  <div className={isTomorrow ? "plane-pulse" : "plane-float"} style={{ color: "var(--primary)" }}><PlaneIcon size={16} /></div>
-                </div>
-                {dateDisplay && <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 5, whiteSpace: "nowrap" }} dir="ltr">{dateDisplay}</div>}
-              </div>
-              <div style={{ flexShrink: 0, textAlign: "center", minWidth: 58 }}>
+            {/* المسار — المغادرة يميناً والوصول يساراً، صريحاً لا تبعاً لاتّجاه
+                الصفحة: كان الوصول أوّلَ العناصر فيظهر يميناً في الصفحة العربيّة،
+                خلافَ ما يقوله التعليق. والطائرة تتقدّم من المغادرة إلى الوصول. */}
+            <div dir="rtl" style={{ display: "flex", alignItems: "center" }}>
+              <div data-route-dep style={{ flexShrink: 0, textAlign: "center", minWidth: 58 }}>
                 <div style={{ fontFamily: "monospace", fontSize: 28, fontWeight: 900, color: "var(--primary)", lineHeight: 1 }}>{fromIATA || "—"}</div>
                 <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 2 }}>{extractCity(flight.from_airport || "")}</div>
                 {flight.time && <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 900, color: "var(--primary)", marginTop: 4 }}>{flight.time}</div>}
+              </div>
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", padding: "0 8px" }}>
+                <RoutePlane urgent={isTomorrow} />
+                {dateDisplay && <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 5, whiteSpace: "nowrap" }} dir="ltr">{dateDisplay}</div>}
+              </div>
+              <div data-route-arr style={{ flexShrink: 0, textAlign: "center", minWidth: 58 }}>
+                <div style={{ fontFamily: "monospace", fontSize: 28, fontWeight: 900, color: "var(--primary)", lineHeight: 1 }}>{toIATA || "—"}</div>
+                <div style={{ fontSize: 9, color: "var(--muted)", marginTop: 2 }}>{extractCity(flight.to_airport || "")}</div>
+                {flight.arrival_time && <div style={{ fontFamily: "monospace", fontSize: 14, fontWeight: 900, color: "var(--primary)", marginTop: 4 }}>{flight.arrival_time}</div>}
               </div>
             </div>
           </div>
@@ -524,6 +617,19 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
                 ))}
               </div>
             )}
+
+            {/* من يطابق البحث على هذه الرحلة */}
+            {searching && (() => {
+              const hits = fp.filter(p => matchesFlightSearch(p, flightSearch));
+              if (!hits.length) return null;
+              return (
+                <div data-search-hits style={{ fontSize: 10.5, fontWeight: 700, color: "var(--ink)", background: "color-mix(in srgb, var(--accent) 14%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 35%, transparent)", borderRadius: 8, padding: "4px 8px" }}>
+                  <span style={{ color: "var(--muted)" }}>يطابق البحث: </span>
+                  {hits.slice(0, 3).map(p => p.short_ar || p.name_ar).join(" · ")}
+                  {hits.length > 3 ? ` و${hits.length - 3} غيرهم` : ""}
+                </div>
+              );
+            })()}
           </div>
         </div>
       </div>
@@ -532,11 +638,13 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
 
   // ══════════════════════════════════════════════════════════
   const tabBtn = (t: "ذهاب" | "إياب" | "الكل", n: number) => (
-    <button key={t} onClick={() => setActiveTab(t)}
+    /* التبويب يُنهي البحث ويعرض اتّجاهه — والبحث نفسه لا يتقيّد بتبويب */
+    <button key={t} onClick={() => { setActiveTab(t); setFlightSearch(""); }} aria-pressed={!searching && activeTab === t}
       style={{ padding: "5px 14px", borderRadius: 99, fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "var(--font-body)",
-        border: activeTab === t ? "1.5px solid var(--primary)" : "1.5px solid var(--line)",
-        background: activeTab === t ? "var(--primary)" : "var(--paper)",
-        color: activeTab === t ? "var(--text-inverse)" : "var(--muted)" }}>
+        opacity: searching ? .55 : 1,
+        border: !searching && activeTab === t ? "1.5px solid var(--primary)" : "1.5px solid var(--line)",
+        background: !searching && activeTab === t ? "var(--primary)" : "var(--paper)",
+        color: !searching && activeTab === t ? "var(--text-inverse)" : "var(--muted)" }}>
       {t} <span style={{ opacity: .75 }}>({n})</span>
     </button>
   );
@@ -553,29 +661,45 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
           .fl-pass { width: auto; }
           .fl-perf { width: auto; height: 0; border-right: none; border-top: 1px dashed var(--line); margin: 0 14px; }
         }
+        .fl-card:focus-visible { outline: 2.5px solid var(--primary); outline-offset: 2px; }
+        .fl-dir-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+        ${ROUTE_CSS}
       `}</style>
       <AlertModal alert={alertState} onClose={() => showAlert(null)} />
       <ConfirmModal state={confirmState} onConfirm={handleConfirm} onCancel={handleCancel} />
       <FlightsStats flights={flights} passengers={passengers} />
 
       <div style={{ display: "flex", gap: 8, marginBottom: 12, marginTop: 12, flexWrap: "wrap" }}>
-        <button disabled={readOnly} onClick={() => setShowAdd(true)}
+        <button disabled={readOnly} onClick={openAdd}
           style={{ ...roOff, display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 99, background: "var(--paper)", border: "1px solid var(--line)", color: "var(--primary)", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "var(--font-body)" }}>
           <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg> رحلة جديدة
         </button>
-        {flights.length > 0 && <PrintOptionsMenu report={"flights"} value={printOpts} onChange={setPrintOpts} />}
+        {flights.length > 0 && <PrintOptionsMenu report={"flights"} value={printOpts} onChange={setPrintOpts} disabled={sealsOff} />}
         {flights.length > 0 && <button onClick={printAll} style={btnS()}>طباعة الكل</button>}
         <div style={{ display: "flex", gap: 6, marginInlineStart: "auto", flexWrap: "wrap" }}>
           {tabBtn("ذهاب", goFlights.length)}{tabBtn("إياب", retFlights.length)}{tabBtn("الكل", flights.length)}
         </div>
       </div>
 
+      {flights.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <AllocationSearch value={flightSearch} onChange={setFlightSearch} placeholder="ابحث عن مسافر بالاسم أو رقم الجواز..." />
+          {searching && (
+            <div role="status" style={{ fontSize: 11, color: "var(--muted)", fontWeight: 700, marginTop: 6 }}>
+              {visibleFlights.length
+                ? `${visibleFlights.length === 1 ? "رحلة واحدة" : `${visibleFlights.length} رحلات`} فيها مسافرٌ يطابق «${flightSearch.trim()}» — في الذهاب والإياب معاً`
+                : `لا رحلة فيها مسافرٌ يطابق «${flightSearch.trim()}» — في الذهاب والإياب`}
+            </div>
+          )}
+        </div>
+      )}
+
       <AllocationStates loading={flightsLoading} error={flightsError} empty={!flights.length}
         icon={<PlaneIcon size={16} />} errorText="تعذر تحميل الرحلات — يرجى التحقق من الاتصال وتحديث الصفحة" emptyText="لا يوجد رحلات بعد" />
 
       {!flightsLoading && !flightsError && flights.length > 0 && (
         visibleFlights.length === 0
-          ? <div style={{ fontSize: 12, color: "var(--muted)", padding: "8px 2px" }}>لا رحلات {activeTab} في هذا الموسم</div>
+          ? (searching ? null : <div style={{ fontSize: 12, color: "var(--muted)", padding: "8px 2px" }}>لا رحلات {activeTab} في هذا الموسم</div>)
           : visibleFlights.map(renderBoardingPass)
       )}
 
@@ -605,6 +729,9 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
 
         return (
           <AllocationDialog onClose={closeDialog} icon={<PlaneIcon size={16} />}
+            /* Escape الأولى تلغي تعديل المقاعد وحده — من الحقل أو من «حفظ/إلغاء»
+               أو من أيّ موضعٍ في المودال — والتالية تغلقه */
+            onEscape={() => { if (!editingCap) return false; setEditingCap(false); return true; }}
             title={<span dir="ltr">{f.name}</span>}
             badges={<>{dirBadge(f.type, true)}{f.airline && <span style={{ fontSize: 10, fontWeight: 700, opacity: .9 }}>{f.airline}</span>}</>}
             meta={
@@ -617,7 +744,7 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
                   <span style={{ opacity: .85 }}>· {capNote(f)}</span>
                   {editingCap ? (
                     <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
-                      <input value={capDraft} onChange={e => setCapDraft(e.target.value)} type="number" min="1" autoFocus aria-label="مقاعد الحملة"
+                      <input value={capDraft} onChange={e => setCapDraft(e.target.value)} type="number" min="1" step="1" inputMode="numeric" autoFocus aria-label="مقاعد الحملة"
                         style={{ width: 60, padding: "2px 6px", borderRadius: 6, border: "none", outline: "none", background: "var(--paper)", color: "var(--ink)", fontSize: 11, fontFamily: "var(--font-body)" }} />
                       <button onClick={() => saveCapacity(f)} style={{ fontSize: 10, fontWeight: 900, padding: "2px 8px", borderRadius: 6, border: "none", background: "var(--paper)", color: "var(--primary)", cursor: "pointer", fontFamily: "var(--font-body)" }}>حفظ</button>
                       <button onClick={() => setEditingCap(false)} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, border: "1px solid color-mix(in srgb, var(--text-inverse) 35%, transparent)", background: "transparent", color: "var(--text-inverse)", cursor: "pointer", fontFamily: "var(--font-body)" }}>إلغاء</button>
@@ -709,7 +836,7 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
                                 {others.map(x => <option key={x.id} value={x.id}>{x.name} ({x.capacity == null ? "بلا مقاعد" : `${remainingOf(x)} متاح`})</option>)}
                               </select>
                             )}
-                            <button disabled={readOnly} onClick={() => void writesFor(f).unassign(p.id, "تعذر إزالة المسافر من الرحلة")}
+                            <button disabled={readOnly} onClick={() => void removeP(f, p)}
                               aria-label={`إزالة ${p.short_ar || p.name_ar} من الرحلة`} title="إزالة من الرحلة"
                               style={{ ...roOff, width: 24, height: 24, borderRadius: 7, border: "1px solid var(--danger)", background: "var(--paper)", cursor: "pointer", color: "var(--danger)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                               <svg aria-hidden width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="9 14 4 9 9 4" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></svg>
@@ -739,17 +866,17 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
       })()}
 
       {/* ═══ إضافة رحلة ═══ */}
-      <Modal show={showAdd} onClose={() => { setShowAdd(false); setFormError(""); }} title="إضافة رحلة جديدة" maxWidth={420}>
+      <Modal show={showAdd} onClose={closeAdd} title="إضافة رحلة جديدة" maxWidth={520}>
         <FlightForm form={addForm} setForm={setAddForm} occupied={0} />
         {formError && <div role="alert" style={{ fontSize: 11, color: "var(--danger)", marginBottom: 10 }}>{formError}</div>}
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={addFlight} style={{ ...btnP(), flex: 1 }}>إضافة</button>
-          <button onClick={() => { setShowAdd(false); setFormError(""); }} style={btnS()}>إلغاء</button>
+          <button onClick={closeAdd} style={btnS()}>إلغاء</button>
         </div>
       </Modal>
 
       {/* ═══ تعديل رحلة ═══ */}
-      <Modal show={!!editFlightModal} onClose={() => setEditFlightModal(null)} title={`تعديل رحلة ${editFlightModal?.name ?? ""}`} maxWidth={420}>
+      <Modal show={!!editFlightModal} onClose={() => setEditFlightModal(null)} title={`تعديل رحلة ${editFlightModal?.name ?? ""}`} maxWidth={520}>
         <FlightForm form={editForm} setForm={setEditForm} occupied={editFlightModal ? occOf(editFlightModal) : 0} />
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={saveEditFlight} style={{ ...btnP(), flex: 1 }}>حفظ</button>
@@ -763,44 +890,104 @@ function FlightsPage({ passengers, setPassengers }: { passengers: Passenger[]; s
 /* نموذجُ الرحلة — مشتركٌ بين الإضافة والتعديل، فلا يفترق الحقلان */
 type FlightFormState = { name: string; type: "ذهاب" | "إياب"; airline: string; date: string; time: string; arrival_time: string; arrival_date: string; from_airport: string; to_airport: string; capacity: string };
 
+function emptyFlightForm(): FlightFormState {
+  return { name: "", type: "ذهاب", airline: "", date: "", time: "", arrival_time: "", arrival_date: "", from_airport: "", to_airport: "", capacity: "" };
+}
+
 function FlightForm({ form, setForm, occupied }: { form: FlightFormState; setForm: Dispatch<SetStateAction<FlightFormState>>; occupied: number }) {
   const set = (k: keyof FlightFormState) => (e: React.ChangeEvent<HTMLInputElement>) => setForm(prev => ({ ...prev, [k]: e.target.value }));
-  const lbl = { fontSize: 11, color: "var(--text-muted)", marginBottom: 4 } as const;
+  const lbl = { fontSize: 11, color: "var(--text-muted)", marginBottom: 4, display: "block" } as const;
+  const section = { border: "1px solid var(--line)", borderRadius: 12, padding: "10px 12px", marginBottom: 10, background: "var(--bg-2)" } as const;
+  const sectionTitle = { fontSize: 10.5, fontWeight: 900, color: "var(--primary)", marginBottom: 8, letterSpacing: .2 } as const;
+
+  /* الخيار يُستنتج من القيمة المحفوظة مرّةً عند الفتح، ولا يُعاد كتابة
+     القيمة إلا إن غيّر الموظّف الخيار: اسمٌ قديمٌ لا تعرفه القائمة يبقى
+     كما هو تحت «أخرى» */
+  const [choice, setChoice] = useState(() => airlineOption(form.airline));
+  const pickAirline = (v: string) => {
+    setChoice(v as typeof choice);
+    setForm(prev => ({ ...prev, airline: v === AIRLINE_OTHER ? (airlineOption(prev.airline) === AIRLINE_OTHER ? prev.airline : "") : v }));
+  };
+
   return (
     <>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+      {/* رأس النموذج — الشركة والرقم والاتّجاه كما ستظهر على البطاقة */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <div data-form-airline-mark style={{ width: 44, height: 44, borderRadius: 12, border: "2px solid var(--accent)", background: "var(--paper)", display: "flex", alignItems: "center", justifyContent: "center", padding: 4, color: "var(--accent)", flexShrink: 0, overflow: "hidden" }}>
+          <AirlineMark airline={form.airline} size={20} />
+        </div>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 800, color: "var(--ink)" }}>{form.airline.trim() || "شركة الطيران"}</div>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: "var(--muted)", fontFamily: "monospace" }} dir="ltr">{form.name.trim() || "—"}</div>
+        </div>
+        <span style={{ marginInlineStart: "auto", fontSize: 10, fontWeight: 800, padding: "2px 9px", borderRadius: 99, background: "color-mix(in srgb, var(--primary) 12%, transparent)", color: "var(--primary)" }}>{form.type}</span>
+      </div>
+
+      {/* ═ الرحلة ═ */}
+      <div style={section}>
+        <div style={sectionTitle}>الرحلة</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 10 }}>
+          <label>
+            <span style={lbl}>رقم الرحلة</span>
+            <input style={inp} value={form.name} onChange={set("name")} placeholder="QA1212" />
+          </label>
+          <label>
+            <span style={lbl}>شركة الطيران</span>
+            <select style={inp} value={choice} onChange={e => pickAirline(e.target.value)} aria-label="شركة الطيران">
+              {AIRLINE_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </label>
+        </div>
+        {choice === AIRLINE_OTHER && (
+          <label style={{ display: "block", marginBottom: 10 }}>
+            <span style={lbl}>اسم شركة الطيران</span>
+            <input style={inp} value={form.airline} onChange={set("airline")} placeholder="اسم الشركة" aria-label="اسم شركة الطيران" />
+          </label>
+        )}
         <div>
-          <div style={lbl}>رقم الرحلة</div>
-          <input style={inp} value={form.name} onChange={set("name")} placeholder="QA1212" />
-        </div>
-        <div>
-          <div style={lbl}>شركة الطيران</div>
-          <input style={inp} value={form.airline} onChange={set("airline")} placeholder="Qatar Airways" />
-        </div>
-      </div>
-      <div style={{ marginBottom: 10 }}>
-        <div style={lbl}>الاتجاه{occupied > 0 ? " — لا يُقلب وفيها مسافرون" : ""}</div>
-        <div style={{ display: "flex", gap: 8 }}>
-          {(["ذهاب", "إياب"] as const).map(t => (
-            <div key={t} onClick={() => { if (occupied === 0) setForm(prev => ({ ...prev, type: t })); }}
-              style={{ flex: 1, padding: 8, borderRadius: 8, textAlign: "center", fontSize: 12, cursor: occupied === 0 ? "pointer" : "not-allowed", opacity: occupied === 0 ? 1 : .5,
-                border: `1.5px solid ${form.type === t ? "var(--primary)" : "var(--border)"}`,
-                background: form.type === t ? "color-mix(in srgb, var(--primary) 8%, transparent)" : "transparent",
-                color: form.type === t ? "var(--primary)" : "var(--text-muted)" }}>{t}</div>
-          ))}
+          <span style={lbl}>الاتجاه{occupied > 0 ? " — لا يُقلب وفيها مسافرون" : ""}</span>
+          <div role="group" aria-label="الاتجاه" style={{ display: "flex", gap: 8 }}>
+            {(["ذهاب", "إياب"] as const).map(t => (
+              <button key={t} type="button" className="fl-dir-btn" aria-pressed={form.type === t} disabled={occupied > 0}
+                onClick={() => setForm(prev => ({ ...prev, type: t }))}
+                style={{ flex: 1, padding: 8, borderRadius: 8, textAlign: "center", fontSize: 12, fontWeight: 700, fontFamily: "var(--font-body)", cursor: occupied === 0 ? "pointer" : "not-allowed", opacity: occupied === 0 ? 1 : .5,
+                  border: `1.5px solid ${form.type === t ? "var(--primary)" : "var(--border)"}`,
+                  background: form.type === t ? "color-mix(in srgb, var(--primary) 8%, transparent)" : "var(--paper)",
+                  color: form.type === t ? "var(--primary)" : "var(--text-muted)" }}>{t}</button>
+            ))}
+          </div>
         </div>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-        <div><div style={lbl}>من مطار</div><input style={inp} value={form.from_airport} onChange={set("from_airport")} placeholder="DOH Doha" /></div>
-        <div><div style={lbl}>إلى مطار</div><input style={inp} value={form.to_airport} onChange={set("to_airport")} placeholder="JED Jeddah" /></div>
-        <div><div style={lbl}>تاريخ المغادرة</div><input style={inp} type="date" value={form.date} onChange={set("date")} /></div>
-        <div><div style={lbl}>وقت المغادرة</div><input style={inp} type="time" value={form.time} onChange={set("time")} /></div>
-        <div><div style={lbl}>تاريخ الوصول</div><input style={inp} type="date" value={form.arrival_date} onChange={set("arrival_date")} /></div>
-        <div><div style={lbl}>وقت الوصول</div><input style={inp} type="time" value={form.arrival_time} onChange={set("arrival_time")} /></div>
+
+      {/* ═ المسار — المغادرة ثم الوصول ═ */}
+      <div style={section}>
+        <div style={sectionTitle}>المسار</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 800, color: "var(--ink)", marginBottom: 6 }}>المغادرة</div>
+            <label style={{ display: "block", marginBottom: 8 }}><span style={lbl}>من مطار</span><input style={inp} value={form.from_airport} onChange={set("from_airport")} placeholder="DOH Doha" /></label>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <label><span style={lbl}>تاريخ المغادرة</span><input style={inp} type="date" value={form.date} onChange={set("date")} /></label>
+              <label><span style={lbl}>وقت المغادرة</span><input style={inp} type="time" value={form.time} onChange={set("time")} /></label>
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 800, color: "var(--ink)", marginBottom: 6 }}>الوصول</div>
+            <label style={{ display: "block", marginBottom: 8 }}><span style={lbl}>إلى مطار</span><input style={inp} value={form.to_airport} onChange={set("to_airport")} placeholder="JED Jeddah" /></label>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <label><span style={lbl}>تاريخ الوصول</span><input style={inp} type="date" value={form.arrival_date} onChange={set("arrival_date")} /></label>
+              <label><span style={lbl}>وقت الوصول</span><input style={inp} type="time" value={form.arrival_time} onChange={set("arrival_time")} /></label>
+            </div>
+          </div>
+        </div>
       </div>
-      <div style={{ marginBottom: 14 }}>
-        <div style={lbl}>المقاعد المخصَّصة للحملة — مطلوبة</div>
-        <input style={inp} type="number" min="1" value={form.capacity} onChange={set("capacity")} placeholder="مثال: 40" />
+
+      {/* ═ مقاعد الحملة ═ */}
+      <div style={{ ...section, marginBottom: 14 }}>
+        <label style={{ display: "block" }}>
+          <span style={sectionTitle}>المقاعد المخصَّصة للحملة — مطلوبة</span>
+          <input style={{ ...inp, marginTop: 6 }} type="number" min="1" step="1" inputMode="numeric" value={form.capacity} onChange={set("capacity")} placeholder="مثال: 40" />
+        </label>
         <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 5 }}>
           ليست سعة الطائرة: طائرةٌ بـ٣٠٠ مقعد قد تكون حصّة الحملة فيها ٤٠.
           {occupied > 0 ? ` ولا تنزل تحت ${occupied} — عدد المسافرين الحاليّ.` : ""}

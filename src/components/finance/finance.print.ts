@@ -2,10 +2,12 @@
 // إنشاء صفحات HTML والطباعة للحسابات (بدون React ولا JSX)
 // ============================================================
 import type { Passenger } from "../../types";
-import type { PricingMap, Payment, CustomCharge, FinancialGroup, FinanceRow, CashflowByDate, PaymentReceipt } from "./finance.types";
+import type { PricingMap, HotelPackagePrices, FinanceHotel, Payment, CustomCharge, FinancialGroup, FinanceRow, CashflowByDate, PaymentReceipt } from "./finance.types";
 import { amountInArabicWords } from "./amountInWords";
-import type { PrintBranding } from "../../print";
-import { fmtAmt, financeStatus, getPriceInfo, getPackageKey, calcTotalDue, calcTotalPaid, paidFlightService, isSpecialPackage, SERVICE_FILTERS, serviceLabel, SPECIAL_PACKAGE_LABEL, PRICING_KEYS } from "./finance.utils";
+import type { PrintBranding, PrintSeals, SealImage } from "../../print";
+import { hasSeals, sealPlanHTML, sealGroupPlanHTML, sealSizeMm, bankBlockHTML,
+         A5_SEAL_SCALE, STAMP_BOX_MM, SIGNATURE_BOX_MM } from "../../print";
+import { fmtAmt, financeStatus, getPriceInfo, viewSurcharge, addonReportRows, packageLabel, requestedHotelName, packageReportRows, calcTotalDue, calcTotalPaid, paidFlightService } from "./finance.utils";
 /* ⚠️ متغيّراتُ السمة (`var(--danger)` وأخواتُها) **لا تعمل في المطبوع**:
    إطارُ الطباعة مستندٌ مستقلٌّ لا يحمل أوراقَ أنماط التطبيق، فتسقط
    القيمةُ ويرث النصُّ لونَ أبيه — وقد يكون أبيضَ على أبيض. فألوانُ
@@ -13,6 +15,10 @@ import { fmtAmt, financeStatus, getPriceInfo, getPackageKey, calcTotalDue, calcT
 const PRINT_DANGER  = "#C0392B";
 const PRINT_SUCCESS = "#2A9D8F";
 const balanceColor = (balance: number) => (balance > 0 ? PRINT_DANGER : PRINT_SUCCESS);
+/* صفرُ الباقة الناتجُ عن نقص الإعداد يُقال في الورقة كما يُقال على الشاشة */
+const zeroReason = (pi: { noHotel?: boolean; missingPrice?: boolean }) =>
+  pi.noHotel ? ` <span style="color:${PRINT_DANGER}">(لا فندق مطلوب — السعر صفر)</span>`
+  : pi.missingPrice ? ` <span style="color:${PRINT_DANGER}">(لا سعر لهذه الباقة في الفندق — صفر)</span>` : "";
 /* `financeStatus` تُرجِع ألوانَ السمة للشاشة — وهي المصدرُ نفسه للتسمية،
    فلا حسابَ ثانٍ هنا: التسميةُ منها، واللونُ يُترجَم للطباعة. */
 const PRINT_STATUS_COLOR: Record<string, string> = {
@@ -30,6 +36,10 @@ const printStatusColor = (label: string) => PRINT_STATUS_COLOR[label] || "#1c1c1
 import { esc, safeBranding, logoOrInitial, issuedStamp, pageRule, joinSections,
          COLOR_ADJUST_RULE_ALL, makeFinanceHTML, printInPage } from "../../print";
 import type { PrintChrome } from "../../print";
+import { normalizeCompanyAssetUrl } from "../../company/safety";
+
+/** صورةُ data مشفّرةٌ base64 — كما يُخرجها قصُّ حشو الختم والتوقيع. */
+const SEAL_DATA_URL = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/;
 export { makeFinanceHTML, printInPage };
 
 
@@ -46,7 +56,8 @@ export { makeFinanceHTML, printInPage };
 
    والملغى يُطبَع بنفسِ رقمِه وعليه «ملغي» وسببُه — الرقمُ لا يُعاد. */
 export function makeReceiptHTML(
-  receipt: PaymentReceipt, brand: PrintBranding, allocations: { name: string; amount: number }[] = []
+  receipt: PaymentReceipt, brand: PrintBranding, allocations: { name: string; amount: number }[] = [],
+  options: { seals?: PrintSeals | null } = {},
 ): string {
   const { logoUrl, companyName, tagline, primaryColor, accentColor, stampUrl, signatureUrl } = safeBranding(brand);
   const logoHtml = logoOrInitial(logoUrl, companyName);
@@ -56,10 +67,38 @@ export function makeReceiptHTML(
   const isGroup = !!receipt.group_name;
 
   /* صندوقُ الختمِ/التوقيعِ يقبل صورةً موقَّعةً إن مُرِّرت، وإلا يبقى
-     إطاراً فارغاً كما اليوم — فلا شيءَ يتعطّل قبل دمج #177. */
-  const assetBox = (url: string, label: string) => url
-    ? `<div class="stamp-box"><img src="${url}" alt="${label}" /></div>`
-    : `<div class="stamp-box"><span style="color:#ddd;font-size:11px">${label}</span></div>`;
+     إطاراً فارغاً للختمِ والتوقيعِ باليد كما كان. والصورةُ تُعرَض بلا إطارٍ
+     منقَّط — كختمٍ على ورق — في الموضعِ نفسِه وبالارتفاعِ نفسِه، فلا يتحرّك
+     في الإيصالِ سطر.
+     والصورةُ الإلكترونيّةُ (الختمُ/التوقيعُ المطلوبان) بمقاسِها الواقعيّ
+     بالمليمتر — مقاسُ التقارير بنسبةِ ورقة A5 (`A5_SEAL_SCALE`) — لا محشورةً
+     في صندوق ٦٢px. */
+  const assetBox = (url: string, label: string, img?: SealImage, box?: { w: number; h: number }) => {
+    if (!url) return `<div class="stamp-box"><span style="color:#ddd;font-size:11px">${label}</span></div>`;
+    const mm = img && box && img.url === url ? sealSizeMm(img, box, A5_SEAL_SCALE) : null;
+    return mm
+      ? `<div class="stamp-box has-img sized"><img src="${url}" alt="${label}" style="width:${mm.w}mm" /></div>`
+      : `<div class="stamp-box has-img"><img src="${url}" alt="${label}" /></div>`;
+  };
+
+  /* ═══ إيصالٌ يمتدّ ورقتين (دفعةُ مجموعةٍ طويلة) ═══
+     خانتا الختمِ والتوقيعِ في آخرِ الإيصال، فلا تقعان إلا على ورقته الأخيرة.
+     فإن طُلبت الصورُ وامتدّ الإيصالُ أكثرَ من ورقة A5 — يُقاس في المستند نفسه
+     بخطوط الجهاز (`sealPlanHTML`) — رُسمتا في هامشِ كلِّ ورقةٍ بأكبر مقاسٍ لا
+     يزيد ورقة، وأُخفيت خانتاهما الإلكترونيّتان كي لا تتكرّرا في الأخيرة.
+     والخانةُ المطفأةُ تبقى للختمِ باليد. */
+  const seals = hasSeals(options.seals) ? options.seals : null;
+  /* ⚠️ عطبٌ ظهر في الطباعة الفعليّة: صورتا الختم والتوقيع بعد قصّ حشوهما روابطُ
+     `data:image/png` (`company/sealTrim.ts`)، و`safeBranding` لا يقبل إلا http(s) —
+     فصار الرابطُ فارغاً وطُبعت الخانتان فارغتين. فمصدرُ الصورة المطلوبة من `seals`
+     نفسها: رابطٌ آمنٌ أو صورةُ data مشفّرةٌ base64 لا غير. */
+  const sealSrc = (img: SealImage | undefined, fallback: string) => {
+    const u = img?.url ?? "";
+    return SEAL_DATA_URL.test(u) || normalizeCompanyAssetUrl(u) ? u : fallback;
+  };
+  const stampSrc = sealSrc(seals?.stamp, stampUrl), signatureSrc = sealSrc(seals?.signature, signatureUrl);
+  const sealPlan = seals ? sealPlanHTML(seals, { size: "A5", margin: "10mm", scale: A5_SEAL_SCALE,
+    boxes: { img: ".stamp-box.sized img", multipageClass: "receipt-multipage" } }) : "";
 
   const allocRows = isGroup && allocations.length
     ? `<table class="alloc"><thead><tr><th>الحاج</th><th>النصيب</th></tr></thead><tbody>${
@@ -102,6 +141,10 @@ export function makeReceiptHTML(
   .stamp-label { font-size:9.5px; color:#aaa; margin-bottom:5px; }
   .stamp-box { border:1px dashed #ccc; border-radius:8px; height:62px; display:flex; align-items:center; justify-content:center; overflow:hidden; padding:3px; }
   .stamp-box img { max-width:100%; max-height:100%; object-fit:contain; }
+  .stamp-box.has-img { border-color:transparent; padding:0; }
+  .stamp-box.sized { height:auto; min-height:62px; overflow:visible; }
+  .stamp-box.sized img { max-width:100%; height:auto; max-height:none; }
+  .receipt-multipage .stamp-area.e-sealed { display:none; }
   ${COLOR_ADJUST_RULE_ALL}
 </style></head><body>
 <div class="receipt">
@@ -138,17 +181,17 @@ export function makeReceiptHTML(
     </div>
     ${allocRows}
     <div class="receipt-footer">
-      <div class="stamp-area">
+      <div class="stamp-area${seals?.stamp && stampSrc ? " e-sealed" : ""}">
         <div class="stamp-label">ختم الشركة</div>
-        ${assetBox(stampUrl, "الختم")}
+        ${assetBox(stampSrc, "الختم", seals?.stamp, STAMP_BOX_MM)}
       </div>
-      <div class="stamp-area">
+      <div class="stamp-area${seals?.signature && signatureSrc ? " e-sealed" : ""}">
         <div class="stamp-label">توقيع المسؤول</div>
-        ${assetBox(signatureUrl, "التوقيع")}
+        ${assetBox(signatureSrc, "التوقيع", seals?.signature, SIGNATURE_BOX_MM)}
       </div>
     </div>
   </div>
-</div>
+</div>${sealPlan}
 </body></html>`;
 }
 
@@ -157,15 +200,23 @@ export function makeReceiptHTML(
 // كشف حساب الحاج الفردي - تصميم كبير للطباعة
 // ============================================================
 export function makePassengerStatementHTML(
-  p: Passenger, pricing: PricingMap, customCharges: CustomCharge[], payments: Payment[], brand: PrintBranding
+  p: Passenger, pricing: PricingMap, hotelPrices: HotelPackagePrices, hotels: FinanceHotel[], customCharges: CustomCharge[], payments: Payment[], brand: PrintBranding,
+  /* خياراتُ «كشف الحساب» (`PRINT_SPECS.statement`) — كلُّها مطفأةٌ افتراضاً،
+     والمطفأُ لا يُحقَن منه شيء: الكشفُ كما كان بالحرف. */
+  chrome: PrintChrome = {},
 ): string {
   const { logoUrl, companyName, tagline, primaryColor, accentColor } = safeBranding(brand);
   const s = p.services;
-  const priceInfo = getPriceInfo(s, pricing);
+  const priceInfo = getPriceInfo(p, pricing, hotelPrices);
+  /* الفندقُ المطلوب أساسُ سعر الباقة — يُكتب بجانبها (إلا «خاص» فسعرُه يدويّ) */
+  const reqHotel = s.hotel_type === "خاص" ? null : requestedHotelName(p, hotels);
+  const pkgLine = `${esc(priceInfo.label)}${reqHotel ? ` — ${esc(reqHotel)}` : ""}${zeroReason(priceInfo)}`;
   const pkgAmt = priceInfo.amount;
   const pCustom   = customCharges.filter(c => c.passenger_id === p.id);
   const pPayments = [...payments.filter(py => py.passenger_id === p.id)].sort((a, b) => new Date(a.payment_date).getTime() - new Date(b.payment_date).getTime());
-  const totalDue  = calcTotalDue(p, pricing, customCharges);
+  const sealsOn = hasSeals(chrome.seals);
+  const bankHTML = bankBlockHTML(chrome.bank, primaryColor);
+  const totalDue  = calcTotalDue(p, pricing, hotelPrices, customCharges);
   const totalPaid = calcTotalPaid(p.id, payments);
   const balance   = totalDue - totalPaid;
   const logoHtml  = logoOrInitial(logoUrl, companyName);
@@ -174,8 +225,8 @@ export function makePassengerStatementHTML(
   /* الدرجة التجاريّة من الخدمة المطلوبة لا من حالة الحجز — نفس مصدر `calcTotalDue` */
   const flightPaid = paidFlightService(p);
 
-  let rows = `<tr><td class="bayan">${esc(priceInfo.label)}</td><td class="debit">${fmtAmt(pkgAmt)}</td><td class="credit">—</td></tr>`;
-  if (s.hotel_view==="مطلة") rows+=`<tr class="alt"><td class="bayan">إضافة مطلة</td><td class="debit">${fmtAmt(pricing["addon_view"]?.amount||0)}</td><td class="credit">—</td></tr>`;
+  let rows = `<tr><td class="bayan">${pkgLine}</td><td class="debit">${fmtAmt(pkgAmt)}</td><td class="credit">—</td></tr>`;
+  if (s.hotel_view==="مطلة") rows+=`<tr class="alt"><td class="bayan">إضافة مطلة</td><td class="debit">${fmtAmt(viewSurcharge(p, hotelPrices))}</td><td class="credit">—</td></tr>`;
   if (s.camp_mina==="خاص")  rows+=`<tr><td class="bayan">خيمة خاصة - منى</td><td class="debit">${fmtAmt(pricing["addon_mina"]?.amount||0)}</td><td class="credit">—</td></tr>`;
   if (s.camp_arafa==="خاص") rows+=`<tr class="alt"><td class="bayan">خيمة خاصة - عرفة</td><td class="debit">${fmtAmt(pricing["addon_arafa"]?.amount||0)}</td><td class="credit">—</td></tr>`;
   if (s.bus==="VIP")         rows+=`<tr><td class="bayan">باص VIP</td><td class="debit">${fmtAmt(pricing["addon_bus_vip"]?.amount||0)}</td><td class="credit">—</td></tr>`;
@@ -250,7 +301,7 @@ export function makePassengerStatementHTML(
   <tr class="total-row"><td>الإجمالي</td><td>${fmtAmt(totalDue)}</td><td>${fmtAmt(totalPaid)}</td></tr>
   <tr class="total-row" style="background:${balance>0?"#C0392B":"#2A9D8F"};color:#fff"><td>${balance>0?"الرصيد المتبقي":balance<0?"رصيد دائن للحاج":"الرصيد المتبقي"}</td><td colspan="2" style="text-align:center">${fmtAmt(Math.abs(balance))} ر.ق</td></tr>
 </table>
-<div class="footer">${esc(companyName)}${tagline?" — "+esc(tagline):""} · كشف حساب</div>
+${bankHTML}<div class="footer">${esc(companyName)}${tagline?" — "+esc(tagline):""} · كشف حساب</div>${sealsOn ? sealGroupPlanHTML(chrome.seals, { margin: "14mm 12mm" }) : ""}
 </body></html>`;
 }
 
@@ -258,28 +309,30 @@ export function makePassengerStatementHTML(
 // كشف حساب المجموعة المالية
 // ============================================================
 export function makeGroupStatementHTML(
-  group: FinancialGroup, gPassengers: Passenger[], pricing: PricingMap,
+  group: FinancialGroup, gPassengers: Passenger[], pricing: PricingMap, hotelPrices: HotelPackagePrices, hotels: FinanceHotel[],
   customCharges: CustomCharge[], payments: Payment[], brand: PrintBranding
 ): string {
   const { logoUrl, companyName, tagline, primaryColor, accentColor } = safeBranding(brand);
   const logoHtml  = logoOrInitial(logoUrl, companyName);
   const { dateStr } = issuedStamp();
-  const gTotDue  = gPassengers.reduce((s,p) => s+calcTotalDue(p,pricing,customCharges), 0);
+  const gTotDue  = gPassengers.reduce((s,p) => s+calcTotalDue(p,pricing,hotelPrices,customCharges), 0);
   const gTotPaid = gPassengers.reduce((s,p) => s+calcTotalPaid(p.id,payments), 0);
   const gTotBal  = gTotDue - gTotPaid;
 
   const memberRows = gPassengers.map((p, i) => {
-    const due  = calcTotalDue(p,pricing,customCharges);
+    const due  = calcTotalDue(p,pricing,hotelPrices,customCharges);
     const paid = calcTotalPaid(p.id,payments);
     const bal  = due - paid;
     const pPays = [...payments.filter(py=>py.passenger_id===p.id)].sort((a,b)=>new Date(a.payment_date).getTime()-new Date(b.payment_date).getTime());
-    const priceInfo = getPriceInfo(p.services, pricing);
+    const priceInfo = getPriceInfo(p, pricing, hotelPrices);
+    const reqHotel = p.services.hotel_type === "خاص" ? null : requestedHotelName(p, hotels);
+    const pkgLine = `${esc(priceInfo.label)}${reqHotel ? ` — ${esc(reqHotel)}` : ""}${zeroReason(priceInfo)}`;
     const payRows = pPays.map(py => `<tr style="background:#f0faf8"><td style="padding:8px 16px;border:1px solid #e8e8e8;font-size:13px;padding-right:32px">دفعة — ${esc(py.payment_date)} <span style="color:#888;font-size:12px">(${esc(py.method)})</span>${py.notes?` — ${esc(py.notes)}`:""}</td><td style="text-align:center;border:1px solid #e8e8e8;color:#888;font-size:13px">—</td><td style="text-align:center;border:1px solid #e8e8e8;color:#2A9D8F;font-weight:700;font-size:14px">${fmtAmt(py.amount)}</td></tr>`).join("");
     return `
     <div style="margin-bottom:20px;border:1.5px solid ${primaryColor}30;border-radius:10px;overflow:hidden;">
       <div style="background:${primaryColor}12;padding:10px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid ${primaryColor}20">
         <div style="font-size:17px;font-weight:800;color:${primaryColor}">${i+1}. ${esc(p.short_ar||p.name_ar)}</div>
-        <div style="font-size:13px;color:#666">${esc(priceInfo.label||"")}</div>
+        <div style="font-size:13px;color:#666">${pkgLine}</div>
         <div style="display:flex;gap:16px;font-size:13px">
           <span>مطلوب: <strong style="color:${primaryColor}">${fmtAmt(due)}</strong></span>
           <span>مدفوع: <strong style="color:#2A9D8F">${fmtAmt(paid)}</strong></span>
@@ -287,7 +340,7 @@ export function makeGroupStatementHTML(
         </div>
       </div>
       <table style="width:100%;border-collapse:collapse">
-        <tr style="background:${primaryColor}08"><td style="padding:8px 16px;border:1px solid #e8e8e8;font-size:14px">${esc(priceInfo.label)}</td><td style="text-align:center;border:1px solid #e8e8e8;color:#C0392B;font-weight:700;font-size:14px;width:130px">${fmtAmt(priceInfo.amount)}</td><td style="text-align:center;border:1px solid #e8e8e8;color:#888;width:130px">—</td></tr>
+        <tr style="background:${primaryColor}08"><td style="padding:8px 16px;border:1px solid #e8e8e8;font-size:14px">${pkgLine}</td><td style="text-align:center;border:1px solid #e8e8e8;color:#C0392B;font-weight:700;font-size:14px;width:130px">${fmtAmt(priceInfo.amount)}</td><td style="text-align:center;border:1px solid #e8e8e8;color:#888;width:130px">—</td></tr>
         ${payRows}
         <tr style="background:${primaryColor};color:#fff"><td style="padding:10px 16px;font-weight:700">الرصيد</td><td style="text-align:center;font-weight:800">${fmtAmt(due)}</td><td style="text-align:center;font-weight:800">${fmtAmt(paid)}</td></tr>
       </table>
@@ -369,7 +422,7 @@ export function printFullReport(data: FinanceRow[], pricing: PricingMap, brand: 
       return `<tr style="${idx%2===1?"background:#f5f5f5":""}">
         <td style="text-align:center;font-size:10pt;padding:0 4pt;height:${ROW_H};color:#888">${idx+1}</td>
         <td style="font-size:11pt;padding:0 6pt;height:${ROW_H}">${esc(r.p.short_ar||r.p.name_ar)}</td>
-        <td style="font-size:9pt;padding:0 4pt;height:${ROW_H};color:#555">${esc(getPriceInfo(r.p.services, pricing).label.replace("باقة ",""))}</td>
+        <td style="font-size:9pt;padding:0 4pt;height:${ROW_H};color:#555">${esc(packageLabel(r.p, pricing).replace("باقة ",""))}</td>
         <td style="text-align:center;font-size:11pt;padding:0 4pt;height:${ROW_H};color:${primaryColor};font-weight:700">${fmtAmt(r.due)}</td>
         <td style="text-align:center;font-size:11pt;padding:0 4pt;height:${ROW_H};color:#2A9D8F;font-weight:700">${fmtAmt(r.paid)}</td>
         <td style="text-align:center;font-size:11pt;padding:0 4pt;height:${ROW_H};color:${balanceColor(r.balance)};font-weight:700">${fmtAmt(r.balance)}</td>
@@ -445,33 +498,26 @@ export function printPaymentsReport(rows: PaymentReportRow[], brand: PrintBrandi
   printInPage(makeFinanceHTML("تقرير الإيصالات والدفعات", joinSections(pages), brand, chrome));
 }
 
-export function printPackagesReport(passengers: Passenger[], pricing: PricingMap, brand: PrintBranding, chrome: PrintChrome = {}) {
+export function printPackagesReport(passengers: Passenger[], pricing: PricingMap, hotelPrices: HotelPackagePrices, hotels: FinanceHotel[], brand: PrintBranding, chrome: PrintChrome = {}) {
   const { primaryColor } = safeBranding(brand);
-  const rows=PRICING_KEYS.filter(k=>k.type==="package").map(pk=>{const count=passengers.filter(p=>!isSpecialPackage(p)&&getPackageKey(p.services.hotel_type)===pk.key).length;const price=pricing[pk.key]?.amount||0;return[esc(pk.label),String(count),fmtAmt(price),`<strong>${fmtAmt(count*price)}</strong>`];});
-  const specialPassengers = passengers.filter(isSpecialPackage);
-  if (specialPassengers.length>0) {
-    const specialTotal = specialPassengers.reduce((s,p)=>s+(Number(p.services.custom_price)||0),0);
-    rows.push([SPECIAL_PACKAGE_LABEL,String(specialPassengers.length),"—",`<strong>${fmtAmt(specialTotal)}</strong>`]);
-  }
-  /* الإجماليُّ يُجمَع من الصفوف المعروضة نفسها — لا مسارَ حسابٍ ثانٍ،
-     ولا رقمَ في الورقة لا يُرى من أين جاء. */
-  const pkgCount = rows.reduce((n,r)=>n+Number(r[1]),0);
-  const pkgTotal = PRICING_KEYS.filter(k=>k.type==="package")
-      .reduce((sum,pk)=>sum+passengers.filter(p=>!isSpecialPackage(p)&&getPackageKey(p.services.hotel_type)===pk.key).length*(pricing[pk.key]?.amount||0),0)
-    + specialPassengers.reduce((sum,p)=>sum+(Number(p.services.custom_price)||0),0);
-  printInPage(makeFinanceHTML("تقرير الباقات", printTable(["الباقة","عدد الحجاج","السعر الواحد","الإجمالي المستحق"], rows, primaryColor,
+  /* الصفوفُ من `packageReportRows` — المصدرُ نفسُه للشاشة: صفٌّ لكلّ باقةٍ
+     في كلّ فندقٍ مطلوب. والإجماليُّ يُجمَع من الصفوف المعروضة نفسها. */
+  const data = packageReportRows(passengers, pricing, hotelPrices, hotels);
+  const rows = data.map(r => [esc(r.label), String(r.count), r.price == null ? "—" : fmtAmt(r.price), `<strong>${fmtAmt(r.total)}</strong>`]);
+  const pkgCount = data.reduce((n, r) => n + r.count, 0);
+  const pkgTotal = data.reduce((n, r) => n + r.total, 0);
+  printInPage(makeFinanceHTML("تقرير الباقات", printTable(["الباقة · الفندق المطلوب","عدد الحجاج","السعر الواحد","الإجمالي المستحق"], rows, primaryColor,
     ["الإجمالي", String(pkgCount), "—", fmtAmt(pkgTotal)]), brand, chrome));
 }
 
-export function printAddonsReport(passengers: Passenger[], pricing: PricingMap, brand: PrintBranding, chrome: PrintChrome = {}) {
+export function printAddonsReport(passengers: Passenger[], pricing: PricingMap, hotelPrices: HotelPackagePrices, hotels: FinanceHotel[], brand: PrintBranding, chrome: PrintChrome = {}) {
   const { primaryColor } = safeBranding(brand);
-  /* المصدر المشترك نفسه الذي يغذّي فلترَ الخدمات والشاشة — لا قائمةٌ ثالثة */
-  const checks=SERVICE_FILTERS;
-  const amounts=checks.map(a=>{const count=passengers.filter(a.check).length;const price=pricing[a.key]?.amount||0;const isDis=a.key==="discount_no_ticket";return{a,count,price,isDis,sum:count*price};});
-  const rows=amounts.map(({a,count,price,isDis,sum})=>[esc(serviceLabel(a.key, pricing)),String(count),fmtAmt(price),isDis?`(${fmtAmt(sum)})`:fmtAmt(sum)]);
+  /* `addonReportRows` — المصدرُ نفسُه للشاشة: الإطلالةُ صفٌّ لكلّ فندقٍ مطلوب برسمه */
+  const data = addonReportRows(passengers, pricing, hotelPrices, hotels);
+  const rows = data.map(r => [esc(r.label), String(r.count), fmtAmt(r.price), r.isDiscount ? `(${fmtAmt(r.total)})` : fmtAmt(r.total)]);
   /* صافي الإضافات: الإضافاتُ تُجمَع والخصمُ يُطرَح — كما في `calcTotalDue` */
-  const addonNet=amounts.reduce((n,x)=>n+(x.isDis?-x.sum:x.sum),0);
-  const addonCount=amounts.reduce((n,x)=>n+x.count,0);
+  const addonNet = data.reduce((n, r) => n + (r.isDiscount ? -r.total : r.total), 0);
+  const addonCount = data.reduce((n, r) => n + r.count, 0);
   printInPage(makeFinanceHTML("ملخص الإضافات", printTable(["الإضافة / الخصم","عدد الحجاج","السعر الواحد","الإجمالي"], rows, primaryColor,
     ["الصافي", String(addonCount), "—", fmtAmt(addonNet)]), brand, chrome));
 }
