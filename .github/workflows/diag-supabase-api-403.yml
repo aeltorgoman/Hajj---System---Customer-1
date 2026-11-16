@@ -1,0 +1,76 @@
+name: "TEMPORARY — Diagnose Supabase Management API 403 (read-only)"
+# ════════════════════════════════════════════════════════════
+# Temporary, read-only diagnostic. Not a release file. Do not merge.
+#   · GET requests only. No SQL, no writes, no deploy, no secrets set.
+#   · Never prints the token, the Authorization header, the project ref or
+#     any response body: only HTTP status codes, yes/no facts, and a
+#     category picked from a fixed allowlist.
+#   · Never calls an endpoint that returns secret values (api-keys, secrets).
+# ════════════════════════════════════════════════════════════
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      API: https://api.supabase.com/v1
+      EXPECTED_REF_SHA256: 23d886a418f402ea0583417867686c7e732fca34fb9e5f084415092d22c9d375
+    steps:
+      - name: "Diagnose (status codes and categories only)"
+        run: |
+          set -uo pipefail
+          T="$RUNNER_TEMP/d"; mkdir -p "$T"
+          yn() { if "$@"; then echo yes; else echo no; fi; }
+          echo "### Secret shape (no values)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- token present: $(yn test -n "${SUPABASE_ACCESS_TOKEN:-}")" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- token has whitespace/newline: $(yn grep -q '[[:space:]]' <<< "${SUPABASE_ACCESS_TOKEN:-}" )" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- token starts with sbp_: $(yn test "${SUPABASE_ACCESS_TOKEN#sbp_}" != "${SUPABASE_ACCESS_TOKEN:-}")" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- project ref present: $(yn test -n "${PROJECT_REF:-}")" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- project ref is 20 lowercase letters: $(yn grep -qx '[a-z]\{20\}' <<< "${PROJECT_REF:-}")" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "- project ref is the expected Customer 1 project: $(yn test "$(printf '%s' "${PROJECT_REF:-}" | sha256sum | cut -c1-64)" = "$EXPECTED_REF_SHA256")" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # category of an error body from a fixed allowlist (the body itself is never printed)
+          cat_of() {
+            local f="$1" ct="$2"
+            if ! grep -qi 'application/json' <<< "$ct"; then
+              if grep -qi -e 'cloudflare' -e 'cf-ray' "$f.h" 2>/dev/null; then echo "non-JSON response from the edge (Cloudflare)"; else echo "non-JSON response"; fi; return
+            fi
+            local m; m="$(jq -r '(.message // .error // .msg // "") | ascii_downcase' "$f" 2>/dev/null | head -c 300)"
+            case "$m" in
+              "") echo "JSON without a message";;
+              *privilege*|*permission*|*not\ allowed*|*forbidden*|*scope*) echo "permission / privilege refusal";;
+              *unauthori*|*invalid*token*|*jwt*|*expired*) echo "authentication refusal (token)";;
+              *not\ found*|*does\ not\ exist*) echo "not found";;
+              *paused*|*inactive*|*restrict*|*suspend*|*billing*) echo "project/plan restriction";;
+              *rate*limit*|*too\ many*) echo "rate limited";;
+              *) echo "other message (not printed)";;
+            esac
+          }
+          probe() {   # probe <key> <label> <path>
+            local f="$T/$1" label="$2" path="$3" code ct
+            code="$(curl -sS -G -o "$f" -D "$f.h" -w '%{http_code}' \
+              -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" "$API$path" 2>/dev/null || true)"; code="${code:-000}"
+            ct="$(grep -i '^content-type:' "$f.h" 2>/dev/null | head -1 | tr -d '\r')"
+            if [ "${code:0:1}" = "2" ]; then echo "- $label: HTTP $code"
+            else echo "- $label: HTTP $code — $(cat_of "$f" "$ct")"; fi
+          }
+          echo "### Management API (GET only)" | tee -a "$GITHUB_STEP_SUMMARY"
+          { probe a1 "A1 token accepted — GET /projects" "/projects"
+            probe a2 "A2 token accepted — GET /organizations" "/organizations"
+            probe b1 "B1 expected project — GET /projects/{ref}" "/projects/$PROJECT_REF"
+            probe b2 "B2 project functions (worked on 2026-11-10) — GET /projects/{ref}/functions" "/projects/$PROJECT_REF/functions"
+            probe c "C  migration history (failing) — GET /projects/{ref}/database/migrations" "/projects/$PROJECT_REF/database/migrations"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          f="$T/a1"
+          if [ -s "$f" ] && jq -e 'type=="array"' "$f" >/dev/null 2>&1; then
+            vis="$(jq -r --arg r "${PROJECT_REF:-}" 'map(.id // .ref) | index($r) != null' "$f")"
+            st="$(jq -r --arg r "${PROJECT_REF:-}" '.[] | select((.id // .ref) == $r) | .status // "unknown"' "$f" | head -1)"
+            echo "- expected project is in this token's project list: $vis" | tee -a "$GITHUB_STEP_SUMMARY"
+            case "$st" in ACTIVE_HEALTHY|ACTIVE_UNHEALTHY|INACTIVE|PAUSED|COMING_UP|GOING_DOWN|RESTORING|UPGRADING|REMOVED|INIT_FAILED|UNKNOWN|unknown|"") echo "- project status (enum): ${st:-not listed}" | tee -a "$GITHUB_STEP_SUMMARY";; *) echo "- project status: other";; esac
+          fi
+          rm -rf "$T"
