@@ -28,6 +28,14 @@ export type Database = {
           target_ids: number[]
           target_type: string
           title: string | null
+          /* Phase 1 (20261110122335) */
+          pinned_at: string | null
+          content_revision: number
+          content_updated_at: string | null
+          audience: Json | null
+          audience_frozen_at: string | null
+          updated_at: string | null
+          updated_by: string | null
         }
         Insert: {
           body: string
@@ -42,6 +50,8 @@ export type Database = {
           target_ids?: number[]
           target_type?: string
           title?: string | null
+          pinned_at?: string | null
+          audience?: Json | null
         }
         Update: {
           body?: string
@@ -56,6 +66,9 @@ export type Database = {
           target_ids?: number[]
           target_type?: string
           title?: string | null
+          /* العنوانُ والنصُّ من update_announcement وحدها (المحفّز يرفض المباشر) */
+          pinned_at?: string | null
+          audience?: Json | null
         }
         Relationships: [
           {
@@ -1008,6 +1021,40 @@ export type Database = {
           },
         ]
       }
+      /* Polls Phase 2 — للقراءة وحدها (سياسة manage_portal). الكتابةُ بالدوالّ وحدها:
+         لا منحَ INSERT/UPDATE/DELETE لأيّ دورٍ تطبيقيّ، فـInsert/Update غيرُ قابلين للاستعمال. */
+      polls: {
+        Row: {
+          id: number
+          season_id: number
+          title: string
+          body: string | null
+          kind: string
+          max_choices: number | null
+          audience: Json
+          status: string
+          publish_at: string | null
+          published_at: string | null
+          audience_frozen_at: string | null
+          closes_at: string | null
+          closed_at: string | null
+          close_reason: string | null
+          allow_answer_changes: boolean
+          created_by: string | null
+          created_at: string
+          updated_by: string | null
+          updated_at: string
+        }
+        Insert: never
+        Update: never
+        Relationships: []
+      }
+      poll_options: {
+        Row: { id: number; poll_id: number; label: string; sort_order: number }
+        Insert: never
+        Update: never
+        Relationships: []
+      }
       pricing_settings: {
         Row: {
           amount: number
@@ -1254,6 +1301,51 @@ export type Database = {
         Returns: {
           passenger_id: number
         }[]
+      }
+      /* Phase 1 — معاينةُ جمهورٍ مركّب (manage_portal) */
+      announcement_audience_preview: {
+        Args: { p_audience: Json }
+        Returns: {
+          passenger_id: number
+        }[]
+      }
+      /* Phase 1 — تعديلُ تنبيه (manage_portal): push = requested | scheduled | expired | none */
+      update_announcement: {
+        Args: { p_id: number; p_title: string | null; p_body: string; p_priority: string; p_expires_at: string | null }
+        Returns: Json
+      }
+      /* Phase 1 — حذفٌ نهائيّ (manage_portal) */
+      delete_announcement: { Args: { p_id: number }; Returns: boolean }
+      /* Phase 1 — بوابة الحاجّ (anon، بالجلسة) */
+      get_pilgrim_announcements: { Args: { p_token: string; p_offset: number }; Returns: Json }
+      acknowledge_pilgrim_announcement: {
+        Args: { p_token: string; p_announcement_id: number; p_revision: number | null }
+        Returns: Json
+      }
+      /* Polls Phase 2 — الإدارة (authenticated، وحارسُها manage_portal) */
+      create_poll: {
+        Args: { p_title: string; p_body: string | null; p_kind: string; p_max_choices: number | null; p_audience: Json;
+                p_options: string[]; p_closes_at?: string | null; p_allow_answer_changes?: boolean }
+        Returns: number
+      }
+      update_poll: {
+        Args: { p_poll_id: number; p_title: string; p_body: string | null; p_kind: string; p_max_choices: number | null; p_audience: Json;
+                p_options: string[]; p_closes_at?: string | null; p_allow_answer_changes?: boolean }
+        Returns: undefined
+      }
+      publish_poll: { Args: { p_poll_id: number; p_publish_at?: string | null }; Returns: Json }
+      unschedule_poll: { Args: { p_poll_id: number }; Returns: undefined }
+      close_poll: { Args: { p_poll_id: number }; Returns: Json }
+      delete_poll: { Args: { p_poll_id: number }; Returns: boolean }
+      poll_results: { Args: { p_poll_id: number; p_dimension?: string | null }; Returns: Json }
+      get_poll_snapshot: { Args: { p_poll_id: number }; Returns: Json }
+      /* Phase 4 — تفاصيلُ النتائج المسمّاة (manage_portal) — ترحيلة 20261112224117 */
+      poll_details: { Args: { p_poll_id: number }; Returns: Json }
+      /* Polls Phase 2 — البوابة (anon، بالجلسة) */
+      get_pilgrim_polls: { Args: { p_token: string }; Returns: Json }
+      submit_pilgrim_poll_response: {
+        Args: { p_token: string; p_poll_id: number; p_option_ids: number[]; p_expected_revision: number }
+        Returns: Json
       }
       assign_passenger_room:
         /* MOD-001: `p_room_id` = null يُخرج الحاجّ من غرفته.

@@ -1,10 +1,10 @@
-# Customer Release 1.2.1
+# Customer Release 1.3.0
 
 | | |
 |---|---|
 | Product | Hajj Management System |
-| Release version | `v1.2.1` |
-| Snapshot generated | 2026-11-10 |
+| Release version | `v1.3.0` |
+| Snapshot generated | 2026-11-15 |
 | Allowlist manifest | `customer-release.manifest.json` v1 (Master) |
 
 This repository is a **clean release snapshot**, not a fork or mirror of the
@@ -100,7 +100,7 @@ setting differs from `supabase/config.toml`).
 1. **GitHub** — Actions → **Customer Function Update** → Run workflow on this
    release with **mode = plan**, **function** = the function, **project_ref** =
    this installation's Supabase project ref (it must equal the
-   `SUPABASE_PROJECT_REF` secret), **expected_release** = `1.2.1` and
+   `SUPABASE_PROJECT_REF` secret), **expected_release** = `1.3.0` and
    **source = checkout**. It is read-only: it proves every file of the
    function's bundle matches `release-manifest.json`, reads the deployed
    version and JWT setting, checks that the configuration names the function
